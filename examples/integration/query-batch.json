@@ -1,0 +1,8 @@
+{
+  "queries": [
+    {"kind":"files","role":"source","relevant":true,"fields":["id","absolute_path","analysis"],"limit":10},
+    {"kind":"symbols","fields":["id","name","file_id"],"limit":10},
+    {"kind":"notes","limit":3}
+  ],
+  "token_budget":4000
+}

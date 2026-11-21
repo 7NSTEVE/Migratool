@@ -1,0 +1,659 @@
+{
+  "schema": "migratool.agent-playbook/1",
+  "title": "Solicitudes del manual de agentes de Migratool 0.3.0",
+  "usage": "Seleccione requests[n].arguments, sustituya placeholders, guarde solo ese objeto y páselo con --input. En MCP úselo como params.arguments de tools/call. El archivo completo es una colección de ejemplos.",
+  "placeholders": {
+    "$SOURCE_FILE": "ID F actual de un archivo relevante de origen",
+    "$TARGET_FILE": "ID F actual de un archivo de destino",
+    "$SOURCE_SYMBOL": "ID S actual de un símbolo de origen",
+    "$TARGET_SYMBOL": "ID S actual de un símbolo de destino",
+    "$CASE_ID": "ID de un caso configurado",
+    "$COVERAGE_PATH": "Ruta absoluta de un informe de cobertura real",
+    "expected_revision": "En los lotes, reemplace 0 por la revisión actual del proyecto antes de enviarlos"
+  },
+  "requests": [
+    {
+      "id": "context",
+      "tool": "project_context",
+      "cli": "agent context",
+      "arguments": {
+        "token_budget": 1600
+      }
+    },
+    {
+      "id": "sync_incremental",
+      "tool": "inventory_sync",
+      "cli": "agent sync",
+      "arguments": {
+        "full": false,
+        "token_budget": 4000
+      }
+    },
+    {
+      "id": "sync_full",
+      "tool": "inventory_sync",
+      "cli": "agent sync",
+      "arguments": {
+        "full": true,
+        "token_budget": 4000
+      }
+    },
+    {
+      "id": "source_files",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "files",
+        "role": "source",
+        "relevant": true,
+        "fields": [
+          "id",
+          "absolute_path",
+          "language",
+          "analysis",
+          "sha256"
+        ],
+        "limit": 20,
+        "token_budget": 8000
+      }
+    },
+    {
+      "id": "target_files",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "files",
+        "role": "target",
+        "fields": [
+          "id",
+          "absolute_path",
+          "category",
+          "analysis"
+        ],
+        "limit": 20,
+        "token_budget": 6000
+      }
+    },
+    {
+      "id": "one_file",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "files",
+        "id": "$SOURCE_FILE",
+        "detail": "full",
+        "fields": [
+          "id",
+          "absolute_path",
+          "category",
+          "analysis",
+          "sha256",
+          "text_truncated"
+        ],
+        "limit": 1,
+        "token_budget": 4000
+      }
+    },
+    {
+      "id": "file_symbols",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "symbols",
+        "file": "$SOURCE_FILE",
+        "fields": [
+          "id",
+          "file_id",
+          "name",
+          "qualified_name",
+          "kind",
+          "line",
+          "absolute_path"
+        ],
+        "limit": 100,
+        "token_budget": 12000
+      }
+    },
+    {
+      "id": "file_dependencies",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "dependencies",
+        "file": "$SOURCE_FILE",
+        "fields": [
+          "id",
+          "file_id",
+          "target_id",
+          "kind",
+          "name",
+          "details"
+        ],
+        "limit": 30,
+        "token_budget": 6000
+      }
+    },
+    {
+      "id": "documentation",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "documentation",
+        "detail": "full",
+        "fields": [
+          "id",
+          "absolute_path",
+          "text_content",
+          "text_truncated"
+        ],
+        "limit": 5,
+        "token_budget": 6000
+      }
+    },
+    {
+      "id": "relations",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "relations",
+        "file": "$SOURCE_FILE",
+        "limit": 20,
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "file_notes",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "notes",
+        "file": "$SOURCE_FILE",
+        "limit": 20,
+        "token_budget": 6000
+      }
+    },
+    {
+      "id": "file_mappings",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "mappings",
+        "file": "$SOURCE_FILE",
+        "limit": 10,
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "symbol_mappings",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "mappings",
+        "file": "$SOURCE_SYMBOL",
+        "limit": 10,
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "global_search",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "search",
+        "text": "manual",
+        "limit": 10,
+        "token_budget": 4000
+      }
+    },
+    {
+      "id": "untracked",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "files",
+        "git_state": "??",
+        "fields": [
+          "id",
+          "absolute_path",
+          "category",
+          "relevant"
+        ],
+        "limit": 20,
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "ignored",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "ignored",
+        "fields": [
+          "id",
+          "absolute_path",
+          "category",
+          "relevant"
+        ],
+        "limit": 20,
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "excluded",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "excluded",
+        "root": "target1",
+        "fields": [
+          "id",
+          "absolute_path",
+          "build_state",
+          "analysis"
+        ],
+        "limit": 20,
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "unknown",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "files",
+        "category": "unknown",
+        "fields": [
+          "id",
+          "absolute_path",
+          "language",
+          "relevant"
+        ],
+        "limit": 20,
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "deleted",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "files",
+        "deleted": true,
+        "fields": [
+          "id",
+          "absolute_path",
+          "sha256",
+          "last_revision"
+        ],
+        "limit": 20,
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "new_since",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "new",
+        "since_revision": 0,
+        "fields": [
+          "id",
+          "absolute_path",
+          "first_revision"
+        ],
+        "limit": 20,
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "orphans",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "kind": "orphans",
+        "role": "source",
+        "fields": [
+          "id",
+          "absolute_path",
+          "analysis"
+        ],
+        "limit": 20,
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "file_context_batch",
+      "tool": "query",
+      "cli": "agent query",
+      "arguments": {
+        "queries": [
+          {
+            "kind": "files",
+            "id": "$SOURCE_FILE",
+            "fields": [
+              "id",
+              "absolute_path",
+              "sha256",
+              "analysis"
+            ]
+          },
+          {
+            "kind": "symbols",
+            "file": "$SOURCE_FILE",
+            "fields": [
+              "id",
+              "name",
+              "line"
+            ],
+            "limit": 30
+          },
+          {
+            "kind": "dependencies",
+            "file": "$SOURCE_FILE",
+            "fields": [
+              "name",
+              "kind",
+              "target_id"
+            ],
+            "limit": 20
+          },
+          {
+            "kind": "notes",
+            "file": "$SOURCE_FILE",
+            "fields": [
+              "text",
+              "actor",
+              "at"
+            ],
+            "limit": 10
+          }
+        ],
+        "token_budget": 12000
+      }
+    },
+    {
+      "id": "project_status",
+      "tool": "migration_status",
+      "cli": "agent status",
+      "arguments": {
+        "level": "project",
+        "fields": [
+          "revision",
+          "total_units",
+          "migrated_units",
+          "migration_percent",
+          "units_with_passing_cases_percent"
+        ],
+        "token_budget": 1600
+      }
+    },
+    {
+      "id": "file_status",
+      "tool": "migration_status",
+      "cli": "agent status",
+      "arguments": {
+        "level": "files",
+        "id": "$SOURCE_FILE",
+        "limit": 1,
+        "token_budget": 6000
+      }
+    },
+    {
+      "id": "symbol_status",
+      "tool": "migration_status",
+      "cli": "agent status",
+      "arguments": {
+        "level": "symbols",
+        "root": "source1",
+        "fields": [
+          "id",
+          "file_id",
+          "name",
+          "absolute_path",
+          "declared_complete",
+          "verified_in_cases"
+        ],
+        "limit": 30,
+        "token_budget": 8000
+      }
+    },
+    {
+      "id": "next",
+      "tool": "next_tasks",
+      "cli": "agent next",
+      "arguments": {
+        "limit": 5,
+        "fields": [
+          "id",
+          "source_path",
+          "migration_percent",
+          "missing",
+          "unresolved_dependencies",
+          "candidate_targets",
+          "notes",
+          "documentation"
+        ],
+        "token_budget": 6000
+      }
+    },
+    {
+      "id": "changes",
+      "tool": "changes_since",
+      "cli": "agent changes",
+      "arguments": {
+        "since_revision": 0,
+        "detail": "compact",
+        "limit": 30,
+        "token_budget": 6000
+      }
+    },
+    {
+      "id": "history",
+      "tool": "history",
+      "cli": "agent history",
+      "arguments": {
+        "entity": "$SOURCE_FILE",
+        "since_revision": 0,
+        "detail": "full",
+        "limit": 10,
+        "token_budget": 16000
+      }
+    },
+    {
+      "id": "evidence",
+      "tool": "evidence_report",
+      "cli": "agent report",
+      "arguments": {
+        "fields": [
+          "kind",
+          "id",
+          "state",
+          "fresh",
+          "source",
+          "source_path",
+          "target_paths",
+          "verified_in_configured_cases",
+          "receipt_path"
+        ],
+        "limit": 20,
+        "token_budget": 10000
+      }
+    },
+    {
+      "id": "connections",
+      "tool": "connections",
+      "cli": "agent connections",
+      "arguments": {
+        "limit": 20,
+        "token_budget": 8000
+      }
+    },
+    {
+      "id": "statistics",
+      "tool": "statistics",
+      "cli": "agent statistics",
+      "arguments": {
+        "token_budget": 10000
+      }
+    },
+    {
+      "id": "note",
+      "tool": "batch_update",
+      "cli": "agent batch",
+      "mutates": true,
+      "arguments": {
+        "actor": "Agente / sesion-manual",
+        "expected_revision": 0,
+        "operations": [
+          {
+            "op": "note",
+            "entity": "$SOURCE_FILE",
+            "text": "Relevo del manual. Sustituir por observaciones reales."
+          }
+        ],
+        "detail": "full",
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "symbol_map",
+      "tool": "batch_update",
+      "cli": "agent batch",
+      "mutates": true,
+      "arguments": {
+        "actor": "Agente / sesion-manual",
+        "expected_revision": 0,
+        "operations": [
+          {
+            "op": "map",
+            "source": "$SOURCE_SYMBOL",
+            "targets": [
+              "$TARGET_SYMBOL"
+            ],
+            "complete": true,
+            "cases": [
+              "$CASE_ID"
+            ],
+            "note": "Sustituir por el alcance revisado de la unidad."
+          }
+        ],
+        "detail": "full",
+        "token_budget": 5000
+      }
+    },
+    {
+      "id": "file_partial",
+      "tool": "batch_update",
+      "cli": "agent batch",
+      "mutates": true,
+      "arguments": {
+        "actor": "Agente / sesion-manual",
+        "expected_revision": 0,
+        "operations": [
+          {
+            "op": "mark",
+            "source": "$SOURCE_FILE",
+            "targets": [
+              "$TARGET_FILE"
+            ],
+            "complete": false,
+            "cases": [],
+            "note": "Sustituir por el trabajo concreto que falta."
+          }
+        ],
+        "token_budget": 2000
+      }
+    },
+    {
+      "id": "file_complete",
+      "tool": "batch_update",
+      "cli": "agent batch",
+      "mutates": true,
+      "arguments": {
+        "actor": "Agente / sesion-manual",
+        "expected_revision": 0,
+        "operations": [
+          {
+            "op": "mark",
+            "source": "$SOURCE_FILE",
+            "targets": [
+              "$TARGET_FILE"
+            ],
+            "complete": true,
+            "cases": [
+              "$CASE_ID"
+            ],
+            "note": "Sustituir por el alcance completamente revisado."
+          }
+        ],
+        "token_budget": 2000
+      }
+    },
+    {
+      "id": "classify",
+      "tool": "batch_update",
+      "cli": "agent batch",
+      "mutates": true,
+      "arguments": {
+        "actor": "Agente / sesion-manual",
+        "expected_revision": 0,
+        "operations": [
+          {
+            "op": "classify",
+            "file": "$SOURCE_FILE",
+            "category": "source",
+            "relevant": true
+          }
+        ],
+        "token_budget": 2000
+      }
+    },
+    {
+      "id": "build",
+      "tool": "verify",
+      "cli": "agent verify",
+      "executes": true,
+      "arguments": {
+        "action": "build",
+        "execute": true,
+        "token_budget": 16000
+      }
+    },
+    {
+      "id": "test",
+      "tool": "verify",
+      "cli": "agent verify",
+      "executes": true,
+      "arguments": {
+        "action": "test",
+        "execute": true,
+        "token_budget": 24000
+      }
+    },
+    {
+      "id": "scan",
+      "tool": "verify",
+      "cli": "agent verify",
+      "executes": true,
+      "arguments": {
+        "action": "scan",
+        "execute": true,
+        "token_budget": 4000
+      }
+    },
+    {
+      "id": "coverage",
+      "tool": "verify",
+      "cli": "agent verify",
+      "executes": true,
+      "arguments": {
+        "action": "coverage",
+        "execute": true,
+        "root": "target1",
+        "format": "generic",
+        "input": "$COVERAGE_PATH",
+        "token_budget": 12000
+      }
+    }
+  ]
+}

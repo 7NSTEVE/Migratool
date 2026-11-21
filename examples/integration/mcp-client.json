@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "migratool": {
+      "command": "<PATH_TO_MIGRATOOL>/build/delivery/bin/migratool-cli-0.3.exe",
+      "args": ["mcp","--project","<PATH_TO_MIGRATOOL>/examples/demo/migration.json"]
+    }
+  }
+}

@@ -1,0 +1,44 @@
+# Build outputs & IDE files
+/build/
+/out/
+/release/
+/qa/
+/backups/
+/.vs/
+/.vscode/
+/.migratool/
+/adapters/roslyn/bin/
+/adapters/roslyn/obj/
+**/obj/
+/examples/demo/source/bin/
+**/__pycache__/
+*.pyc
+*.user
+*.suo
+*.tmp
+*.bak
+*.log
+*.zip
+
+# Local / private project artifacts & workspace dumps
+/-
+/PROJECT.md
+/firmware.ini
+/respaldos.ini
+/cleanup_report.log
+/test-results.json
+/.agents/teamwork/
+/examples/demo/.migratool/
+/examples/demo/artifacts/
+
+# Local internal audit/dump documentation excluded from public repository
+/docs/ARCHIVOS.txt
+/docs/ARCHIVOS.txt.*
+/docs/ARCHIVOS_CAMBIO_*.txt
+/docs/ARCHIVOS_ENTREGA.txt
+/docs/EVIDENCIA_*.md
+/docs/FUENTES_Y_HERRAMIENTAS.md
+/docs/IMPLEMENTACION_ESCALA_ESTADO.md
+/docs/PLAN_ESCALABILIDAD_*.md
+/docs/VALIDACION*.md
+/docs/MANUAL_AGENTES.md

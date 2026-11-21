@@ -1,0 +1,8 @@
+{
+  "expected_revision":0,
+  "actor":"AGENTE_QUE_REALIZA_LA_REVISION",
+  "operations":[
+    {"op":"note","text":"Sustituya revisión e identificadores por los obtenidos del proyecto real."}
+  ],
+  "token_budget":1000
+}

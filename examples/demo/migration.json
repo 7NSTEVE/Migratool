@@ -1,0 +1,20 @@
+{
+  "schema":"migratool.project/1",
+  "name":"Demostración · C# a C++23",
+  "roots":[{"id":"source1","role":"source","path":"source"},{"id":"target1","role":"target","path":"target"}],
+  "exclude_dirs":[".git",".migratool","bin","obj","build"],
+  "defines":[],"clang_args":[],"analyzers":[],
+  "builds":[
+    {"id":"original","root":"source1","argv":["dotnet","build","{root}/Invoice.csproj","-c","Release","--configfile","{project}/../../NuGet.Config","-o","{project}/artifacts/source","--nologo","--disable-build-servers"],"artifacts":["{project}/artifacts/source/Invoice.dll"]},
+    {"id":"destino","root":"target1","argv":["cmake","--build","{bin}/..","--target","demo_target","demo_different"],"cwd":"{project}/../..","artifacts":["{bin}/demo_target.exe"]}
+  ],
+  "cases":[
+    {"id":"normal","stdin":{"cents":1000,"rate":13},"comparator":"json","expected_stdout":{"total_cents":1130,"currency":"CRC"},"left":{"root":"source1","argv":["dotnet","{project}/artifacts/source/Invoice.dll"]},"right":{"root":"target1","argv":["{bin}/demo_target.exe"]},"observers":[{"kind":"files","path":"receipt.txt"}]},
+    {"id":"redondeo","stdin":{"cents":5,"rate":10},"comparator":"json","expected_stdout":{"total_cents":6,"currency":"CRC"},"left":{"root":"source1","argv":["dotnet","{project}/artifacts/source/Invoice.dll"]},"right":{"root":"target1","argv":["{bin}/demo_target.exe"]},"observers":[{"kind":"files","path":"receipt.txt"}]},
+    {"id":"cero","stdin":{"cents":0,"rate":0},"comparator":"json","expected_stdout":{"total_cents":0,"currency":"CRC"},"left":{"root":"source1","argv":["dotnet","{project}/artifacts/source/Invoice.dll"]},"right":{"root":"target1","argv":["{bin}/demo_target.exe"]},"observers":[{"kind":"files","path":"receipt.txt"}]},
+    {"id":"validacion","stdin":{"cents":-1,"rate":13},"expected_exit":2,"comparator":"json","expected_stdout":{"error":"out_of_range"},"left":{"root":"source1","argv":["dotnet","{project}/artifacts/source/Invoice.dll"]},"right":{"root":"target1","argv":["{bin}/demo_target.exe"]},"observers":[{"kind":"files","path":"receipt.txt","expect":"absent"}]},
+    {"id":"entrada_invalida","stdin":"no es json","expected_exit":2,"comparator":"json","expected_stdout":{"error":"invalid_input"},"left":{"root":"source1","argv":["dotnet","{project}/artifacts/source/Invoice.dll"]},"right":{"root":"target1","argv":["{bin}/demo_target.exe"]},"observers":[{"kind":"files","path":"receipt.txt","expect":"absent"}]},
+    {"id":"overflow","stdin":{"cents":9223372036854775807,"rate":13},"expected_exit":2,"comparator":"json","expected_stdout":{"error":"invalid_input"},"left":{"root":"source1","argv":["dotnet","{project}/artifacts/source/Invoice.dll"]},"right":{"root":"target1","argv":["{bin}/demo_target.exe"]},"observers":[{"kind":"files","path":"receipt.txt","expect":"absent"}]}
+  ],
+  "mappings":[]
+}
