@@ -149,6 +149,7 @@ void update_ancestors_delta(Database& db, int64_t root_id, uint64_t start_parent
     if (d_files == 0 && d_dirs == 0 && d_bytes == 0) return;
     uint64_t cur = start_parent_frn;
     std::unordered_set<uint64_t> visited;
+    int hops = 0;
     for (int hop = 0; hop < 256 && cur != 0; ++hop) {
         if (!visited.insert(cur).second) break;
         auto rows = db.query("SELECT parent_frn FROM fs_dirs WHERE root_id=? AND frn=?",
@@ -157,11 +158,14 @@ void update_ancestors_delta(Database& db, int64_t root_id, uint64_t start_parent
         db.exec("UPDATE fs_dirs SET total_files=MAX(0,total_files+?), total_dirs=MAX(0,total_dirs+?), "
                 "total_bytes=MAX(0,total_bytes+?) WHERE root_id=? AND frn=?",
                 {d_files, d_dirs, d_bytes, root_id, static_cast<int64_t>(cur)});
+        ++hops;
         cur = static_cast<uint64_t>(rows[0]["parent_frn"].get<int64_t>());
     }
-    db.exec("UPDATE fs_roots SET total_files=MAX(0,total_files+?), total_dirs=MAX(0,total_dirs+?), "
-            "total_bytes=MAX(0,total_bytes+?), last_sync_ns=? WHERE root_id=?",
-            {d_files, d_dirs, d_bytes, now_ns(), root_id});
+    if (hops > 0) {
+        db.exec("UPDATE fs_roots SET total_files=MAX(0,total_files+?), total_dirs=MAX(0,total_dirs+?), "
+                "total_bytes=MAX(0,total_bytes+?), last_sync_ns=? WHERE root_id=?",
+                {d_files, d_dirs, d_bytes, now_ns(), root_id});
+    }
 }
 
 std::string join_rel(const std::string& parent_rel, const std::string& name) {
@@ -239,6 +243,20 @@ bool match_glob_impl(std::string_view pat, std::string_view txt) {
 int64_t now_ns() {
     auto dur = std::chrono::system_clock::now().time_since_epoch();
     return std::chrono::duration_cast<std::chrono::nanoseconds>(dur).count();
+}
+
+bool is_link_reparse_tag(DWORD tag) {
+    return tag == IO_REPARSE_TAG_SYMLINK || tag == IO_REPARSE_TAG_MOUNT_POINT;
+}
+
+FsNodeKind classify_win32_node(uint32_t attrs, DWORD reparse_tag) {
+    const bool is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    const bool is_rep = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    if (is_rep && is_link_reparse_tag(reparse_tag)) {
+        if (reparse_tag == IO_REPARSE_TAG_MOUNT_POINT) return FsNodeKind::Junction;
+        return is_dir ? FsNodeKind::SymlinkDir : FsNodeKind::SymlinkFile;
+    }
+    return is_dir ? FsNodeKind::Directory : FsNodeKind::File;
 }
 
 bool fs_glob_match(std::string_view pattern, std::string_view text) {
@@ -353,14 +371,16 @@ uint64_t query_path_frn(const fs::path& path, uint64_t* out_parent_frn,
 }
 
 void fs_schema(Database& db) {
-    if (db.integer("SELECT COUNT(*) FROM meta WHERE key='fs_index_schema' AND value='1'") != 0) return;
+    if (db.integer("SELECT COUNT(*) FROM meta WHERE key='fs_index_schema' AND value='2'") != 0) return;
     ScopedTx tx(db);
-    if (db.integer("SELECT COUNT(*) FROM meta WHERE key='fs_index_schema' AND value='1'") != 0) {
+    if (db.integer("SELECT COUNT(*) FROM meta WHERE key='fs_index_schema' AND value='2'") != 0) {
         tx.commit();
         return;
     }
     sqlite3* raw = db.native_handle();
-    exec_raw(raw, R"sql(
+    const bool had_v1 = db.integer("SELECT COUNT(*) FROM meta WHERE key='fs_index_schema' AND value='1'") != 0;
+    if (!had_v1) {
+        exec_raw(raw, R"sql(
 CREATE TABLE IF NOT EXISTS fs_roots (
   root_id         INTEGER PRIMARY KEY AUTOINCREMENT,
   root_key        TEXT NOT NULL UNIQUE,
@@ -438,21 +458,36 @@ CREATE TABLE IF NOT EXISTS fs_errors (
   message    TEXT NOT NULL DEFAULT ''
 );
 )sql");
-    create_fs_secondary_indexes(raw);
+        create_fs_secondary_indexes(raw);
 
-    std::string tok = "trigram";
-    try {
-        exec_raw(raw,
-            "CREATE VIRTUAL TABLE IF NOT EXISTS fs_name_fts USING fts5(name, content='fs_nodes', content_rowid='node_id', tokenize='trigram');"
-            "CREATE VIRTUAL TABLE IF NOT EXISTS fs_dir_fts USING fts5(root_id UNINDEXED, frn UNINDEXED, rel_path, tokenize='trigram');");
-    } catch (...) {
-        tok = "unicode61";
-        exec_raw(raw,
-            "CREATE VIRTUAL TABLE IF NOT EXISTS fs_name_fts USING fts5(name, content='fs_nodes', content_rowid='node_id', tokenize='unicode61');"
-            "CREATE VIRTUAL TABLE IF NOT EXISTS fs_dir_fts USING fts5(root_id UNINDEXED, frn UNINDEXED, rel_path, tokenize='unicode61');");
+        std::string tok = "trigram";
+        try {
+            exec_raw(raw,
+                "CREATE VIRTUAL TABLE IF NOT EXISTS fs_name_fts USING fts5(name, content='fs_nodes', content_rowid='node_id', tokenize='trigram');"
+                "CREATE VIRTUAL TABLE IF NOT EXISTS fs_dir_fts USING fts5(root_id UNINDEXED, frn UNINDEXED, rel_path, tokenize='trigram');");
+        } catch (...) {
+            tok = "unicode61";
+            exec_raw(raw,
+                "CREATE VIRTUAL TABLE IF NOT EXISTS fs_name_fts USING fts5(name, content='fs_nodes', content_rowid='node_id', tokenize='unicode61');"
+                "CREATE VIRTUAL TABLE IF NOT EXISTS fs_dir_fts USING fts5(root_id UNINDEXED, frn UNINDEXED, rel_path, tokenize='unicode61');");
+        }
+        db.exec("INSERT OR REPLACE INTO meta(key,value) VALUES('fs_fts_tokenizer',?)", {tok});
     }
-    db.exec("INSERT OR REPLACE INTO meta(key,value) VALUES('fs_fts_tokenizer',?)", {tok});
-    db.exec("INSERT OR REPLACE INTO meta(key,value) VALUES('fs_index_schema','1')");
+    exec_raw(raw, R"sql(
+CREATE TABLE IF NOT EXISTS fs_hashes (
+  root_id        INTEGER NOT NULL,
+  frn            INTEGER NOT NULL,
+  size_bytes     INTEGER NOT NULL,
+  mtime_ns       INTEGER NOT NULL,
+  partial_sha256 TEXT NOT NULL DEFAULT '',
+  full_sha256    TEXT NOT NULL DEFAULT '',
+  computed_ns    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(root_id, frn)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_fs_hashes_full ON fs_hashes(full_sha256) WHERE full_sha256 <> '';
+CREATE INDEX IF NOT EXISTS idx_fs_nodes_size ON fs_nodes(root_id, size_bytes) WHERE kind=0 AND (flags & 1)=0;
+)sql");
+    db.exec("INSERT OR REPLACE INTO meta(key,value) VALUES('fs_index_schema','2')");
     tx.commit();
 }
 
@@ -1055,44 +1090,54 @@ bool fs_apply_delete(Database& db, int64_t root_id, uint64_t frn, bool log_chang
     const std::string rel = join_rel(lookup_dir_rel(db, root_id, parent_frn), name);
 
     if (kind == static_cast<int>(FsNodeKind::Directory)) {
-        auto drow = db.query("SELECT rel_path, total_files, total_dirs, total_bytes FROM fs_dirs WHERE root_id=? AND frn=?",
-                             {root_id, static_cast<int64_t>(frn)});
-        int64_t d_files = 0, d_dirs = 0, d_bytes = 0;
-        std::string dir_rel = rel;
-        if (!drow.empty()) {
-            dir_rel = drow[0]["rel_path"].get<std::string>();
-            d_files = drow[0]["total_files"].get<int64_t>();
-            d_dirs = drow[0]["total_dirs"].get<int64_t>();
-            d_bytes = drow[0]["total_bytes"].get<int64_t>();
-        }
-        const std::string pfx = dir_rel + "/";
-        const std::string hi = dir_rel + "0";
+        // Collect ALL descendant directories recursively by parent_frn (immune to any rel_path mismatch)
+        auto subdirs = db.query(
+            "WITH RECURSIVE sub(frn) AS ("
+            "  VALUES(?)"
+            "  UNION ALL"
+            "  SELECT n.frn FROM fs_nodes n JOIN sub s ON n.parent_frn=s.frn "
+            "  WHERE n.root_id=? AND n.kind=1 AND (n.flags & 1)=0"
+            ") SELECT frn FROM sub",
+            {static_cast<int64_t>(frn), root_id});
 
-        // Collect all descendant dir FRNs (including frn) and remove their children from fs_name_fts & fs_nodes
-        auto subdirs = db.query("SELECT frn FROM fs_dirs WHERE root_id=? AND (frn=? OR (rel_path>=? AND rel_path<?))",
-                                {root_id, static_cast<int64_t>(frn), pfx, hi});
+        int64_t actual_files = 0, actual_dirs = 0, actual_links = 0, actual_bytes = 0;
         for (const auto& sd : subdirs) {
-            int64_t sd_frn = sd["frn"].get<int64_t>();
-            auto children = db.query("SELECT node_id, name FROM fs_nodes WHERE root_id=? AND parent_frn=? AND (flags & 1)=0",
-                                     {root_id, sd_frn});
+            const int64_t sd_frn = sd["frn"].get<int64_t>();
+            auto children = db.query(
+                "SELECT node_id, frn, name, kind, size_bytes FROM fs_nodes "
+                "WHERE root_id=? AND parent_frn=? AND (flags & 1)=0",
+                {root_id, sd_frn});
             for (const auto& ch : children) {
                 db.exec("INSERT INTO fs_name_fts(fs_name_fts, rowid, name) VALUES('delete',?,?)",
                         {ch["node_id"], ch["name"]});
+                const int ck = ch["kind"].get<int>();
+                if (ck == static_cast<int>(FsNodeKind::File)) {
+                    ++actual_files;
+                    actual_bytes += ch["size_bytes"].get<int64_t>();
+                } else if (ck == static_cast<int>(FsNodeKind::Directory)) {
+                    ++actual_dirs;
+                } else {
+                    ++actual_links;
+                }
             }
             db.exec("DELETE FROM fs_nodes WHERE root_id=? AND parent_frn=?", {root_id, sd_frn});
+            db.exec("DELETE FROM fs_hashes WHERE root_id=? AND frn=?", {root_id, sd_frn});
+            db.exec("DELETE FROM fs_dir_fts WHERE root_id=? AND frn=?", {root_id, sd_frn});
+            db.exec("DELETE FROM fs_dirs WHERE root_id=? AND frn=?", {root_id, sd_frn});
         }
         db.exec("INSERT INTO fs_name_fts(fs_name_fts, rowid, name) VALUES('delete',?,?)", {node_id, name});
         db.exec("DELETE FROM fs_nodes WHERE node_id=?", {node_id});
-        db.exec("DELETE FROM fs_dir_fts WHERE root_id=? AND (frn=? OR (rel_path>=? AND rel_path<?))",
-                {root_id, static_cast<int64_t>(frn), pfx, hi});
-        db.exec("DELETE FROM fs_dirs WHERE root_id=? AND (frn=? OR (rel_path>=? AND rel_path<?))",
-                {root_id, static_cast<int64_t>(frn), pfx, hi});
         db.exec("UPDATE fs_dirs SET direct_dirs=MAX(0,direct_dirs-1) WHERE root_id=? AND frn=?",
                 {root_id, static_cast<int64_t>(parent_frn)});
-        update_ancestors_delta(db, root_id, parent_frn, -d_files, -(d_dirs + 1), -d_bytes);
+        update_ancestors_delta(db, root_id, parent_frn, -actual_files, -(actual_dirs + 1), -actual_bytes);
+        if (actual_links > 0) {
+            db.exec("UPDATE fs_roots SET total_links=MAX(0,total_links-?), last_sync_ns=? WHERE root_id=?",
+                    {actual_links, now_ns(), root_id});
+        }
     } else {
         db.exec("INSERT INTO fs_name_fts(fs_name_fts, rowid, name) VALUES('delete',?,?)", {node_id, name});
         db.exec("DELETE FROM fs_nodes WHERE node_id=?", {node_id});
+        db.exec("DELETE FROM fs_hashes WHERE root_id=? AND frn=?", {root_id, static_cast<int64_t>(frn)});
         if (kind == static_cast<int>(FsNodeKind::File)) {
             db.exec("UPDATE fs_dirs SET direct_files=MAX(0,direct_files-1) WHERE root_id=? AND frn=?",
                     {root_id, static_cast<int64_t>(parent_frn)});
@@ -1107,6 +1152,229 @@ bool fs_apply_delete(Database& db, int64_t root_id, uint64_t frn, bool log_chang
     }
     tx.commit();
     return true;
+}
+
+Json fs_rebuild_dir_rollups(Database& db, int64_t root_id) {
+    fs_schema(db);
+    auto t0 = std::chrono::steady_clock::now();
+    ScopedTx tx(db);
+
+    auto rrows = db.query("SELECT root_frn FROM fs_roots WHERE root_id=?", {root_id});
+    if (rrows.empty()) {
+        tx.commit();
+        return {{"rebuilt", false}, {"reason", "ROOT_NOT_FOUND"}};
+    }
+    const uint64_t root_frn = static_cast<uint64_t>(rrows[0]["root_frn"].get<int64_t>());
+
+    // Load extension names
+    std::vector<std::string> ext_names;
+    db.each("SELECT ext_id, ext FROM fs_extensions ORDER BY ext_id", Json::array(), [&](const Json& r) {
+        size_t id = static_cast<size_t>(std::max<int64_t>(0, r["ext_id"].get<int64_t>()));
+        if (id >= ext_names.size()) ext_names.resize(id + 1);
+        ext_names[id] = r["ext"].get<std::string>();
+        return true;
+    });
+
+    struct DirAcc {
+        uint64_t frn = 0;
+        uint64_t parent_frn = 0;
+        std::string name;
+        std::string rel_path;
+        int depth = -1;
+        int64_t mtime_ns = 0;
+        int64_t direct_files = 0;
+        int64_t direct_dirs = 0;
+        int64_t total_files = 0;
+        int64_t total_dirs = 0;
+        int64_t total_bytes = 0;
+        std::vector<std::pair<int32_t, int64_t>> ext_counts;
+    };
+
+    std::unordered_map<uint64_t, DirAcc> dirs;
+    // Preserve root_dir mtime
+    int64_t root_mtime = 0;
+    auto rd_row = db.query("SELECT dir_mtime_ns FROM fs_dirs WHERE root_id=? AND frn=?",
+                           {root_id, static_cast<int64_t>(root_frn)});
+    if (!rd_row.empty()) root_mtime = rd_row[0]["dir_mtime_ns"].get<int64_t>();
+    {
+        DirAcc root_d;
+        root_d.frn = root_frn;
+        root_d.parent_frn = 0;
+        root_d.rel_path = "";
+        root_d.depth = 0;
+        root_d.mtime_ns = root_mtime;
+        dirs.emplace(root_frn, std::move(root_d));
+    }
+
+    // Pass 1: Load all live directory nodes from fs_nodes
+    db.each("SELECT frn, parent_frn, name, mtime_ns FROM fs_nodes WHERE root_id=? AND kind=1 AND (flags & 1)=0",
+            {root_id}, [&](const Json& r) {
+                uint64_t f = static_cast<uint64_t>(r["frn"].get<int64_t>());
+                if (f == root_frn) return true;
+                DirAcc d;
+                d.frn = f;
+                d.parent_frn = static_cast<uint64_t>(r["parent_frn"].get<int64_t>());
+                d.name = r["name"].get<std::string>();
+                d.mtime_ns = r["mtime_ns"].get<int64_t>();
+                dirs.emplace(f, std::move(d));
+                return true;
+            });
+
+    // Resolve rel_path & depth for all reachable dirs from root_frn; drop any disconnected orphan dirs
+    std::function<int(uint64_t, int)> resolve_dir = [&](uint64_t f, int guard) -> int {
+        auto it = dirs.find(f);
+        if (it == dirs.end()) return -2;
+        if (it->second.depth >= 0) return it->second.depth;
+        if (it->second.depth == -2 || guard > 256 || it->second.parent_frn == 0 || it->second.parent_frn == f) {
+            it->second.depth = -2;
+            return -2;
+        }
+        it->second.depth = -2; // cycle guard
+        int pd = resolve_dir(it->second.parent_frn, guard + 1);
+        if (pd < 0) return -2;
+        auto pit = dirs.find(it->second.parent_frn);
+        it->second.rel_path = pit->second.rel_path.empty() ? it->second.name : (pit->second.rel_path + "/" + it->second.name);
+        it->second.depth = pd + 1;
+        return it->second.depth;
+    };
+    std::vector<uint64_t> orphan_dir_frns;
+    for (auto& [f, _] : dirs) {
+        if (resolve_dir(f, 0) < 0) orphan_dir_frns.push_back(f);
+    }
+    for (uint64_t of : orphan_dir_frns) dirs.erase(of);
+
+    // Count direct_dirs
+    for (const auto& [f, d] : dirs) {
+        if (f == root_frn) continue;
+        auto pit = dirs.find(d.parent_frn);
+        if (pit != dirs.end()) ++pit->second.direct_dirs;
+    }
+
+    auto add_ext_count = [](std::vector<std::pair<int32_t, int64_t>>& vec, int32_t eid, int64_t cnt) {
+        if (eid <= 0 || cnt <= 0) return;
+        for (auto& [k, v] : vec) {
+            if (k == eid) { v += cnt; return; }
+        }
+        if (vec.size() < 24) vec.emplace_back(eid, cnt);
+        else {
+            auto min_it = std::min_element(vec.begin(), vec.end(),
+                                           [](const auto& a, const auto& b) { return a.second < b.second; });
+            if (min_it != vec.end() && cnt > min_it->second) *min_it = {eid, cnt};
+        }
+    };
+
+    // Pass 2: Accumulate all live non-dir nodes into their exact parent directory; collect orphan nodes to purge
+    int64_t total_files = 0, total_links = 0, total_bytes = 0, orphans_purged = 0;
+    std::vector<std::pair<int64_t, std::string>> orphan_nodes;
+    db.each("SELECT node_id, frn, parent_frn, name, ext_id, kind, size_bytes FROM fs_nodes "
+            "WHERE root_id=? AND kind<>1 AND (flags & 1)=0",
+            {root_id}, [&](const Json& r) {
+                uint64_t pf = static_cast<uint64_t>(r["parent_frn"].get<int64_t>());
+                auto pit = dirs.find(pf);
+                if (pit == dirs.end()) {
+                    orphan_nodes.emplace_back(r["node_id"].get<int64_t>(), r["name"].get<std::string>());
+                    return true;
+                }
+                const int k = r["kind"].get<int>();
+                const int64_t sz = r["size_bytes"].get<int64_t>();
+                const int32_t eid = static_cast<int32_t>(r["ext_id"].get<int64_t>());
+                if (k == static_cast<int>(FsNodeKind::File)) {
+                    ++total_files;
+                    total_bytes += sz;
+                    ++pit->second.direct_files;
+                    ++pit->second.total_files;
+                    pit->second.total_bytes += sz;
+                    add_ext_count(pit->second.ext_counts, eid, 1);
+                } else {
+                    ++total_links;
+                }
+                return true;
+            });
+
+    // Purge any orphaned directory or file nodes so fs_nodes, fs_name_fts, fs_dirs & fs_roots are 100% consistent
+    for (uint64_t of : orphan_dir_frns) {
+        auto o_rows = db.query("SELECT node_id, name FROM fs_nodes WHERE root_id=? AND frn=?",
+                               {root_id, static_cast<int64_t>(of)});
+        for (const auto& r : o_rows) orphan_nodes.emplace_back(r["node_id"].get<int64_t>(), r["name"].get<std::string>());
+    }
+    for (const auto& [nid, nm] : orphan_nodes) {
+        db.exec("INSERT INTO fs_name_fts(fs_name_fts, rowid, name) VALUES('delete',?,?)", {nid, nm});
+        db.exec("DELETE FROM fs_nodes WHERE node_id=?", {nid});
+        ++orphans_purged;
+    }
+
+    // Bottom-up rollups ordered strictly by depth descending
+    std::vector<DirAcc*> ordered;
+    ordered.reserve(dirs.size());
+    for (auto& [_, d] : dirs) ordered.push_back(&d);
+    std::sort(ordered.begin(), ordered.end(), [](const DirAcc* a, const DirAcc* b) { return a->depth > b->depth; });
+    for (DirAcc* d : ordered) {
+        if (d->frn == root_frn || d->parent_frn == 0) continue;
+        auto pit = dirs.find(d->parent_frn);
+        if (pit == dirs.end() || pit->first == d->frn) continue;
+        pit->second.total_files += d->total_files;
+        pit->second.total_dirs += d->total_dirs + 1;
+        pit->second.total_bytes += d->total_bytes;
+        for (const auto& [eid, cnt] : d->ext_counts) add_ext_count(pit->second.ext_counts, eid, cnt);
+    }
+
+    // Persist rebuilt fs_dirs + fs_dir_fts + fs_roots atomically
+    sqlite3* raw = db.native_handle();
+    db.exec("DELETE FROM fs_dirs WHERE root_id=?", {root_id});
+    db.exec("DELETE FROM fs_dir_fts WHERE root_id=?", {root_id});
+    RawStmt ins_dir(raw,
+        "INSERT INTO fs_dirs(root_id,frn,parent_frn,rel_path,depth,dir_mtime_ns,direct_files,direct_dirs,total_files,total_dirs,total_bytes,top_exts) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)");
+    RawStmt ins_dfts(raw, "INSERT INTO fs_dir_fts(root_id,frn,rel_path) VALUES(?,?,?)");
+
+    for (DirAcc* d : ordered) {
+        std::sort(d->ext_counts.begin(), d->ext_counts.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        Json top = Json::object();
+        for (size_t k = 0; k < std::min<size_t>(8, d->ext_counts.size()); ++k) {
+            size_t eid = static_cast<size_t>(d->ext_counts[k].first);
+            if (eid > 0 && eid < ext_names.size()) top[ext_names[eid]] = d->ext_counts[k].second;
+        }
+        std::string top_s = top.dump();
+        ins_dir.reset();
+        sqlite3_bind_int64(ins_dir.s, 1, root_id);
+        sqlite3_bind_int64(ins_dir.s, 2, static_cast<int64_t>(d->frn));
+        sqlite3_bind_int64(ins_dir.s, 3, static_cast<int64_t>(d->parent_frn));
+        sqlite3_bind_text(ins_dir.s, 4, d->rel_path.c_str(), static_cast<int>(d->rel_path.size()), SQLITE_STATIC);
+        sqlite3_bind_int(ins_dir.s, 5, d->depth);
+        sqlite3_bind_int64(ins_dir.s, 6, d->mtime_ns);
+        sqlite3_bind_int64(ins_dir.s, 7, d->direct_files);
+        sqlite3_bind_int64(ins_dir.s, 8, d->direct_dirs);
+        sqlite3_bind_int64(ins_dir.s, 9, d->total_files);
+        sqlite3_bind_int64(ins_dir.s, 10, d->total_dirs);
+        sqlite3_bind_int64(ins_dir.s, 11, d->total_bytes);
+        sqlite3_bind_text(ins_dir.s, 12, top_s.c_str(), static_cast<int>(top_s.size()), SQLITE_TRANSIENT);
+        if (sqlite3_step(ins_dir.s) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(raw));
+
+        if (!d->rel_path.empty()) {
+            ins_dfts.reset();
+            sqlite3_bind_int64(ins_dfts.s, 1, root_id);
+            sqlite3_bind_int64(ins_dfts.s, 2, static_cast<int64_t>(d->frn));
+            sqlite3_bind_text(ins_dfts.s, 3, d->rel_path.c_str(), static_cast<int>(d->rel_path.size()), SQLITE_STATIC);
+            if (sqlite3_step(ins_dfts.s) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(raw));
+        }
+    }
+
+    const int64_t total_dirs = static_cast<int64_t>(dirs.size()) > 0 ? static_cast<int64_t>(dirs.size() - 1) : 0;
+    db.exec("UPDATE fs_roots SET total_files=?, total_dirs=?, total_links=?, total_bytes=?, last_sync_ns=? WHERE root_id=?",
+            {total_files, total_dirs, total_links, total_bytes, now_ns(), root_id});
+    tx.commit();
+
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    return {
+        {"rebuilt", true},
+        {"total_files", total_files},
+        {"total_dirs", total_dirs},
+        {"total_links", total_links},
+        {"total_bytes", total_bytes},
+        {"orphans_purged", orphans_purged},
+        {"elapsed_ms", ms}
+    };
 }
 
 bool fs_sync_single_path(const Project& p, Database& db, const fs::path& abs_path, bool log_change) {
@@ -1143,14 +1411,9 @@ bool fs_sync_single_path(const Project& p, Database& db, const fs::path& abs_pat
                                     static_cast<int>(FsNodeKind::Directory), 0, d_mt, d_at, "", false);
                 }
             }
-            int kind = static_cast<int>(FsNodeKind::File);
-            if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
-                if (reparse_tag == IO_REPARSE_TAG_MOUNT_POINT) kind = static_cast<int>(FsNodeKind::Junction);
-                else kind = (attrs & FILE_ATTRIBUTE_DIRECTORY) ? static_cast<int>(FsNodeKind::SymlinkDir) : static_cast<int>(FsNodeKind::SymlinkFile);
-            } else if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
-                kind = static_cast<int>(FsNodeKind::Directory);
-                size_bytes = 0;
-            }
+            const FsNodeKind kenum = classify_win32_node(attrs, reparse_tag);
+            const int kind = static_cast<int>(kenum);
+            if (kenum == FsNodeKind::Directory) size_bytes = 0;
             fs_apply_upsert(db, root_id, frn, parent_frn, utf8(abs_path.filename().wstring()),
                             kind, size_bytes, mtime_ns, attrs, "", log_change);
             return true;
@@ -1217,6 +1480,10 @@ Json fs_explore_tree(const Project& p, Database& db, const Json& args) {
     const std::string sort_by = to_lower_ascii(args.value("sort", "bytes"));
     const bool include_samples = args.value("include_samples", true);
     const int sample_limit = std::clamp(args.value("sample_limit", 5), 0, 50);
+    const bool flat = args.value("flat", false) ||
+                      args.value("format", "") == "columnar" ||
+                      args.value("format", "") == "compact_table";
+    const int ext_limit = std::clamp(args.value("extensions_limit", 8), 0, 24);
 
     std::string order_sql = "total_bytes DESC, total_files DESC";
     if (sort_by == "files") order_sql = "total_files DESC, total_bytes DESC";
@@ -1249,9 +1516,22 @@ Json fs_explore_tree(const Project& p, Database& db, const Json& args) {
                 {"direct_dirs", drow["direct_dirs"]},
                 {"total_files", drow["total_files"]},
                 {"total_dirs", drow["total_dirs"]},
-                {"total_bytes", drow["total_bytes"]},
-                {"top_extensions", Json::parse(drow["top_exts"].get<std::string>(), nullptr, false)}
+                {"total_bytes", drow["total_bytes"]}
             };
+            if (ext_limit > 0) {
+                auto parsed_ext = Json::parse(drow["top_exts"].get<std::string>(), nullptr, false);
+                if (parsed_ext.is_object()) {
+                    if (static_cast<int>(parsed_ext.size()) > ext_limit) {
+                        Json trimmed = Json::object();
+                        int k = 0;
+                        for (auto it = parsed_ext.begin(); it != parsed_ext.end() && k < ext_limit; ++it, ++k)
+                            trimmed[it.key()] = it.value();
+                        node["top_extensions"] = std::move(trimmed);
+                    } else {
+                        node["top_extensions"] = std::move(parsed_ext);
+                    }
+                }
+            }
             if (cur_depth < max_depth) {
                 auto children = db.query(
                     "SELECT frn,rel_path,depth,dir_mtime_ns,direct_files,direct_dirs,total_files,total_dirs,total_bytes,top_exts "
@@ -1290,9 +1570,41 @@ Json fs_explore_tree(const Project& p, Database& db, const Json& args) {
         grand_files += target[0]["total_files"].get<int64_t>();
         grand_dirs += target[0]["total_dirs"].get<int64_t>();
         grand_bytes += target[0]["total_bytes"].get<int64_t>();
-        items.push_back(expand_dir(rid, rkey, target[0], 0));
+        if (flat) {
+            const int base_depth = target[0]["depth"].get<int>();
+            const int hi_depth = base_depth + max_depth;
+            Json flat_rows;
+            if (req_path.empty()) {
+                flat_rows = db.query(
+                    "SELECT rel_path,depth,direct_files,direct_dirs,total_files,total_dirs,total_bytes "
+                    "FROM fs_dirs WHERE root_id=? AND depth>=? AND depth<=? ORDER BY " + order_sql + " LIMIT ?",
+                    {rid, base_depth, hi_depth, limit});
+            } else {
+                flat_rows = db.query(
+                    "SELECT rel_path,depth,direct_files,direct_dirs,total_files,total_dirs,total_bytes "
+                    "FROM fs_dirs WHERE root_id=? AND (rel_path=? OR (rel_path>=? AND rel_path<?)) AND depth<=? "
+                    "ORDER BY " + order_sql + " LIMIT ?",
+                    {rid, req_path, req_path + "/", req_path + "0", hi_depth, limit});
+            }
+            for (const auto& fr : flat_rows) {
+                std::string rel = fr["rel_path"].get<std::string>();
+                items.push_back({
+                    {"root", rkey},
+                    {"path", rel.empty() ? "." : rel},
+                    {"depth", fr["depth"]},
+                    {"direct_files", fr["direct_files"]},
+                    {"direct_dirs", fr["direct_dirs"]},
+                    {"total_files", fr["total_files"]},
+                    {"total_dirs", fr["total_dirs"]},
+                    {"total_bytes", fr["total_bytes"]}
+                });
+            }
+        } else {
+            items.push_back(expand_dir(rid, rkey, target[0], 0));
+        }
     }
 
+    const size_t returned_cnt = items.size();
     auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     return {
         {"schema", "migratool.explore_tree/1"},
@@ -1300,6 +1612,8 @@ Json fs_explore_tree(const Project& p, Database& db, const Json& args) {
         {"mode", project_mode(p)},
         {"path", req_path.empty() ? "." : req_path},
         {"depth", max_depth},
+        {"flat", flat},
+        {"returned", returned_cnt},
         {"summary", {{"total_files", grand_files}, {"total_dirs", grand_dirs}, {"total_bytes", grand_bytes}}},
         {"elapsed_us", elapsed_us},
         {"items", std::move(items)}
@@ -1423,11 +1737,12 @@ Json fs_find_files(const Project& p, Database& db, const Json& args) {
                 {"frn", row["frn"]}
             });
         }
+        const size_t dir_returned = items.size();
         return {
             {"schema", "migratool.find_files/1"},
             {"strategy", (has_trigram && query_text.size() >= 3) ? "fs_dir_fts_trigram" : "fs_dirs_btree"},
             {"items", std::move(items)},
-            {"returned", rows.size()},
+            {"returned", dir_returned},
             {"has_more", more},
             {"next_cursor", more ? Json(std::to_string(offset + limit)) : Json(nullptr)},
             {"elapsed_us", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()}

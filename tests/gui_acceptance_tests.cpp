@@ -241,9 +241,13 @@ int wmain(int argc, wchar_t** argv) {
 
         // Verify HIG contrast metrics directly from ui::system_palette()
         const auto pal = ui::system_palette();
-        check(ui::contrast(pal.text, pal.surface) >= 4.5, "Contraste texto/superficie >= 4.5:1");
+        check(ui::contrast(pal.text, pal.surface) >= 7.0, "Contraste texto principal/superficie >= 7.0:1 (WCAG AAA)");
+        check(ui::contrast(pal.secondary, pal.surface) >= 4.5, "Contraste texto secundario/superficie >= 4.5:1 (WCAG AA)");
         check(ui::contrast(pal.selection_text, pal.selection) >= 4.5, "Contraste selección >= 4.5:1");
         check(ui::contrast(pal.accent, pal.surface) >= 4.5, "Contraste acento/superficie >= 4.5:1");
+        check(ui::contrast(pal.success_text, pal.success_bg) >= 4.5, "Contraste estado éxito >= 4.5:1");
+        check(ui::contrast(pal.warning_text, pal.warning_bg) >= 4.5, "Contraste estado advertencia >= 4.5:1");
+        check(ui::contrast(pal.danger_text, pal.danger_bg) >= 4.5, "Contraste estado peligro >= 4.5:1");
 
         // Launch real Migratool-0.3.exe with the project file
         const auto gui_exe = executable_dir() / L"Migratool-0.3.exe";
@@ -387,8 +391,9 @@ int wmain(int argc, wchar_t** argv) {
         HWND form_hwnd = nullptr;
         wait_until([&] {
             form_hwnd = find_top_window_by_class(pi.dwProcessId, L"MigratoolForm");
-            return form_hwnd != nullptr && child_by_id(form_hwnd, 90) != nullptr && child_by_id(form_hwnd, 91) != nullptr;
+            return form_hwnd != nullptr && IsWindowVisible(form_hwnd) && child_by_id(form_hwnd, 90) != nullptr && child_by_id(form_hwnd, 91) != nullptr;
         }, "Formulario guiado de configuración abierto con selectores de modo y duplicados");
+        Sleep(80);
         save_window_png(form_hwnd, evidence_dir / L"05-configuracion-guiada.png");
         PostMessageW(form_hwnd, WM_COMMAND, IDCANCEL, 0);
         wait_until([&] { return find_top_window_by_class(pi.dwProcessId, L"MigratoolForm") == nullptr; },
@@ -479,6 +484,8 @@ int wmain(int argc, wchar_t** argv) {
         // Page 0 (1000): Estado del proyecto includes development_control rows
         send_responsive(main_hwnd, WM_COMMAND, 1000, 0, 200);
         wait_until([&] { return listview_count(lv) >= 10; }, "Página 0 muestra filas incluyendo development_control");
+        Sleep(100);
+        save_window_png(main_hwnd, evidence_dir / L"00-estado-proyecto.png");
 
         // Close GUI cleanly
         PostMessageW(main_hwnd, WM_CLOSE, 0, 0);

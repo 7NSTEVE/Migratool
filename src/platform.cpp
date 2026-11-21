@@ -39,10 +39,72 @@ std::wstring wide(const std::string& s) {
     return out;
 }
 std::string path_text(const fs::path& p) { return utf8(p.generic_wstring()); }
+namespace {
+bool needs_extended_win32_prefix(std::wstring_view value) {
+    if (value.size() >= 248) return true;
+    size_t i = 0;
+    while (i < value.size()) {
+        size_t sep = value.find_first_of(L"\\/", i);
+        std::wstring_view seg = (sep == std::wstring_view::npos) ? value.substr(i) : value.substr(i, sep - i);
+        if (!seg.empty() && seg != L"." && seg != L".." && (seg.back() == L' ' || seg.back() == L'.')) {
+            return true;
+        }
+        if (sep == std::wstring_view::npos) break;
+        i = sep + 1;
+    }
+    return false;
+}
+
+std::wstring normalize_rooted_preserving_segments(std::wstring_view raw) {
+    // Normalize '/' -> '\\' and resolve '.' / '..' WITHOUT calling GetFullPathNameW,
+    // which would silently strip trailing spaces/dots from existing NTFS names.
+    std::wstring s(raw);
+    for (auto& c : s) if (c == L'/') c = L'\\';
+    const bool is_unc = s.starts_with(L"\\\\");
+    std::vector<std::wstring> parts;
+    std::wstring prefix;
+    size_t pos = 0;
+    if (is_unc) {
+        prefix = L"\\\\";
+        pos = 2;
+    } else if (s.size() >= 2 && s[1] == L':') {
+        prefix = s.substr(0, 2);
+        pos = 2;
+        if (pos < s.size() && s[pos] == L'\\') ++pos;
+    }
+    while (pos <= s.size()) {
+        size_t next = s.find(L'\\', pos);
+        std::wstring seg = (next == std::wstring::npos) ? s.substr(pos) : s.substr(pos, next - pos);
+        if (!seg.empty() && seg != L".") {
+            if (seg == L"..") {
+                if (!parts.empty() && (!is_unc || parts.size() > 2)) parts.pop_back();
+            } else {
+                parts.push_back(std::move(seg));
+            }
+        }
+        if (next == std::wstring::npos) break;
+        pos = next + 1;
+    }
+    std::wstring out = prefix;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (!is_unc || i > 0) out.push_back(L'\\');
+        out.append(parts[i]);
+    }
+    if (!is_unc && parts.empty() && out.size() == 2 && out[1] == L':') out.push_back(L'\\');
+    return out;
+}
+} // namespace
+
 fs::path native_path(const fs::path& path) {
     if (path.empty()) return path;
-    auto value = fs::absolute(path).lexically_normal().make_preferred().wstring();
-    if (value.starts_with(L"\\\\?\\") || value.starts_with(L"\\\\.\\") || value.size() < 248) return fs::path(value);
+    const std::wstring raw = path.wstring();
+    if (raw.starts_with(L"\\\\?\\") || raw.starts_with(L"\\\\.\\")) return path;
+    const bool already_rooted = (raw.size() >= 3 && raw[1] == L':' && (raw[2] == L'\\' || raw[2] == L'/'))
+                             || raw.starts_with(L"\\\\");
+    const std::wstring value = already_rooted
+        ? normalize_rooted_preserving_segments(raw)
+        : fs::absolute(path).lexically_normal().make_preferred().wstring();
+    if (!needs_extended_win32_prefix(value)) return fs::path(value);
     if (value.starts_with(L"\\\\")) return fs::path(L"\\\\?\\UNC\\" + value.substr(2));
     return fs::path(L"\\\\?\\" + value);
 }

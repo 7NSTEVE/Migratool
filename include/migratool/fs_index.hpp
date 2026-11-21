@@ -15,6 +15,16 @@ enum class FsNodeKind : int {
     Junction = 4
 };
 
+// True ONLY for actual filesystem link/junction reparse tags (excludes OneDrive Cloud Filter 0x9000*, WOF, dedup, etc.)
+bool is_link_reparse_tag(DWORD tag);
+
+// Single authoritative Win32 attribute + reparse tag -> FsNodeKind classifier
+FsNodeKind classify_win32_node(uint32_t attrs, DWORD reparse_tag);
+
+// Recompute exact fs_dirs rollups (direct_files, direct_dirs, total_files, total_dirs, total_bytes, top_exts)
+// and fs_roots totals directly from live fs_nodes rows (<120ms for 100K+ dirs). Guarantees zero rollup drift.
+Json fs_rebuild_dir_rollups(Database& db, int64_t root_id);
+
 // Lightweight bulk record used by Tier A (MFT) / Tier B (multi-thread crawler) / synthetic stress tests
 struct FsBulkEntry {
     uint64_t frn = 0;

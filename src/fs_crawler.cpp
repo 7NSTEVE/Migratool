@@ -438,12 +438,15 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
                             const std::string child_rel = task.rel_path.empty() ? name : (task.rel_path + "/" + name);
                             const uint32_t attrs = info->FileAttributes;
                             const bool is_reparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-                            const bool is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                            const DWORD reparse_tag = is_reparse ? info->EaSize : 0;
+                            const FsNodeKind kenum = classify_win32_node(attrs, reparse_tag);
+                            const bool is_link_node = (kenum == FsNodeKind::Junction || kenum == FsNodeKind::SymlinkDir || kenum == FsNodeKind::SymlinkFile);
+                            const bool is_dir = (kenum == FsNodeKind::Directory);
                             uint64_t child_frn = static_cast<uint64_t>(info->FileId.QuadPart);
                             if (child_frn == 0) child_frn = synthetic_frn(task.frn, name_low);
                             const int64_t mtime = ft_to_ns(info->LastWriteTime);
 
-                            if (is_dir && !is_reparse) {
+                            if (is_dir) {
                                 fs::path child_full = task.full_path / std::wstring(wname);
                                 if (!filters.should_skip_dir(child_full, child_rel, name_low)) {
                                     FsBulkEntry entry;
@@ -466,18 +469,16 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
 
                                     new_subdirs.push_back(DirTask{std::move(child_full), child_rel, child_frn, task.depth + 1});
                                 }
-                            } else if (is_reparse) {
+                            } else if (is_link_node) {
                                 // Record symlink/junction and target WITHOUT recursing (AGENTS.md Rule #6)
                                 fs::path child_full = task.full_path / std::wstring(wname);
                                 FsBulkEntry entry;
                                 entry.frn = child_frn;
                                 entry.parent_frn = task.frn;
                                 entry.name = name;
-                                entry.ext = is_dir ? "" : extract_ext(name);
-                                const DWORD tag = info->EaSize;
-                                if (tag == IO_REPARSE_TAG_MOUNT_POINT) entry.kind = static_cast<int>(FsNodeKind::Junction);
-                                else entry.kind = is_dir ? static_cast<int>(FsNodeKind::SymlinkDir) : static_cast<int>(FsNodeKind::SymlinkFile);
-                                entry.size_bytes = is_dir ? 0 : info->EndOfFile.QuadPart;
+                                entry.ext = (attrs & FILE_ATTRIBUTE_DIRECTORY) ? "" : extract_ext(name);
+                                entry.kind = static_cast<int>(kenum);
+                                entry.size_bytes = (attrs & FILE_ATTRIBUTE_DIRECTORY) ? 0 : std::max<int64_t>(0, info->EndOfFile.QuadPart);
                                 entry.mtime_ns = mtime;
                                 entry.attrs = attrs;
                                 entry.link_target = read_reparse_target(child_full);
@@ -614,26 +615,24 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
                 sqlite3_bind_text(ins_node.s, 10, e.link_target.c_str(), static_cast<int>(e.link_target.size()), SQLITE_STATIC);
                 if (sqlite3_step(ins_node.s) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(raw));
 
-                auto pit = dirs.find(e.parent_frn);
-                if (pit == dirs.end()) pit = dirs.find(root_frn);
+                // Fix D1: stub-create missing parent_frn instead of misattributing out-of-order worker batches to root_frn!
+                auto [pit, created_stub] = dirs.try_emplace(e.parent_frn);
+                if (created_stub) {
+                    pit->second.frn = e.parent_frn;
+                    pit->second.parent_frn = 0; // filled when parent's discovered_dirs batch arrives
+                }
                 if (e.kind == static_cast<int>(FsNodeKind::Directory)) {
                     ++total_dirs;
-                    if (pit != dirs.end()) ++pit->second.direct_dirs;
+                    ++pit->second.direct_dirs;
                 } else if (e.kind == static_cast<int>(FsNodeKind::File)) {
                     ++total_files;
                     total_bytes += e.size_bytes;
-                    if (pit != dirs.end()) {
-                        ++pit->second.direct_files;
-                        pit->second.total_files += 1;
-                        pit->second.total_bytes += e.size_bytes;
-                        if (eid != 0) add_ext_count(pit->second.ext_counts, eid, 1);
-                    }
+                    ++pit->second.direct_files;
+                    pit->second.total_files += 1;
+                    pit->second.total_bytes += e.size_bytes;
+                    if (eid != 0) add_ext_count(pit->second.ext_counts, eid, 1);
                 } else {
                     ++total_links;
-                    if (pit != dirs.end()) {
-                        ++pit->second.direct_files;
-                        pit->second.total_files += 1;
-                    }
                 }
                 if (++pending_in_tx >= TX_BATCH) {
                     commit_tx();
@@ -661,9 +660,23 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
     auto t_crawl = std::chrono::steady_clock::now();
 
     // Bottom-up rollups on dirs map (~50ms for 277K dirs)
+    // First ensure any unresolved stub inherits root_frn and recompute exact depths from parent_frn chain
+    std::function<int(uint64_t, int)> calc_depth = [&](uint64_t f, int guard) -> int {
+        if (f == root_frn) return 0;
+        auto it = dirs.find(f);
+        if (it == dirs.end() || guard > 256 || it->second.parent_frn == 0 || it->second.parent_frn == f) return 1;
+        return 1 + calc_depth(it->second.parent_frn, guard + 1);
+    };
     std::vector<DirStat*> ordered_dirs;
     ordered_dirs.reserve(dirs.size());
-    for (auto& [_, d] : dirs) ordered_dirs.push_back(&d);
+    for (auto& [frn_k, d] : dirs) {
+        if (frn_k != root_frn && d.parent_frn == 0 && d.rel_path.empty()) {
+            // Orphan stub whose parent dir never arrived (e.g., cancelled); fold into root_frn
+            d.parent_frn = root_frn;
+        }
+        d.depth = (frn_k == root_frn) ? 0 : calc_depth(frn_k, 0);
+        ordered_dirs.push_back(&d);
+    }
     std::sort(ordered_dirs.begin(), ordered_dirs.end(),
               [](const DirStat* a, const DirStat* b) { return a->depth > b->depth; });
     for (DirStat* d : ordered_dirs) {
@@ -912,10 +925,22 @@ Json crawl_root_mft(const Project& p, Database& db, int64_t root_id, const fs::p
         e.frn = r.frn;
         e.parent_frn = r.parent_frn;
         e.name = name_arena.substr(r.name_off, r.name_len);
-        const bool is_dir = (r.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
         const bool is_rep = (r.attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-        e.kind = is_rep ? (is_dir ? static_cast<int>(FsNodeKind::SymlinkDir) : static_cast<int>(FsNodeKind::SymlinkFile))
-                        : (is_dir ? static_cast<int>(FsNodeKind::Directory) : static_cast<int>(FsNodeKind::File));
+        DWORD rtag = 0;
+        if (is_rep) {
+            FILE_ID_DESCRIPTOR desc{};
+            desc.dwSize = sizeof(desc);
+            desc.Type = FileIdType;
+            desc.FileId.QuadPart = static_cast<LONGLONG>(r.frn);
+            HandleGuard fh(OpenFileById(vh.h, &desc, FILE_READ_ATTRIBUTES,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        nullptr, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT));
+            if (fh.h != INVALID_HANDLE_VALUE) {
+                FILE_ATTRIBUTE_TAG_INFO ati{};
+                if (GetFileInformationByHandleEx(fh.h, FileAttributeTagInfo, &ati, sizeof(ati))) rtag = ati.ReparseTag;
+            }
+        }
+        e.kind = static_cast<int>(classify_win32_node(r.attrs, rtag));
         e.ext = (e.kind == static_cast<int>(FsNodeKind::Directory)) ? "" : extract_ext(e.name);
         e.attrs = r.attrs;
         filtered.push_back(std::move(e));
@@ -1047,38 +1072,91 @@ Json fs_usn_replay_root(const Project& p, Database& db, const Json& root_cfg, Ca
         if (cursor_usn >= cur.next_usn) break;
     }
 
-    // Apply coalesced FRN ops inside one transaction
-    db.begin();
-    try {
-        for (uint64_t frn : op_order) {
-            const auto& op = pending_ops[frn];
-            std::wstring wname_low = wide(op.name);
-            if (is_watch_ignored_path(wname_low, p)) continue;
+    // Helper to strip \\?\ prefix and normalize to lowercase backslash form for containment checks
+    auto normalize_final_lower = [](std::wstring s) -> std::wstring {
+        if (s.starts_with(L"\\\\?\\UNC\\")) s = L"\\\\" + s.substr(8);
+        else if (s.starts_with(L"\\\\?\\")) s.erase(0, 4);
+        for (auto& c : s) {
+            if (c == L'/') c = L'\\';
+            else c = static_cast<wchar_t>(towlower(c));
+        }
+        while (s.size() > 3 && s.back() == L'\\') s.pop_back();
+        return s;
+    };
+    auto get_final_path_w = [](HANDLE h) -> std::wstring {
+        DWORD needed = GetFinalPathNameByHandleW(h, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (needed == 0 || needed > 32768) return {};
+        std::wstring buf(needed, L'\0');
+        DWORD got = GetFinalPathNameByHandleW(h, buf.data(), needed, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (got == 0 || got >= needed) return {};
+        buf.resize(got);
+        return buf;
+    };
 
-            const bool deleted = (op.reasons & USN_REASON_FILE_DELETE) != 0;
-            const bool renamed = (op.reasons & (USN_REASON_RENAME_NEW_NAME | USN_REASON_RENAME_OLD_NAME)) != 0;
-            const bool is_dir = (op.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            const bool is_rep = (op.attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    // Determine canonical DOS final path of root base for exact inside/outside containment checks
+    std::wstring base_final_lower;
+    {
+        HandleGuard bh(CreateFileW(native_path(base).c_str(), FILE_READ_ATTRIBUTES,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+        if (bh.h != INVALID_HANDLE_VALUE) base_final_lower = normalize_final_lower(get_final_path_w(bh.h));
+        if (base_final_lower.empty()) base_final_lower = normalize_final_lower(base.wstring());
+    }
+    const std::wstring base_final_prefix = base_final_lower + L"\\";
 
-            if (deleted) {
-                if (fs_apply_delete(db, root_id, frn, true)) { ++deletes; ++applied; }
-                continue;
-            }
-            if (renamed && db.integer("SELECT EXISTS(SELECT 1 FROM fs_nodes WHERE root_id=? AND frn=? AND (flags & 1)=0)",
-                                      {root_id, static_cast<int64_t>(frn)}) != 0) {
-                if (known_dirs.contains(op.parent_frn)) {
-                    if (fs_apply_rename_or_move(db, root_id, frn, op.parent_frn, op.name, now_ns(), true)) {
-                        ++moves; ++applied;
-                    }
-                } else {
-                    // Moved outside indexed root -> remove from index
-                    if (fs_apply_delete(db, root_id, frn, true)) { ++deletes; ++applied; }
-                }
-                continue;
-            }
-            if (!known_dirs.contains(op.parent_frn)) continue;
-            // Query exact size/mtime via OpenFileById if still alive on disk
-            int64_t fsize = 0, fmtime = now_ns();
+    auto is_path_inside_base = [&](const std::wstring& final_w) -> bool {
+        if (final_w.empty()) return false;
+        const std::wstring low = normalize_final_lower(final_w);
+        return low.starts_with(base_final_prefix);
+    };
+
+    // Phase 0: Probe each coalesced FRN via OpenFileById to obtain authoritative live state
+    // (existence, containment inside root, exact ReparseTag, size, mtime, depth)
+    struct ResolvedUsnOp {
+        uint64_t frn = 0;
+        uint64_t parent_frn = 0;
+        std::string name;
+        uint32_t attrs = 0;
+        DWORD reasons = 0;
+        bool alive_in_root = false;
+        bool existed_in_db = false;
+        int kind = 0;
+        int64_t size_bytes = 0;
+        int64_t mtime_ns = 0;
+        std::wstring final_path_w;
+        int path_depth = 0;
+        std::string link_target;
+    };
+
+    constexpr DWORD MUTATION_REASONS = USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_EXTEND | USN_REASON_DATA_TRUNCATION |
+                                       USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE |
+                                       USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME |
+                                       USN_REASON_REPARSE_POINT_CHANGE;
+
+    std::vector<ResolvedUsnOp> dir_creates_or_moves;
+    std::vector<ResolvedUsnOp> file_ops;
+    std::vector<ResolvedUsnOp> delete_ops;
+
+    for (uint64_t frn : op_order) {
+        if (frn == root_frn) continue;
+        const auto& op = pending_ops[frn];
+        // Skip pure close-only noise (eliminates spurious upserts on untouched OneDrive/read files!)
+        if ((op.reasons & MUTATION_REASONS) == 0) continue;
+
+        std::wstring wname_low = wide(op.name);
+        if (is_watch_ignored_path(wname_low, p)) continue;
+
+        ResolvedUsnOp rop;
+        rop.frn = frn;
+        rop.parent_frn = op.parent_frn;
+        rop.name = op.name;
+        rop.attrs = op.attrs;
+        rop.reasons = op.reasons;
+        rop.existed_in_db = db.integer("SELECT EXISTS(SELECT 1 FROM fs_nodes WHERE root_id=? AND frn=? AND (flags & 1)=0)",
+                                       {root_id, static_cast<int64_t>(frn)}) != 0;
+
+        const bool deleted_flag = (op.reasons & USN_REASON_FILE_DELETE) != 0;
+        if (!deleted_flag) {
             FILE_ID_DESCRIPTOR desc{};
             desc.dwSize = sizeof(desc);
             desc.Type = FileIdType;
@@ -1087,19 +1165,149 @@ Json fs_usn_replay_root(const Project& p, Database& db, const Json& root_cfg, Ca
                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                         nullptr, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT));
             if (fh.h != INVALID_HANDLE_VALUE) {
-                BY_HANDLE_FILE_INFORMATION bhfi{};
-                if (GetFileInformationByHandle(fh.h, &bhfi)) {
-                    fsize = is_dir ? 0 : ((static_cast<int64_t>(bhfi.nFileSizeHigh) << 32) | bhfi.nFileSizeLow);
-                    LARGE_INTEGER li{};
-                    li.LowPart = bhfi.ftLastWriteTime.dwLowDateTime;
-                    li.HighPart = bhfi.ftLastWriteTime.dwHighDateTime;
-                    fmtime = ft_to_ns(li);
+                std::wstring fpw = get_final_path_w(fh.h);
+                if (is_path_inside_base(fpw)) {
+                    rop.alive_in_root = true;
+                    rop.final_path_w = fpw;
+                    // Count depth relative to base
+                    std::wstring rel_w = normalize_final_lower(fpw).substr(base_final_prefix.size());
+                    rop.path_depth = 1 + static_cast<int>(std::count(rel_w.begin(), rel_w.end(), L'\\'));
+
+                    BY_HANDLE_FILE_INFORMATION bhfi{};
+                    if (GetFileInformationByHandle(fh.h, &bhfi)) {
+                        rop.attrs = bhfi.dwFileAttributes;
+                        rop.size_bytes = ((static_cast<int64_t>(bhfi.nFileSizeHigh) << 32) | bhfi.nFileSizeLow);
+                        LARGE_INTEGER li{};
+                        li.LowPart = bhfi.ftLastWriteTime.dwLowDateTime;
+                        li.HighPart = bhfi.ftLastWriteTime.dwHighDateTime;
+                        rop.mtime_ns = ft_to_ns(li);
+                    }
+                    DWORD rtag = 0;
+                    if (rop.attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+                        FILE_ATTRIBUTE_TAG_INFO ati{};
+                        if (GetFileInformationByHandleEx(fh.h, FileAttributeTagInfo, &ati, sizeof(ati))) {
+                            rtag = ati.ReparseTag;
+                        }
+                    }
+                    const FsNodeKind kenum = classify_win32_node(rop.attrs, rtag);
+                    rop.kind = static_cast<int>(kenum);
+                    if (kenum == FsNodeKind::Directory || kenum == FsNodeKind::Junction || kenum == FsNodeKind::SymlinkDir) {
+                        rop.size_bytes = 0;
+                    }
+                    if (is_link_reparse_tag(rtag)) {
+                        rop.link_target = read_reparse_target(fs::path(fpw));
+                    }
+                    // Extract exact current basename & parent FRN from live path (handles multi-rename coalescing!)
+                    fs::path live_p(fpw);
+                    if (!live_p.filename().empty()) {
+                        try { rop.name = utf8(live_p.filename().wstring()); } catch (...) {}
+                    }
+                    auto live_parent = live_p.parent_path();
+                    if (!live_parent.empty()) {
+                        uint64_t lp_frn = query_path_frn(live_parent);
+                        if (lp_frn != 0) rop.parent_frn = lp_frn;
+                    }
                 }
             }
-            int kind = is_rep ? (is_dir ? static_cast<int>(FsNodeKind::SymlinkDir) : static_cast<int>(FsNodeKind::SymlinkFile))
-                              : (is_dir ? static_cast<int>(FsNodeKind::Directory) : static_cast<int>(FsNodeKind::File));
-            fs_apply_upsert(db, root_id, frn, op.parent_frn, op.name, kind, fsize, fmtime, op.attrs, "", true);
-            ++creates; ++applied;
+        }
+
+        if (!rop.alive_in_root) {
+            if (rop.existed_in_db) delete_ops.push_back(std::move(rop));
+        } else if (rop.kind == static_cast<int>(FsNodeKind::Directory)) {
+            // If an existing directory from outside root was moved INTO root (rename without create),
+            // its pre-existing children had no USN events; fall back cleanly to incremental reconciler.
+            if (!rop.existed_in_db &&
+                (rop.reasons & USN_REASON_RENAME_NEW_NAME) != 0 &&
+                (rop.reasons & USN_REASON_FILE_CREATE) == 0) {
+                return {{"used", false}, {"reason", "DIR_MOVED_IN_FROM_OUTSIDE"}, {"needs_reconcile", true}};
+            }
+            dir_creates_or_moves.push_back(std::move(rop));
+        } else {
+            file_ops.push_back(std::move(rop));
+        }
+    }
+
+    // Sort directory ops strictly top-down (shallowest depth first) so parents ALWAYS exist in fs_dirs before children!
+    std::sort(dir_creates_or_moves.begin(), dir_creates_or_moves.end(),
+              [](const ResolvedUsnOp& a, const ResolvedUsnOp& b) { return a.path_depth < b.path_depth; });
+
+    // Helper: ensure every ancestor directory between base and final_path_w.parent_path() exists in fs_dirs
+    auto ensure_ancestors_in_db = [&](const std::wstring& child_final_w) {
+        fs::path cur = fs::path(child_final_w).parent_path();
+        std::vector<fs::path> missing_chain;
+        while (!cur.empty()) {
+            std::wstring clow = normalize_final_lower(cur.wstring());
+            if (clow == base_final_lower || !clow.starts_with(base_final_prefix)) break;
+            uint64_t cfrn = query_path_frn(cur);
+            if (cfrn == 0) break;
+            if (db.integer("SELECT EXISTS(SELECT 1 FROM fs_dirs WHERE root_id=? AND frn=?)",
+                           {root_id, static_cast<int64_t>(cfrn)}) != 0) {
+                break;
+            }
+            missing_chain.push_back(cur);
+            cur = cur.parent_path();
+        }
+        std::reverse(missing_chain.begin(), missing_chain.end());
+        for (const auto& d : missing_chain) {
+            uint64_t dp = 0; int64_t dsz = 0, dmt = 0; uint32_t dat = 0;
+            uint64_t dfrn = query_path_frn(d, &dp, &dsz, &dmt, &dat);
+            if (dfrn != 0 && dp != 0 &&
+                db.integer("SELECT EXISTS(SELECT 1 FROM fs_dirs WHERE root_id=? AND frn=?)",
+                           {root_id, static_cast<int64_t>(dfrn)}) == 0) {
+                fs_apply_upsert(db, root_id, dfrn, dp, utf8(d.filename().wstring()),
+                                static_cast<int>(FsNodeKind::Directory), 0, dmt, dat, "", true);
+                ++creates; ++applied;
+            }
+        }
+    };
+
+    // Apply all 4 topological phases inside one atomic transaction
+    db.begin();
+    try {
+        // Phase 1 & 2: Live directories inside root (top-down parent-before-child)
+        for (const auto& rop : dir_creates_or_moves) {
+            ensure_ancestors_in_db(rop.final_path_w);
+            const bool renamed = (rop.reasons & (USN_REASON_RENAME_NEW_NAME | USN_REASON_RENAME_OLD_NAME)) != 0;
+            if (rop.existed_in_db && renamed) {
+                if (fs_apply_rename_or_move(db, root_id, rop.frn, rop.parent_frn, rop.name, rop.mtime_ns, true)) {
+                    ++moves; ++applied;
+                }
+            } else {
+                fs_apply_upsert(db, root_id, rop.frn, rop.parent_frn, rop.name,
+                                rop.kind, 0, rop.mtime_ns, rop.attrs, rop.link_target, true);
+                ++creates; ++applied;
+            }
+        }
+
+        // Phase 3: Live files & links inside root (all destination parent dirs now exist in fs_dirs!)
+        for (const auto& rop : file_ops) {
+            ensure_ancestors_in_db(rop.final_path_w);
+            const bool renamed = (rop.reasons & (USN_REASON_RENAME_NEW_NAME | USN_REASON_RENAME_OLD_NAME)) != 0;
+            if (rop.existed_in_db && renamed) {
+                if (fs_apply_rename_or_move(db, root_id, rop.frn, rop.parent_frn, rop.name, rop.mtime_ns, true)) {
+                    ++moves; ++applied;
+                }
+                // Also sync size/mtime if modified in same window
+                if (rop.reasons & (USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_EXTEND | USN_REASON_DATA_TRUNCATION)) {
+                    fs_apply_upsert(db, root_id, rop.frn, rop.parent_frn, rop.name,
+                                    rop.kind, rop.size_bytes, rop.mtime_ns, rop.attrs, rop.link_target, true);
+                }
+            } else {
+                fs_apply_upsert(db, root_id, rop.frn, rop.parent_frn, rop.name,
+                                rop.kind, rop.size_bytes, rop.mtime_ns, rop.attrs, rop.link_target, true);
+                ++creates; ++applied;
+            }
+        }
+
+        // Phase 4: Deleted FRNs and FRNs moved outside root (recursive FRN cascade delete!)
+        for (const auto& rop : delete_ops) {
+            if (fs_apply_delete(db, root_id, rop.frn, true)) {
+                ++deletes; ++applied;
+            }
+        }
+
+        if (applied > 0) {
+            fs_rebuild_dir_rollups(db, root_id);
         }
         db.exec("UPDATE fs_roots SET next_usn=?, last_sync_ns=? WHERE root_id=?",
                 {static_cast<int64_t>(cursor_usn), now_ns(), root_id});
@@ -1233,27 +1441,28 @@ Json fs_reconcile_incremental(const Project& p, Database& db, const Json& root_c
                         std::string crel = drel.empty() ? name : (drel + "/" + name);
                         uint32_t attrs = info->FileAttributes;
                         bool is_rep = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-                        bool is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                        DWORD rtag = is_rep ? info->EaSize : 0;
+                        FsNodeKind kenum = classify_win32_node(attrs, rtag);
+                        bool is_link_node = (kenum == FsNodeKind::Junction || kenum == FsNodeKind::SymlinkDir || kenum == FsNodeKind::SymlinkFile);
+                        bool is_dir = (kenum == FsNodeKind::Directory);
                         uint64_t cfrn = static_cast<uint64_t>(info->FileId.QuadPart);
                         if (cfrn == 0) cfrn = synthetic_frn(dfrn, nlow);
 
-                        bool skip = (is_dir && !is_rep) ? filters.should_skip_dir(dpath / std::wstring(wname), crel, nlow)
-                                                        : (!is_rep && filters.should_skip_file(crel, nlow));
+                        bool skip = is_dir ? filters.should_skip_dir(dpath / std::wstring(wname), crel, nlow)
+                                           : (!is_link_node && filters.should_skip_file(crel, nlow));
                         if (!skip) {
                             DiskChild ch;
                             ch.frn = cfrn;
                             ch.name = std::move(name);
                             ch.attrs = attrs;
                             ch.mtime_ns = ft_to_ns(info->LastWriteTime);
-                            if (is_rep) {
-                                ch.kind = (info->EaSize == IO_REPARSE_TAG_MOUNT_POINT)
-                                    ? static_cast<int>(FsNodeKind::Junction)
-                                    : (is_dir ? static_cast<int>(FsNodeKind::SymlinkDir) : static_cast<int>(FsNodeKind::SymlinkFile));
+                            ch.kind = static_cast<int>(kenum);
+                            if (is_link_node) {
                                 ch.link_target = read_reparse_target(dpath / std::wstring(wname));
+                                ch.size_bytes = (attrs & FILE_ATTRIBUTE_DIRECTORY) ? 0 : std::max<int64_t>(0, info->EndOfFile.QuadPart);
                             } else if (is_dir) {
-                                ch.kind = static_cast<int>(FsNodeKind::Directory);
+                                ch.size_bytes = 0;
                             } else {
-                                ch.kind = static_cast<int>(FsNodeKind::File);
                                 ch.size_bytes = std::max<int64_t>(0, info->EndOfFile.QuadPart);
                             }
                             disk_children[cfrn] = std::move(ch);
@@ -1366,6 +1575,9 @@ Json fs_reconcile_incremental(const Project& p, Database& db, const Json& root_c
             }
         }
 
+        if (moved_cnt + created_cnt + modified_cnt + deleted_cnt > 0) {
+            fs_rebuild_dir_rollups(db, root_id);
+        }
         db.exec("UPDATE fs_roots SET last_sync_ns=? WHERE root_id=?", {now_ns(), root_id});
         db.commit();
     } catch (...) {

@@ -2,6 +2,7 @@
 #include "migratool/sql.hpp"
 #include "migratool/scale.hpp"
 #include "migratool/fs_index.hpp"
+#include "migratool/fs_organize.hpp"
 #include "migratool/memories.hpp"
 #include "migratool/file_toolkit.hpp"
 #include "migratool/workspace_registry.hpp"
@@ -727,6 +728,39 @@ Json bound(Json result,const Json& args){
             while(!fit()&&!result["callers"].empty())result["callers"].erase(result["callers"].size()-1);
         }
     }
+    // Fix D2: for nested explore_tree, trim subdirs progressively before dropping the entire root item!
+    if(!fit()&&result.contains("schema")&&result["schema"].is_string()&&result["schema"].get<std::string>()=="migratool.explore_tree/1"&&
+       result.contains("items")&&result["items"].is_array()&&result["items"].size()==1&&result["items"][0].is_object()){
+        auto& root_node=result["items"][0];
+        if(root_node.contains("sample_files")){root_node.erase("sample_files");}
+        if(!fit()&&root_node.contains("subdirs")&&root_node["subdirs"].is_array()){
+            int64_t omitted=0;
+            // First strip sample_files/nested subdirs/top_extensions inside subdirs to keep more depth-1 subdirs visible
+            for(auto& sd:root_node["subdirs"])if(sd.is_object())sd.erase("sample_files");
+            if(!fit()){
+                for(auto& sd:root_node["subdirs"])if(sd.is_object()&&sd.contains("subdirs"))sd.erase("subdirs");
+            }
+            if(!fit()){
+                for(auto& sd:root_node["subdirs"])if(sd.is_object())sd.erase("top_extensions");
+            }
+            if(!fit()){
+                // Reserve exact overhead of truncated + subdirs_omitted BEFORE measuring fit()
+                result["truncated"]=true;
+                result["subdirs_omitted"]=999999;
+                while(!fit()&&!root_node["subdirs"].empty()){
+                    root_node["subdirs"].erase(root_node["subdirs"].size()-1);
+                    ++omitted;
+                }
+                if(omitted>0){
+                    result["subdirs_omitted"]=omitted;
+                }else{
+                    result.erase("subdirs_omitted");
+                }
+            }
+        }
+        if(!fit()&&root_node.contains("top_extensions")){root_node.erase("top_extensions");result["truncated"]=true;}
+        if(!fit()&&root_node.contains("subdirs")&&root_node["subdirs"].empty()){root_node.erase("subdirs");result["truncated"]=true;}
+    }
     for (const auto* key : {"items", "rows"}) {
         if (!result.contains(key) || !result[key].is_array() || fit()) continue;
         const auto page_cursor = result.value("cursor", std::string("0:0"));
@@ -753,6 +787,7 @@ Json bound(Json result,const Json& args){
             rows_size += row_size;
             result["next_cursor"] = std::move(next);
         }
+        if (result.contains("returned")) result["returned"] = result[key].size();
         if (result[key].empty()) result["hint"] = "El elemento no cabe. Aumente token_budget o seleccione menos fields.";
     }
     if(!fit()&&result.contains("active_claims")&&result["active_claims"].is_array())while(!fit()&&!result["active_claims"].empty())result["active_claims"].erase(result["active_claims"].size()-1);
@@ -3228,6 +3263,13 @@ Json agent_request(const Project& p,const std::string& tool,const Json& raw_args
     else if(tool=="explore_tree")result=fs_explore_tree(p,db,args);
     else if(tool=="find_files")result=fs_find_files(p,db,args);
     else if(tool=="changes_feed")result=fs_changes_feed(p,db,args);
+    else if(tool=="find_duplicates")result=tool_find_duplicates(p,db,args,cancel);
+    else if(tool=="verify_archive_vs_dir")result=tool_verify_archive_vs_dir(p,db,args,cancel);
+    else if(tool=="inspect_workspace_topology")result=tool_inspect_workspace_topology(p,db,args,cancel);
+    else if(tool=="organize_plan")result=tool_organize_plan(p,db,args,cancel);
+    else if(tool=="organize_apply")result=tool_organize_apply(p,db,args,log,cancel);
+    else if(tool=="organize_undo")result=tool_organize_undo(p,db,args,log,cancel);
+    else if(tool=="organize_verify")result=tool_organize_verify(p,db,args,cancel);
     else if(tool=="activate_workspace")result=tool_activate_workspace(args,nullptr,log,cancel);
     else if(tool=="list_workspaces")result=tool_list_workspaces(args);
     else if(tool=="query_workspace")result=tool_query_workspace(args,log,cancel);
@@ -3499,7 +3541,13 @@ Json agent_request(const Project& p,const std::string& tool,const Json& raw_args
     if(!response_options.contains("token_budget")&&!response_options.contains("budget_tokens")&&
        (tool=="inventory_sync"||tool=="session_bootstrap"||tool=="complete_task"||tool=="job_status"||tool=="job_control"||tool=="project_settings"||tool=="acquire_task"||tool=="import_existing_work"||tool=="project_diagnostics"||
         tool=="query"||tool=="explore_tree"||tool=="find_files"||tool=="changes_feed"||tool=="search_pattern"||tool=="read_file"||tool=="list_workspaces"||tool=="query_workspace"||tool=="onboard_workspace"||tool=="memory"||tool=="get_diagnostics"||tool=="find_implementations"||tool=="find_declaration"||tool=="housekeep"||
-        tool=="next_tasks"||tool=="evidence_report"||tool=="changes_since"||tool=="history"||paginated_status))response_options["token_budget"]=(tool=="read_file"||tool=="memory")?16000:4000;
+        tool=="find_duplicates"||tool=="verify_archive_vs_dir"||tool=="inspect_workspace_topology"||tool=="organize_plan"||tool=="organize_apply"||tool=="organize_undo"||tool=="organize_verify"||
+        tool=="next_tasks"||tool=="evidence_report"||tool=="changes_since"||tool=="history"||paginated_status)){
+        const bool wide_tool = (tool=="read_file"||tool=="memory"||tool=="explore_tree"||tool=="find_duplicates"||
+                                tool=="inspect_workspace_topology"||tool=="organize_plan"||tool=="organize_apply"||
+                                tool=="organize_verify"||tool=="verify_archive_vs_dir");
+        response_options["token_budget"] = wide_tool ? 16000 : 4000;
+    }
     result=bound(result,response_options);
     auto micros=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-begin).count();
     if(!db.try_aux_write("INSERT INTO requests(at,tool,request_bytes,response_bytes,duration_us,cache_revision)VALUES(?,?,?,?,?,?)",{now(),tool,args.dump().size(),result.dump().size(),micros,db.revision()})){
@@ -3511,12 +3559,19 @@ Json agent_tools(){
     const std::vector<std::pair<std::string,std::string>> definitions={
         {"session_bootstrap","Arranque de sesión en 1 llamada: devuelve revisión actual, estado global, diagnóstico de bloqueos del denominador (denominator_blockers), raíces, módulos pendientes prioritarios, reclamos activos y siguientes tareas."},
         {"activate_workspace","Activa o inicializa en 1 llamada cualquier directorio (modo workspace, archive para 6M+ archivos o migration) guardando el catálogo fuera de raíces protegidas (ej. %LOCALAPPDATA%\\Migratool\\workspaces\\)."},
-        {"list_workspaces","Lista todos los workspaces y proyectos registrados con su modo, tamaño de catálogo, número de archivos/directorios indexados y sesiones activas."},
+        {"list_workspaces","Lista workspaces y proyectos registrados (admite available_only:true y action:'prune' con dry_run para limpiar registros obsoletos)."},
         {"query_workspace","Consulta federada de solo lectura contra otro workspace registrado (por nombre, JSON o carpeta) sin cambiar el workspace activo."},
         {"onboard_workspace","Orientación automática del workspace: detecta estructura, lenguajes, marcadores de compilación y crea la memoria persistente _onboarding."},
-        {"explore_tree","Exploración jerárquica ultra-escala (<10ms sobre 6M+ archivos): devuelve conteos recursivos de archivos/carpetas/bytes, top extensiones y muestras por carpeta usando rollups precalculados fs_dirs."},
+        {"explore_tree","Exploración jerárquica ultra-escala (<10ms sobre 6M+ archivos): devuelve conteos exactos de archivos/carpetas/bytes, top extensiones y muestras por carpeta. Soporta flat:true o format:'columnar'."},
         {"find_files","Búsqueda instantánea (<25ms sobre 6M+ archivos) por subcadena trigrama FTS5, glob, prefijo de ruta, extensión, tamaño y mtime sin escaneos completos."},
         {"changes_feed","Flujo auditable acotado de cambios detectados automáticamente por identidad NTFS FRN (created, modified, deleted, renamed, moved)."},
+        {"find_duplicates","Deduplicación universal de contenido sobre cualquier tipo de archivo (ZIP, DLL, ROM, PNG, PDF, código) en 3 etapas (tamaño -> 64KiB -> SHA-256 cacheado en fs_hashes) + matriz tree_overlap; omite placeholders cloud-only de OneDrive por defecto."},
+        {"verify_archive_vs_dir","Compara cada entrada de un archivo .zip contra una carpeta en disco por tamaño y CRC32 (vía libzip), ignorando sufijos configurables (ej. .git/index)."},
+        {"inspect_workspace_topology","Mapa de seguridad completo antes de reorganizar: repos Git y worktrees válidos/rotos, junctions/symlinks NTFS, archivos cloud-only OneDrive, carpetas de build regenerables anotadas con git tracked/ignored, y referencias a rutas absolutas."},
+        {"organize_plan","Planificador dry-run de reorganización: valida invariantes de seguridad (cero archivos rastreados en Git en cuarentena, cero junctions, cero colisiones), guarda snapshot base y escribe plan.jsonl."},
+        {"organize_apply","Ejecutor transaccional de organize_plan (requiere execute:true): mueve con MoveFileExW (\\\\?\\, sin sobrescritura), genera manifiesto SHA-256 antes de cuarentenar, respalda pre-edición y registra journal.jsonl con soporte resume:true."},
+        {"organize_undo","Reversión completa de organize_apply (requiere execute:true): reproduce journal.jsonl en reverso, restaura respaldos verificando SHA-256 y devuelve el árbol a su estado exacto."},
+        {"organize_verify","Auditoría independiente post-reorganización: conservación 1-a-1 raíz+cuarentena vs línea base, 100% SHA-256 del manifiesto de cuarentena e integridad HEAD/status/worktrees de todos los repos Git."},
         {"memory","Memorias persistentes de proyecto con SQLite FTS5, espejo Markdown y rastreo FRN de archivos enlazados: action = write | read | edit | list | search | rename | delete."},
         {"read_file","Lectura quirúrgica por rango de líneas o ventana de símbolo con sha256, detección de binarios y presupuesto de tokens."},
         {"create_file","Crea un archivo dentro de raíces autorizadas y actualiza fs_nodes inmediatamente."},
@@ -3551,46 +3606,109 @@ Json agent_tools(){
         {"history","Historial inmutable filtrable por entity, actor, action y since_revision."},
         {"connections","Conexiones MCP de este proyecto y estado vivo del proceso."},
         {"statistics","Invocaciones, bytes de entrada/salida y duración medida por herramienta."}};
+
+    const Json s_str = {{"type","string"}};
+    const Json s_int = {{"type","integer"}};
+    const Json s_bool = {{"type","boolean"}};
+    const Json s_str_arr = {{"type","array"},{"items",{{"type","string"}}}};
+    const Json s_obj_arr = {{"type","array"},{"items",{{"type","object"}}}};
+
+    auto schema_for = [&](const std::string& name) -> Json {
+        Json props = {
+            {"project",{{"type","string"},{"description","Ruta absoluta opcional al JSON del proyecto; por defecto el workspace activo."}}},
+            {"token_budget",{{"type","integer"},{"minimum",256},{"maximum",100000}}}
+        };
+        if (name == "activate_workspace") {
+            props["path"] = s_str; props["name"] = s_str; props["mode"] = {{"type","string"},{"enum",{"workspace","archive","migration"}}};
+            props["index_tier"] = {{"type","string"},{"enum",{"metadata","code","full"}}}; props["sync"] = s_bool;
+            props["full"] = s_bool; props["threads"] = s_int; props["switch_active"] = s_bool;
+        } else if (name == "list_workspaces") {
+            props["available_only"] = s_bool; props["action"] = {{"type","string"},{"enum",{"list","prune"}}};
+            props["dry_run"] = s_bool; props["prune_temp"] = s_bool;
+        } else if (name == "query_workspace") {
+            props["workspace"] = s_str; props["tool"] = s_str; props["arguments"] = {{"type","object"}};
+        } else if (name == "explore_tree") {
+            props["root"] = s_str; props["path"] = s_str; props["depth"] = {{"type","integer"},{"minimum",1},{"maximum",4}};
+            props["limit"] = {{"type","integer"},{"minimum",1},{"maximum",500}}; props["sort"] = {{"type","string"},{"enum",{"bytes","files","dirs","name","mtime"}}};
+            props["include_samples"] = s_bool; props["sample_limit"] = s_int; props["flat"] = s_bool;
+            props["extensions_limit"] = s_int; props["format"] = {{"type","string"},{"enum",{"json","columnar"}}};
+        } else if (name == "find_files") {
+            props["query"] = s_str; props["glob"] = s_str; props["ext"] = s_str; props["path_prefix"] = s_str;
+            props["root"] = s_str; props["kind"] = {{"type","string"},{"enum",{"all","file","dir","link"}}};
+            props["min_bytes"] = s_int; props["max_bytes"] = s_int; props["limit"] = s_int; props["cursor"] = s_str;
+            props["format"] = {{"type","string"},{"enum",{"json","columnar"}}};
+        } else if (name == "changes_feed") {
+            props["since_seq"] = s_int; props["since_ns"] = s_int; props["root"] = s_str; props["path_prefix"] = s_str;
+            props["ops"] = s_str_arr; props["order"] = {{"type","string"},{"enum",{"asc","desc"}}}; props["limit"] = s_int;
+        } else if (name == "find_duplicates") {
+            props["root"] = s_str; props["path_prefix"] = s_str; props["min_bytes"] = s_int; props["limit"] = s_int;
+            props["exclude_dirs"] = s_str_arr; props["skip_cloud_only"] = s_bool; props["threads"] = s_int;
+            props["format"] = {{"type","string"},{"enum",{"json","columnar"}}};
+        } else if (name == "verify_archive_vs_dir") {
+            props["zip"] = s_str; props["target_dir"] = s_str; props["ignore_suffixes"] = s_str_arr; props["sample_limit"] = s_int;
+        } else if (name == "inspect_workspace_topology") {
+            props["root"] = s_str; props["inspect_git"] = s_bool; props["scan_path_refs"] = s_bool;
+        } else if (name == "organize_plan") {
+            props["plan_id"] = s_str; props["root"] = s_str; props["quarantine_dir"] = s_str;
+            props["operations"] = s_obj_arr; props["protected_paths"] = s_str_arr; props["allow_git_tracked"] = s_bool;
+        } else if (name == "organize_apply") {
+            props["plan_id"] = s_str; props["execute"] = s_bool; props["resume"] = s_bool; props["sync_after"] = s_bool;
+        } else if (name == "organize_undo") {
+            props["plan_id"] = s_str; props["execute"] = s_bool; props["sync_after"] = s_bool;
+        } else if (name == "organize_verify") {
+            props["plan_id"] = s_str;
+        } else if (name == "memory") {
+            props["action"] = {{"type","string"},{"enum",{"write","read","edit","list","search","rename","delete"}}};
+            props["name"] = s_str; props["content"] = s_str; props["query"] = s_str; props["new_name"] = s_str;
+            props["tags"] = s_str_arr; props["linked_paths"] = s_str_arr; props["actor"] = s_str;
+        } else if (name == "read_file" || name == "create_file" || name == "edit_file") {
+            props["path"] = s_str; props["start_line"] = s_int; props["end_line"] = s_int; props["symbol"] = s_str;
+            props["content"] = s_str; props["mode"] = s_str; props["target"] = s_str; props["replacement"] = s_str;
+            props["expected_sha256"] = s_str; props["dry_run"] = s_bool; props["actor"] = s_str;
+        } else if (name == "search_pattern") {
+            props["pattern"] = s_str; props["is_regex"] = s_bool; props["path_prefix"] = s_str;
+            props["include_glob"] = s_str; props["exclude_glob"] = s_str; props["context_lines"] = s_int;
+            props["limit"] = s_int; props["format"] = {{"type","string"},{"enum",{"json","columnar"}}};
+        } else if (name == "get_diagnostics" || name == "find_implementations" || name == "find_declaration" || name == "lsp_rename_symbol" || name == "restart_language_server") {
+            props["path"] = s_str; props["symbol"] = s_str; props["line"] = s_int; props["column"] = s_int;
+            props["new_name"] = s_str; props["language"] = s_str; props["dry_run"] = s_bool;
+        } else if (name == "housekeep") {
+            props["action"] = {{"type","string"},{"enum",{"status","run","vacuum"}}}; props["dry_run"] = s_bool; props["deep"] = s_bool;
+        } else if (name == "inventory_sync") {
+            props["full"] = s_bool; props["wait"] = s_bool; props["root"] = s_str; props["threads"] = s_int;
+            props["scope"] = {{"type","object"}}; props["tier"] = s_str;
+        } else if (name == "export_inventory" || name == "backup_catalog") {
+            props["out"] = {{"type","string"},{"minLength",1}};
+            if (name == "export_inventory") { props["format"] = {{"type","string"},{"enum",{"jsonl","json"}}}; props["wait"] = s_bool; }
+            else props["destination"] = {{"type","string"},{"minLength",1}};
+        } else if (name == "import_existing_work") {
+            props["ids"] = {{"type","array"},{"items",{{"type","integer"},{"minimum",1}}},{"minItems",1},{"maxItems",1000}};
+            for (const auto* f : {"external_path","registry_path","catalog_path","base_directory","prefix","action"}) props[f] = s_str;
+            for (const auto* f : {"verify","verify_inputs","verify_outputs"}) props[f] = s_bool;
+            props["offset"] = {{"type","integer"},{"minimum",0}}; props["limit"] = s_int;
+        } else if (name == "verify") {
+            props["action"] = s_str; props["execute"] = s_bool; props["case_ids"] = {{"type","array"},{"items",{{"type","string"},{"minLength",1}}}};
+        } else {
+            // Code/migration tools: compact shared subset (additionalProperties:true keeps full compatibility)
+            for (const auto* f : {"kind","text","id","task_id","symbol","file","root","role","language","category","detail","actor","action","entity","cursor","format","level","op","new_body","new_name","path_prefix","extension","disposition","stage","ast_pattern"}) props[f] = s_str;
+            for (const auto* f : {"limit","since_revision","expected_revision","depth"}) props[f] = s_int;
+            for (const auto* f : {"full","execute","dry_run","include_body","outline_only","auto_sync_touched","auto_map_symbols","wait"}) props[f] = s_bool;
+            for (const auto* f : {"fields","task_ids","ids","targets","verify_cases"}) props[f] = s_str_arr;
+            for (const auto* f : {"operations","queries","mappings","write_files","edits"}) props[f] = s_obj_arr;
+            props["preset"] = {{"type","string"},{"enum",{"minimal","agent","full"}}};
+        }
+        return {{"type","object"},{"properties",std::move(props)},{"additionalProperties",true}};
+    };
+
     Json tools=Json::array();
     for(const auto& [name,description]:definitions){
-        Json properties={{"project",{{"type","string"},{"description","Ruta absoluta opcional al JSON del proyecto; por defecto, el seleccionado al iniciar MCP."}}},{"token_budget",{{"type","integer"},{"minimum",256},{"maximum",100000}}},{"limit",{{"type","integer"},{"minimum",1},{"maximum",1000}}},
-            {"cursor",{{"type","string"}}},{"fields",{{"type","array"},{"items",{{"type","string"}}}}},{"preset",{{"type","string"},{"enum",{"minimal","agent","full"}}}},
-            {"kind",{{"type","string"}}},{"text",{{"type","string"}}},{"id",{{"type","string"}}},{"task_id",{{"type","string"}}},{"task_ids",{{"type","array"},{"items",{{"type","string"}}}}},{"symbol",{{"type","string"}}},{"file",{{"type","string"}}},
-            {"root",{{"type","string"}}},{"role",{{"type","string"}}},{"language",{{"type","string"}}},{"category",{{"type","string"}}},{"detail",{{"type","string"}}},
-            {"actor",{{"type","string"}}},{"action",{{"type","string"}}},{"entity",{{"type","string"}}},{"since_revision",{{"type","integer"}}},
-            {"expected_revision",{{"type","integer"}}},{"full",{{"type","boolean"}}},{"execute",{{"type","boolean"}}},{"dry_run",{{"type","boolean"}}},{"include_body",{{"type","boolean"}}},{"outline_only",{{"type","boolean"}}},{"level",{{"type","string"}}},
-            {"operations",{{"type","array"},{"items",{{"type","object"}}}}},{"queries",{{"type","array"},{"items",{{"type","object"}}}}},
-            {"ids",{{"type","array"},{"items",{{"type","string"}}}}},{"input",{{"type","string"}}},{"format",{{"type","string"}}},
-            {"ast_pattern",{{"type","string"}}},{"regex_pattern",{{"type","string"}}},{"signature_contains",{{"type","string"}}},{"symbol_kind",{{"type","string"}}},
-            {"migration_state",{{"type","string"}}},{"missing_target_language",{{"type","string"}}},{"calls",{{"type","string"}}},
-            {"exact_name",{{"type","string"}}},{"qualified_name",{{"type","string"}}},{"semantic_key",{{"type","string"}}},
-            {"start_line",{{"type","integer"}}},{"end_line",{{"type","integer"}}},{"offset",{{"type","integer"}}},{"end_offset",{{"type","integer"}}},{"context_lines",{{"type","integer"}}},
-            {"max_depth",{{"type","integer"}}},{"op",{{"type","string"}}},{"new_body",{{"type","string"}}},{"new_name",{{"type","string"}}},{"content",{{"type","string"}}},{"replacement",{{"type","string"}}},
-            {"auto_sync_touched",{{"type","boolean"}}},{"auto_map_symbols",{{"type","boolean"}}},{"release_claims",{{"type","boolean"}}},
-            {"source",{{"type","string"}}},{"targets",{{"type","array"},{"items",{{"type","string"}}}}},{"mappings",{{"type","array"},{"items",{{"type","object"}}}}},
-            {"write_files",{{"type","array"},{"items",{{"type","object"}}}}},{"edits",{{"type","array"},{"items",{{"type","object"}}}}},{"verify_cases",{{"type","array"},{"items",{{"type","string"}}}}},
-            {"path_prefix",{{"type","string"}}},{"path_contains",{{"type","string"}}},{"extension",{{"type","string"}}},{"disposition",{{"type","string"}}},{"stage",{{"type","string"}}},
-            {"pending_reason",{{"type","string"}}},{"linked_source",{{"type","string"}}}};
-        properties["wait"]={{"type","boolean"}};properties["job_id"]={{"type","string"}};properties["settings"]={{"type","object"}};properties["expected_config_revision"]={{"type","string"}};
-        properties["generation"]={{"type","integer"}};properties["parent"]={{"type","string"}};properties["include_total"]={{"type","boolean"}};
-        properties["depth"]={{"type","integer"},{"minimum",1},{"maximum",4}};properties["phase_id"]={{"type","string"}};properties["state"]={{"type","string"}};
-        properties["include_non_relevant"]={{"type","boolean"}};properties["include_non_source"]={{"type","boolean"}};
-        if(name=="export_inventory"||name=="backup_catalog"){
-            properties["out"]={{"type","string"},{"minLength",1}};
-            if(name=="export_inventory")properties["format"]={{"type","string"},{"enum",{"jsonl","json"}}};
-            else properties["destination"]={{"type","string"},{"minLength",1}};
-        }
-        if(name=="import_existing_work"){
-            properties["ids"]={{"type","array"},{"items",{{"type","integer"},{"minimum",1}}},{"minItems",1},{"maxItems",1000}};
-            for(const auto* field:{"external_path","registry_path","catalog_path","base_directory","prefix"})properties[field]={{"type","string"}};
-            for(const auto* field:{"verify","verify_inputs","verify_outputs"})properties[field]={{"type","boolean"}};
-            properties["offset"]={{"type","integer"},{"minimum",0}};
-        }
-        if(name=="verify")
-            properties["case_ids"]={{"type","array"},{"items",{{"type","string"},{"minLength",1}}}};
-        bool mutating=name=="inventory_sync"||name=="batch_update"||name=="edit_symbol"||name=="complete_task"||name=="verify"||name=="job_control"||name=="project_settings"||name=="acquire_task"||name=="import_existing_work"||name=="export_inventory"||name=="backup_catalog"||name=="activate_workspace"||name=="onboard_workspace"||name=="create_file"||name=="edit_file"||name=="lsp_rename_symbol"||name=="restart_language_server"||name=="memory"||name=="housekeep";
-        tools.push_back({{"name",name},{"description",description},{"inputSchema",{{"type","object"},{"properties",properties},{"additionalProperties",true}}},
-            {"annotations",{{"readOnlyHint",!mutating},{"destructiveHint",false},{"idempotentHint",name!="batch_update"&&name!="edit_symbol"&&name!="complete_task"&&name!="export_inventory"},{"openWorldHint",name=="verify"||name=="complete_task"}}}});
+        const bool mutating = name=="inventory_sync"||name=="batch_update"||name=="edit_symbol"||name=="complete_task"||name=="verify"||
+            name=="job_control"||name=="project_settings"||name=="acquire_task"||name=="import_existing_work"||name=="export_inventory"||
+            name=="backup_catalog"||name=="activate_workspace"||name=="onboard_workspace"||name=="create_file"||name=="edit_file"||
+            name=="lsp_rename_symbol"||name=="restart_language_server"||name=="memory"||name=="housekeep"||
+            name=="organize_apply"||name=="organize_undo";
+        tools.push_back({{"name",name},{"description",description},{"inputSchema",schema_for(name)},
+            {"annotations",{{"readOnlyHint",!mutating},{"destructiveHint",false},{"idempotentHint",name!="batch_update"&&name!="edit_symbol"&&name!="complete_task"&&name!="export_inventory"&&name!="organize_apply"&&name!="organize_undo"},{"openWorldHint",name=="verify"||name=="complete_task"}}}});
     }
     return tools;
 }

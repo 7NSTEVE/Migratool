@@ -3,6 +3,7 @@
 #include <sqlite3.h>
 #include <thread>
 #include <memory>
+#include <optional>
 
 namespace mt {
 class Database {
@@ -48,6 +49,7 @@ Json agent_tools();
 Json agent_batch(const Project&,const Json&);
 Json query_page(const Project&,Database&,const Json&);
 int mcp_server(const Project&);
+int mcp_server(const std::optional<Project>& initial_project);
 class IndexWatcher {
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -81,8 +81,10 @@ void ComparisonView::create(HWND parent, HFONT font, int dpi) {
     target_label_ = make(L"STATIC", L"Código de destino", 0, 55);
     origins_ = make(WC_LISTVIEWW, L"Archivos de origen", WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 50);
     targets_ = make(WC_LISTVIEWW, L"Archivos de destino", WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, 51);
-    for (const auto list : {origins_, targets_})
+    for (const auto list : {origins_, targets_}) {
         ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        ui::apply_control_polish(list, false);
+    }
     int column = 0;
     for (const auto* label : {L"% migrado", L"Estado", L"Ruta absoluta de origen"}) {
         LVCOLUMNW definition{};
@@ -99,7 +101,8 @@ void ComparisonView::create(HWND parent, HFONT font, int dpi) {
         definition.cx = px(column == 0 ? 110 : column == 1 ? 500 : 100);
         ListView_InsertColumn(targets_, column++, &definition);
     }
-    detail_ = make(L"EDIT", L"Seleccione un origen para ver sus rutas y evidencia.", ES_MULTILINE | ES_READONLY | WS_VSCROLL, 56);
+    detail_ = make(L"EDIT", L"Seleccione un origen para ver sus rutas y evidencia.", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 56);
+    ui::apply_control_polish(detail_, true, px(8));
     open_origin_ = make(L"BUTTON", L"Abrir origen", WS_TABSTOP, 57);
     open_target_ = make(L"BUTTON", L"Abrir destino", WS_TABSTOP, 58);
     colors_ = ui::system_palette();
@@ -271,6 +274,9 @@ LRESULT CALLBACK ComparisonView::procedure(HWND window, UINT message, WPARAM wp,
         return 0;
     case WM_NOTIFY: {
         const auto notification = reinterpret_cast<NMHDR*>(lp);
+        if ((notification->hwndFrom == view->origins_ || notification->hwndFrom == view->targets_) &&
+            notification->code == NM_CUSTOMDRAW)
+            return ui::handle_listview_customdraw(lp, view->colors_);
         if (notification->hwndFrom == view->origins_ && notification->code == LVN_ITEMCHANGED)
             view->select_origin();
         if (notification->code == NM_DBLCLK)

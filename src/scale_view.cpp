@@ -130,7 +130,7 @@ struct ScaleView::Impl {
         NotifyWinEvent(EVENT_OBJECT_NAMECHANGE,empty,OBJID_CLIENT,CHILDID_SELF);
     }
     void layout(){
-        if(!list)return;RECT rc{};GetClientRect(hwnd,&rc);const int width=rc.right,height=rc.bottom,gap=px(10),control=ui::control_height(dpi),line=ui::type_size(18,dpi)+px(8);split_bounds={};
+        if(!list)return;RECT rc{};GetClientRect(hwnd,&rc);const int width=rc.right,height=rc.bottom,gap=ui::text_percent>=150?px(6):px(10),control=ui::control_height(dpi),line=ui::type_size(18,dpi)+px(8);split_bounds={};
         const bool compare=page==1,folder_view=page==17,mod_view=page==23,dev_view=page==24;
         const bool show_root_filter=(page==1&&filters_visible)||page==7||page==8||mod_view||(dev_view&&dev_kind==3);
         const bool show_pending_filter=(compare&&filters_visible)||page==7||page==8;
@@ -150,28 +150,37 @@ struct ScaleView::Impl {
         ui::show_if(dev_state_choice,dev_view);
         ui::show_if(tree,folder_view);ui::show_if(next_target,compare&&!next_target_cursor.empty());
         int x=0,y=0;
+        const int btn_pad=ui::text_percent>=150?px(10):px(24);
+        const int btn_min=ui::text_percent>=150?px(64):px(90);
         for(auto item:{refresh_button,filter_button,copy,details_button,pause,resume,cancel,retry,rescan,up})if(GetWindowLongPtrW(item,GWL_STYLE)&WS_VISIBLE){
             auto text=control_text(item);HDC dc=GetDC(item);auto old=SelectObject(dc,font);SIZE size{};GetTextExtentPoint32W(dc,text.c_str(),static_cast<int>(text.size()),&size);SelectObject(dc,old);ReleaseDC(item,dc);
-            const int button_width=std::min(width,std::max(px(95),static_cast<int>(size.cx)+px(26)));if(x&&x+button_width>width){x=0;y+=control+gap;}ui::move_if(item,x,y,button_width,control);x+=button_width+gap;
+            const int button_width=std::min(width,std::max(btn_min,static_cast<int>(size.cx)+btn_pad));if(x&&x+button_width>width){x=0;y+=control+gap;}ui::move_if(item,x,y,button_width,control);x+=button_width+gap;
         }
         if(page!=0)y+=control+gap;
         if(show_pending_filter||show_root_filter||mod_view||dev_view||(compare&&filters_visible)){
-            int fx=0,fy=y;bool any_filter=false;
-            auto place_filter=[&](HWND ctrl,int w,int drop){
-                if(!ctrl||!(GetWindowLongPtrW(ctrl,GWL_STYLE)&WS_VISIBLE))return;
-                const int cw=std::min(width,w);
-                if(fx&&fx+cw>width){fx=0;fy+=control+gap;}
-                ui::move_if(ctrl,fx,fy,cw,control+drop);
-                fx+=cw+gap;any_filter=true;
+            std::vector<std::pair<HWND,std::pair<int,int>>> vis_filters;
+            auto add_f=[&](HWND ctrl,int w,int drop){
+                if(ctrl&&(GetWindowLongPtrW(ctrl,GWL_STYLE)&WS_VISIBLE))vis_filters.push_back({ctrl,{w,drop}});
             };
-            place_filter(depth_choice,std::max(px(160),ui::type_size(18,dpi)*11),px(240));
-            place_filter(dev_kind_choice,std::max(px(230),ui::type_size(18,dpi)*17),px(240));
-            place_filter(dev_state_choice,std::max(px(180),ui::type_size(18,dpi)*12),px(320));
-            place_filter(root_choice,std::max(px(200),ui::type_size(18,dpi)*14),px(260));
-            place_filter(pending_filter,std::max(px(220),ui::type_size(18,dpi)*16),px(300));
-            place_filter(linked,std::max(px(220),ui::type_size(18,dpi)*16),0);
-            place_filter(include_non_source_chk,std::max(px(170),ui::type_size(18,dpi)*12),0);
-            if(any_filter)y=fy+control+gap;
+            add_f(depth_choice,std::max(px(150),ui::type_size(18,dpi)*10),px(240));
+            add_f(dev_kind_choice,std::max(px(220),ui::type_size(18,dpi)*16),px(240));
+            add_f(dev_state_choice,std::max(px(170),ui::type_size(18,dpi)*11),px(320));
+            add_f(root_choice,std::max(px(180),ui::type_size(18,dpi)*12),px(260));
+            add_f(pending_filter,std::max(px(200),ui::type_size(18,dpi)*14),px(300));
+            add_f(linked,std::max(px(200),ui::type_size(18,dpi)*14),0);
+            add_f(include_non_source_chk,std::max(px(160),ui::type_size(18,dpi)*11),0);
+            if(!vis_filters.empty()){
+                const int n=static_cast<int>(vis_filters.size());
+                const int equal_share=n>1&&width>=px(480)?std::max(px(130),(width-gap*(n-1))/n):width;
+                int fx=0,fy=y;
+                for(const auto& [ctrl,spec]:vis_filters){
+                    const int cw=std::min({width,spec.first,equal_share});
+                    if(fx&&fx+cw>width){fx=0;fy+=control+gap;}
+                    ui::move_if(ctrl,fx,fy,cw,control+spec.second);
+                    fx+=cw+gap;
+                }
+                y=fy+control+gap;
+            }
         }
         const int caption_height=page==0?line*2:line;
         ui::move_if(progress,0,y,px(70),line);ui::move_if(caption,reading?px(80):0,y,std::max(px(50),width-(reading?px(80):0)),caption_height);y+=caption_height+gap;
@@ -180,7 +189,7 @@ struct ScaleView::Impl {
         const int available=std::max(px(24),height-y-pager-detail_height-(inspector?gap:0));
         const int tree_width=folder_view?std::min(width/3,std::max(px(180),ui::type_size(18,dpi)*13)):0;
         const int left=folder_view?tree_width+gap:0,body_width=std::max(px(50),width-left);
-        stacked=compare&&body_width<ui::type_size(18,dpi)*52;single_pane=stacked&&available<line*8;
+        stacked=compare&&body_width<ui::type_size(18,dpi)*52;single_pane=stacked&&available<line*5;
         ui::show_if(pane_choice,single_pane);
         if(single_pane){ui::move_if(pane_choice,0,y,width,control+px(200));y+=control+gap;}
         const int actual_available=std::max(px(24),available-(single_pane?control+gap:0));
@@ -189,10 +198,12 @@ struct ScaleView::Impl {
         ui::show_if(source_title,compare&&!single_pane);ui::show_if(target_title,compare&&!single_pane);
         ui::show_if(list,!target_only);ui::show_if(targets,compare&&(!single_pane||target_only));
         if(compare&&!single_pane){
-            const int table_height=std::max(px(20),stacked?(actual_available-gap-line*2)/2:actual_available-line);
-            const int second_x=stacked?left:left+first_width+gap,second_y=stacked?y+line+table_height+gap:y;
-            ui::move_if(source_title,left,y,first_width,line);ui::move_if(list,left,y+line,first_width,table_height);
-            ui::move_if(target_title,second_x,second_y,stacked?body_width:body_width-first_width-gap,line);ui::move_if(targets,second_x,second_y+line,stacked?body_width:body_width-first_width-gap,table_height);
+            const int total_tables=std::max(px(40),actual_available-gap-line*2);
+            const int top_table_h=stacked?std::max(px(24),(total_tables*58)/100):std::max(px(20),actual_available-line);
+            const int bot_table_h=stacked?std::max(px(20),total_tables-top_table_h):top_table_h;
+            const int second_x=stacked?left:left+first_width+gap,second_y=stacked?y+line+top_table_h+gap:y;
+            ui::move_if(source_title,left,y,first_width,line);ui::move_if(list,left,y+line,first_width,top_table_h);
+            ui::move_if(target_title,second_x,second_y,stacked?body_width:body_width-first_width-gap,line);ui::move_if(targets,second_x,second_y+line,stacked?body_width:body_width-first_width-gap,bot_table_h);
             if(!stacked)split_bounds={left+first_width,y,left+first_width+gap,y+actual_available};
         }else{ui::move_if(list,left,y,body_width,actual_available);ui::move_if(targets,left,y,body_width,actual_available);}
         if(folder_view)ui::move_if(tree,0,y,tree_width,actual_available);
@@ -234,25 +245,36 @@ struct ScaleView::Impl {
             ListView_SetItemCountEx(table,0,0);while(ListView_DeleteColumn(table,0)){}names=std::move(desired);
             RECT bounds{};GetClientRect(table,&bounds);int i=0;
             for(const auto& key:names){
-                auto name=label(key);LVCOLUMNW column{};column.mask=LVCF_TEXT|LVCF_WIDTH;
+                auto name=label(key);
+                if(page==23){
+                    if(key=="source_files")name=L"Archivos";
+                    else if(key=="declared_files")name=L"Completos";
+                    else if(key=="migrated_units")name=L"U. migr.";
+                    else if(key=="verified_units")name=L"U. casos";
+                }else if(page==17&&key=="pending_directories"){
+                    name=L"Pendientes";
+                }
+                LVCOLUMNW column{};column.mask=LVCF_TEXT|LVCF_WIDTH;
                 int width=150;
-                if(key=="path")width=230;
+                if(key=="path")width=page==17?215:230;
                 else if(key=="name")width=page==0?275:225;
-                else if(key=="source_module"||key=="target_summary")width=260;
+                else if(key=="source_module")width=175;
+                else if(key=="target_summary")width=240;
                 else if(key=="title"||key=="detail_summary")width=260;
                 else if(key=="record_type"||key=="stage")width=115;
                 else if(key=="disposition")width=165;
                 else if(key=="item_id"||key=="updated_at")width=160;
-                else if(key=="source_files"||key=="non_source_files"||key=="mapped_files"||key=="half_done_files"||key=="ported_files"||key=="declared_files"||key=="verified_files"||key=="total_units"||key=="migrated_units"||key=="verified_units")width=95;
+                else if(key=="source_files"||key=="non_source_files"||key=="mapped_files"||key=="half_done_files"||key=="ported_files"||key=="declared_files"||key=="verified_files"||key=="total_units"||key=="migrated_units"||key=="verified_units")width=86;
                 else if(key.find("path")!=std::string::npos)width=330;
-                else if(key=="migration_percent"||key=="language")width=110;
+                else if(key=="migration_percent")width=page==23?96:110;
+                else if(key=="language")width=110;
                 else if(key=="state")width=page==0?205:200;
                 else if(key=="phase")width=240;
                 else if(key=="coverage_cause")width=230;
                 else if(key=="observed_files_per_second"||key=="eta_seconds")width=140;
                 else if(key=="last_scanned")width=185;
-                else if(key=="discovered_entries"||key=="errors_count"||key=="excluded_entries"||key=="pending_directories")width=110;
-                else if(key=="kind"||key=="bytes")width=120;
+                else if(key=="discovered_entries"||key=="errors_count"||key=="excluded_entries"||key=="pending_directories")width=105;
+                else if(key=="kind"||key=="bytes")width=115;
                 column.cx=key=="description"||key=="value"||key=="excerpt"?std::max<int>(px(320),bounds.right-ui::type_size(485,dpi)):ui::type_size(width,dpi);
                 column.pszText=name.data();ListView_InsertColumn(table,i++,&column);
             }
@@ -494,7 +516,7 @@ struct ScaleView::Impl {
     static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){auto* self=reinterpret_cast<Impl*>(GetWindowLongPtrW(w,GWLP_USERDATA));if(msg==WM_NCCREATE){self=static_cast<Impl*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);self->hwnd=w;SetWindowLongPtrW(w,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(self));}if(!self)return DefWindowProcW(w,msg,wp,lp);
         try{switch(msg){case WM_SIZE:self->layout();return 0;
           case WM_ERASEBKGND:{RECT rc{};GetClientRect(w,&rc);FillRect(reinterpret_cast<HDC>(wp),&rc,self->background);return 1;}
-          case WM_PAINT:{PAINTSTRUCT paint{};auto dc=BeginPaint(w,&paint);if(!IsRectEmpty(&self->split_bounds)){auto brush=CreateSolidBrush(self->colors.border);FillRect(dc,&self->split_bounds,brush);DeleteObject(brush);}EndPaint(w,&paint);return 0;}
+          case WM_PAINT:{PAINTSTRUCT paint{};auto dc=BeginPaint(w,&paint);if(!IsRectEmpty(&self->split_bounds))ui::draw_splitter_grip(dc,self->split_bounds,self->colors);EndPaint(w,&paint);return 0;}
           case WM_CTLCOLORSTATIC:case WM_CTLCOLOREDIT:case WM_CTLCOLORBTN:return reinterpret_cast<LRESULT>(ui::color_control(reinterpret_cast<HDC>(wp),reinterpret_cast<HWND>(lp),self->colors,self->background,self->surface));
           case WM_SETCURSOR:{POINT pt{};GetCursorPos(&pt);ScreenToClient(w,&pt);if(self->dragging||PtInRect(&self->split_bounds,pt)){SetCursor(LoadCursorW(nullptr,IDC_SIZEWE));return TRUE;}break;}
           case WM_LBUTTONDOWN:{POINT pt{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};if(PtInRect(&self->split_bounds,pt)){self->dragging=true;SetCapture(w);return 0;}break;}
@@ -532,7 +554,9 @@ struct ScaleView::Impl {
               case 29:if(HIWORD(wp)==CBN_SELCHANGE){const char* states[]={"","PLANNED","IN_PROGRESS","HALF_DONE","PORTED","INTEGRATED","COMPLETED","VERIFIED","BLOCKED","TODO","UNREVIEWED","REVIEWED","ACTION_REQUIRED","STALE"};auto choice=SendMessageW(self->dev_state_choice,CB_GETCURSEL,0,0);if(choice>=0&&choice<14)self->dev_state=states[choice];self->cursor.clear();self->cursors.clear();self->request();}break;
               case 30:self->include_non_source=SendMessageW(self->include_non_source_chk,BM_GETCHECK,0,0)==BST_CHECKED;self->cursor.clear();self->cursors.clear();self->request();break;
             }return 0;}
-          case WM_NOTIFY:{auto* hdr=reinterpret_cast<NMHDR*>(lp);if(hdr->code==LVN_GETDISPINFOW){auto* info=reinterpret_cast<NMLVDISPINFOW*>(lp);auto& rows=hdr->hwndFrom==self->targets?self->target_rows:self->rows;auto& cols=hdr->hwndFrom==self->targets?self->target_columns:self->columns;
+          case WM_NOTIFY:{auto* hdr=reinterpret_cast<NMHDR*>(lp);
+            if(hdr->code==NM_CUSTOMDRAW&&(hdr->hwndFrom==self->list||hdr->hwndFrom==self->targets))return ui::handle_listview_customdraw(lp,self->colors);
+            if(hdr->code==LVN_GETDISPINFOW){auto* info=reinterpret_cast<NMLVDISPINFOW*>(lp);auto& rows=hdr->hwndFrom==self->targets?self->target_rows:self->rows;auto& cols=hdr->hwndFrom==self->targets?self->target_columns:self->columns;
                 if(info->item.iItem>=0&&static_cast<size_t>(info->item.iItem)<rows.size()&&info->item.iSubItem>=0&&static_cast<size_t>(info->item.iSubItem)<cols.size()&&(info->item.mask&LVIF_TEXT)){auto value=wide(human(cols[info->item.iSubItem],rows[info->item.iItem].value(cols[info->item.iSubItem],Json())));wcsncpy_s(info->item.pszText,info->item.cchTextMax,value.c_str(),_TRUNCATE);}return 0;}
             if(hdr->code==LVN_ITEMCHANGED&&!self->replacing_rows&&(hdr->hwndFrom==self->list||hdr->hwndFrom==self->targets)){
                 const auto* change=reinterpret_cast<const NMLISTVIEW*>(lp);
@@ -574,6 +598,8 @@ void ScaleView::create(HWND parent,HFONT font,int dpi){auto& s=*impl_;s.font=fon
     SetWindowSubclass(s.targets,split_key_proc,1,reinterpret_cast<DWORD_PTR>(&s));
     s.source_title=s.make(L"STATIC",L"Archivos de origen",0,33);s.target_title=s.make(L"STATIC",L"Archivos de destino",0,34);
     s.detail=s.make(L"EDIT",L"Seleccione una fila para consultar rutas completas y evidencia.",WS_TABSTOP|WS_BORDER|ES_MULTILINE|ES_READONLY|WS_VSCROLL,11);s.tree=s.make(WC_TREEVIEWW,L"Raíces y cobertura",WS_TABSTOP|WS_BORDER|TVS_HASLINES|TVS_HASBUTTONS|TVS_LINESATROOT|TVS_SHOWSELALWAYS,12);
+    ui::apply_control_polish(s.detail,true,s.px(8));
+    ui::apply_control_polish(s.tree,false);
     ui::name(s.detail,L"Rutas completas y evidencia del archivo seleccionado");
     s.details_button=s.make(L"BUTTON",L"Ver detalle…",WS_TABSTOP,17);s.filter_button=s.make(L"BUTTON",L"Filtros",WS_TABSTOP,18);
     s.pane_choice=s.make(WC_COMBOBOXW,L"Lista visible: origen o destino",WS_TABSTOP|CBS_DROPDOWNLIST,23);
@@ -584,7 +610,11 @@ void ScaleView::create(HWND parent,HFONT font,int dpi){auto& s=*impl_;s.font=fon
     ShowWindow(s.progress,SW_HIDE);ShowWindow(s.empty,SW_HIDE);
     const HWND keyboard[]={s.refresh_button,s.filter_button,s.copy,s.details_button,s.pause,s.resume,s.cancel,s.retry,s.rescan,s.up,s.depth_choice,s.dev_kind_choice,s.dev_state_choice,s.root_choice,s.pending_filter,s.linked,s.include_non_source_chk,s.tree,s.pane_choice,s.list,s.targets,s.previous,s.next,s.next_target,s.detail};
     ui::tab_order(keyboard);
-    for(auto list:{s.list,s.targets})ListView_SetExtendedListViewStyle(list,LVS_EX_DOUBLEBUFFER|LVS_EX_FULLROWSELECT|LVS_EX_LABELTIP);s.layout();
+    for(auto list:{s.list,s.targets}){
+        ListView_SetExtendedListViewStyle(list,LVS_EX_DOUBLEBUFFER|LVS_EX_FULLROWSELECT|LVS_EX_LABELTIP);
+        ui::apply_control_polish(list,false);
+    }
+    s.layout();
 }
 HWND ScaleView::window()const{return impl_->hwnd;}
 void ScaleView::appearance(HFONT font,int dpi){

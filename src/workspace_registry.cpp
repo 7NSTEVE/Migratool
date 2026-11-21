@@ -231,12 +231,24 @@ Json tool_activate_workspace(const Json& args, fs::path* out_project_file, Log l
 }
 
 Json tool_list_workspaces(const Json& args) {
-    (void)args;
+    const std::string action = lower_ws(args.value("action", "list"));
+    const bool available_only = args.value("available_only", false);
+    Json prune_report = nullptr;
+    if (action == "prune") {
+        const bool dry_run = args.value("dry_run", false);
+        prune_report = housekeep_registry({{"prune_missing_projects", true}}, dry_run);
+    }
+
     auto reg = registered_projects();
     Json items = Json::array();
+    int64_t unavailable_skipped = 0;
     for (const auto& proj : reg.value("projects", Json::array())) {
-        Json item = proj;
         const bool avail = proj.value("available", false);
+        if (available_only && !avail) {
+            ++unavailable_skipped;
+            continue;
+        }
+        Json item = proj;
         if (avail) {
             try {
                 auto loaded = Project::load(fs::path(wide(proj["path"].get<std::string>())));
@@ -268,13 +280,17 @@ Json tool_list_workspaces(const Json& args) {
         }
         items.push_back(std::move(item));
     }
-    return {
+    Json out = {
         {"schema", "migratool.workspaces/1"},
         {"workspaces_root", path_text(default_workspaces_root())},
         {"registry_path", reg.value("registry_path", "")},
+        {"available_only", available_only},
+        {"unavailable_skipped", unavailable_skipped},
         {"count", items.size()},
         {"items", std::move(items)}
     };
+    if (!prune_report.is_null()) out["prune"] = std::move(prune_report);
+    return out;
 }
 
 Json tool_query_workspace(const Json& args, Log log, Cancel* cancel) {
@@ -285,6 +301,7 @@ Json tool_query_workspace(const Json& args, Log log, Cancel* cancel) {
 
     static const std::set<std::string> allowed_ro = {
         "explore_tree", "find_files", "changes_feed", "search_pattern", "read_file",
+        "find_duplicates", "verify_archive_vs_dir", "inspect_workspace_topology", "organize_verify",
         "query", "session_bootstrap", "migration_status", "project_context",
         "project_diagnostics", "next_tasks", "evidence_report", "history",
         "changes_since", "statistics", "get_task_context", "get_diagnostics",

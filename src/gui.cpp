@@ -8,6 +8,7 @@
 #include "migratool/live.hpp"
 #include "migratool/comparison_view.hpp"
 #include "migratool/duplicates.hpp"
+#include "migratool/fs_organize.hpp"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shobjidl.h>
@@ -43,6 +44,7 @@ constexpr int ID_SIDEBAR=57,ID_CODE_SETTINGS=58,ID_RESOURCES=59;
 constexpr int ID_IMPORT_WORK=60,ID_REVALIDATE_WORK=61,ID_CONTINUE_IMPORT=62;
 constexpr int ID_EXPORT_INVENTORY=63,ID_VERIFY_CONFIG=64;
 constexpr int ID_PHASE_UPSERT=65,ID_TASK_UPSERT=66,ID_TASK_TRANSITION=67,ID_DOC_AUDIT=68,ID_MODULE_FILTER_FILES=69,ID_TASK_DELETE=70,ID_CYCLE_PANE=71;
+constexpr int ID_HOUSEKEEP=72,ID_TOPOLOGY_AUDIT=73,ID_INCREASE_CONTRAST=74,ID_TOGGLE_THEME=75;
 constexpr const char* duplicate_modes[]={"off","files","files_and_zip"};
 struct FormCombo {
     int id=0;
@@ -166,6 +168,7 @@ LRESULT CALLBACK form_proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
       case WM_CREATE: {
         f->dpi=GetDpiForWindow(w);form_appearance(*f);
         f->viewport=CreateWindowExW(WS_EX_CONTROLPARENT,L"MigratoolFormBody",L"Campos del formulario",WS_CHILD|WS_VISIBLE|WS_VSCROLL|WS_CLIPCHILDREN,0,0,10,10,w,nullptr,GetModuleHandleW(nullptr),f);
+        ui::apply_control_polish(f->viewport,false);
         const auto mode_combo=[&](const wchar_t* name,int id,std::initializer_list<const wchar_t*> choices,int current){
             f->mode_labels.push_back(control(f->viewport,L"STATIC",name,0,0,f->dialog_font));
             auto combo=control(f->viewport,WC_COMBOBOXW,name,CBS_DROPDOWNLIST|WS_TABSTOP|WS_VSCROLL,id,f->dialog_font);
@@ -200,6 +203,7 @@ LRESULT CALLBACK form_proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             const bool single_line=f->single_fields.contains(i)||(i==0&&f->browse_files)||static_cast<int>(i)==f->single_folder||f->labels[i].starts_with(L"Nombre del proyecto")||f->labels[i].starts_with(L"Autor")||f->labels[i].starts_with(L"Memoria")||f->labels[i].starts_with(L"Tareas")||f->labels[i].starts_with(L"Analizadores simultáneos");
             const DWORD style=single_line?ES_AUTOHSCROLL:ES_MULTILINE|ES_AUTOVSCROLL|ES_WANTRETURN|WS_VSCROLL;
             auto edit=control(f->viewport,L"EDIT",f->values[i],WS_TABSTOP|style|(f->read_only?ES_READONLY:0),100+static_cast<int>(i),f->dialog_font);
+            ui::apply_control_polish(edit,true,ui::dip(8,f->dpi));
             ui::name(edit,f->labels[i]);SendMessageW(edit,EM_SETLIMITTEXT,32*1024*1024,0);f->edits.push_back(edit);
         }
         f->validation=control(w,L"STATIC",L"",0,0,f->dialog_font);
@@ -218,8 +222,21 @@ LRESULT CALLBACK form_proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
       case WM_GETMINMAXINFO:reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize={ui::dip(520,f->dpi),ui::dip(400,f->dpi)};return 0;
       case WM_DPICHANGED:{f->dpi=HIWORD(wp);auto r=reinterpret_cast<RECT*>(lp);form_appearance(*f);SetWindowPos(w,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE);form_layout(*f);return 0;}
       case WM_SETTINGCHANGE:case WM_THEMECHANGED:case WM_SYSCOLORCHANGE:form_appearance(*f);form_layout(*f);RedrawWindow(w,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);return 0;
-      case WM_CTLCOLORSTATIC:case WM_CTLCOLOREDIT:case WM_CTLCOLORBTN:return reinterpret_cast<LRESULT>(ui::color_control(reinterpret_cast<HDC>(wp),reinterpret_cast<HWND>(lp),f->colors,f->background,f->surface));
-      case WM_ERASEBKGND:{RECT area{};GetClientRect(w,&area);FillRect(reinterpret_cast<HDC>(wp),&area,f->background);return 1;}
+      case WM_CTLCOLORSTATIC:case WM_CTLCOLOREDIT:case WM_CTLCOLORBTN:{
+        auto child=reinterpret_cast<HWND>(lp);auto dc=reinterpret_cast<HDC>(wp);
+        if(child==f->validation){SetTextColor(dc,f->colors.danger_text);SetBkColor(dc,f->colors.background);return reinterpret_cast<LRESULT>(f->background);}
+        return reinterpret_cast<LRESULT>(ui::color_control(dc,child,f->colors,f->background,f->surface));
+      }
+      case WM_ERASEBKGND:{
+        auto dc=reinterpret_cast<HDC>(wp);
+        RECT area{};GetClientRect(w,&area);FillRect(dc,&area,f->background);
+        const auto p=[&](int n){return ui::dip(n,f->dpi);};
+        const int gap=p(12),line=ui::type_size(18,f->dpi)+p(7),button=ui::control_height(f->dpi);
+        const int footer_top=std::max(p(80),static_cast<int>(area.bottom)-(button+line*2+gap*3));
+        RECT div_rc{0,footer_top,area.right,footer_top+1};
+        auto div_br=CreateSolidBrush(f->colors.border);FillRect(dc,&div_rc,div_br);DeleteObject(div_br);
+        return 1;
+      }
       case WM_COMMAND:
         if(f->validation&&(HIWORD(wp)==EN_CHANGE||HIWORD(wp)==CBN_SELCHANGE))SetWindowTextW(f->validation,L"");
         if((HIWORD(wp)==EN_SETFOCUS||HIWORD(wp)==CBN_SETFOCUS)&&lp&&GetParent(reinterpret_cast<HWND>(lp))==f->viewport){
@@ -271,7 +288,9 @@ bool show_form(Form& f) {
     const auto x=std::clamp(static_cast<int>(parent.left)+(static_cast<int>(parent.right-parent.left)-width)/2,static_cast<int>(work.left),static_cast<int>(work.right)-width),y=std::clamp(static_cast<int>(parent.top)+24,static_cast<int>(work.top),static_cast<int>(work.bottom)-height);
     f.window=CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_CONTROLPARENT,L"MigratoolForm",f.title.c_str(),WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_CLIPCHILDREN,x,y,width,height,f.parent,nullptr,GetModuleHandleW(nullptr),&f);
     if(!f.window)throw std::runtime_error("No se pudo abrir el formulario");
-    EnableWindow(f.parent,FALSE);ShowWindow(f.window,SW_SHOW);MSG msg{};
+    EnableWindow(f.parent,FALSE);ShowWindow(f.window,SW_SHOW);
+    RedrawWindow(f.window,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW);
+    MSG msg{};
     while(!f.done&&GetMessageW(&msg,nullptr,0,0)>0){
         if(msg.message==WM_KEYDOWN&&msg.wParam==VK_RETURN&&(GetKeyState(VK_CONTROL)&0x8000)){SendMessageW(f.window,WM_COMMAND,IDOK,0);continue;}
         if(!IsDialogMessageW(f.window,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}
@@ -510,10 +529,12 @@ struct App {
     void menus(){
         auto bar=CreateMenu(),project_items=CreatePopupMenu(),view=CreatePopupMenu(),navigate=CreatePopupMenu(),help=CreatePopupMenu();
         AppendMenuW(project_items,MF_STRING,ID_NEW,L"&Crear proyecto…\tCtrl+N");AppendMenuW(project_items,MF_STRING,ID_OPEN,L"&Abrir proyecto…\tCtrl+O");AppendMenuW(project_items,MF_STRING,1014,L"Proyectos &recientes");AppendMenuW(project_items,MF_SEPARATOR,0,nullptr);
-        for(auto item:std::vector<std::pair<int,const wchar_t*>>{{ID_CONFIG,L"Carpetas y filtros…\tCtrl+,"},{ID_CODE_SETTINGS,L"Tipos de código y analizadores…"},{ID_RESOURCES,L"Recursos…"},{ID_VERIFY_CONFIG,L"Compilación y pruebas…"},{ID_CONFIG_ADVANCED,L"Configuración JSON…"},{ID_SCAN,L"Escanear proyecto"},{ID_MARK,L"Registrar avance…"},{ID_NOTE,L"Añadir nota…"},{ID_PHASE_UPSERT,L"Registrar fase…"},{ID_TASK_UPSERT,L"Registrar tarea…"},{ID_TASK_TRANSITION,L"Cambiar estado de tarea…"},{ID_TASK_DELETE,L"Eliminar tarea seleccionada"},{ID_DOC_AUDIT,L"Auditar documento…"},{ID_BUILD,L"Compilar"},{ID_TEST,L"Ejecutar pruebas"},{ID_COVERAGE,L"Importar cobertura…"},{ID_IMPORT_WORK,L"Importar trabajo existente…"},{ID_REVALIDATE_WORK,L"Revalidar resultado seleccionado"},{ID_CONTINUE_IMPORT,L"Continuar importación"},{ID_REPORT,L"Generar informe"},{ID_EXPORT_INVENTORY,L"Exportar inventario…"}})AppendMenuW(project_items,MF_STRING,item.first,item.second);
+        for(auto item:std::vector<std::pair<int,const wchar_t*>>{{ID_CONFIG,L"Carpetas y filtros…\tCtrl+,"},{ID_CODE_SETTINGS,L"Tipos de código y analizadores…"},{ID_RESOURCES,L"Recursos…"},{ID_VERIFY_CONFIG,L"Compilación y pruebas…"},{ID_CONFIG_ADVANCED,L"Configuración JSON…"},{ID_SCAN,L"Escanear proyecto"},{ID_MARK,L"Registrar avance…"},{ID_NOTE,L"Añadir nota…"},{ID_PHASE_UPSERT,L"Registrar fase…"},{ID_TASK_UPSERT,L"Registrar tarea…"},{ID_TASK_TRANSITION,L"Cambiar estado de tarea…"},{ID_TASK_DELETE,L"Eliminar tarea seleccionada"},{ID_DOC_AUDIT,L"Auditar documento…"},{ID_BUILD,L"Compilar"},{ID_TEST,L"Ejecutar pruebas"},{ID_COVERAGE,L"Importar cobertura…"},{ID_IMPORT_WORK,L"Importar trabajo existente…"},{ID_REVALIDATE_WORK,L"Revalidar resultado seleccionado"},{ID_CONTINUE_IMPORT,L"Continuar importación"},{ID_REPORT,L"Generar informe"},{ID_EXPORT_INVENTORY,L"Exportar inventario…"},{ID_HOUSEKEEP,L"Autoaseo del catálogo (Housekeep)…"},{ID_TOPOLOGY_AUDIT,L"Topología y seguridad del workspace…"}})AppendMenuW(project_items,MF_STRING,item.first,item.second);
         AppendMenuW(project_items,MF_SEPARATOR,0,nullptr);AppendMenuW(project_items,MF_STRING,ID_EXIT,L"&Cerrar\tAlt+F4");
         AppendMenuW(view,MF_STRING,ID_FOCUS_SEARCH,L"&Buscar en esta vista\tCtrl+F");AppendMenuW(view,MF_STRING,ID_RELOAD_VIEW,L"&Actualizar vista\tF5");AppendMenuW(view,MF_SEPARATOR,0,nullptr);
-        AppendMenuW(view,MF_STRING,ID_ZOOM_IN,L"&Aumentar texto\tCtrl++");AppendMenuW(view,MF_STRING,ID_ZOOM_OUT,L"&Reducir texto\tCtrl+-");AppendMenuW(view,MF_STRING,ID_ZOOM_RESET,L"&Tamaño original\tCtrl+0");AppendMenuW(view,MF_SEPARATOR,0,nullptr);AppendMenuW(view,MF_STRING,ID_SIDEBAR,L"Barra &lateral\tCtrl+B");AppendMenuW(view,MF_STRING,ID_LOG_TOGGLE,L"Detalles &técnicos\tCtrl+Mayús+D");
+        AppendMenuW(view,MF_STRING,ID_ZOOM_IN,L"&Aumentar texto\tCtrl++");AppendMenuW(view,MF_STRING,ID_ZOOM_OUT,L"&Reducir texto\tCtrl+-");AppendMenuW(view,MF_STRING,ID_ZOOM_RESET,L"&Tamaño original\tCtrl+0");AppendMenuW(view,MF_SEPARATOR,0,nullptr);
+        AppendMenuW(view,MF_STRING,ID_INCREASE_CONTRAST,L"&Contraste reforzado (Bordes nítidos)\tCtrl+Alt+C");AppendMenuW(view,MF_STRING,ID_TOGGLE_THEME,L"Alternar &tema claro / oscuro\tCtrl+Alt+T");AppendMenuW(view,MF_SEPARATOR,0,nullptr);
+        AppendMenuW(view,MF_STRING,ID_SIDEBAR,L"Barra &lateral\tCtrl+B");AppendMenuW(view,MF_STRING,ID_LOG_TOGGLE,L"Detalles &técnicos\tCtrl+Mayús+D");
         for(const auto& group:navigation_groups()){auto submenu=CreatePopupMenu();for(auto view_page:group.pages)AppendMenuW(submenu,MF_STRING,1000+view_page,pages[view_page]);AppendMenuW(navigate,MF_POPUP,reinterpret_cast<UINT_PTR>(submenu),group.title);}
         AppendMenuW(help,MF_STRING,ID_HELP,L"&Cómo usar esta pantalla\tF1");AppendMenuW(bar,MF_POPUP,reinterpret_cast<UINT_PTR>(project_items),L"&Proyecto");AppendMenuW(bar,MF_POPUP,reinterpret_cast<UINT_PTR>(view),L"&Ver");AppendMenuW(bar,MF_POPUP,reinterpret_cast<UINT_PTR>(navigate),L"&Ir a");AppendMenuW(bar,MF_POPUP,reinterpret_cast<UINT_PTR>(help),L"A&yuda");SetMenu(window,bar);
     }
@@ -851,15 +872,16 @@ struct App {
         }
     }
     void layout() {
-        if(!window||!filter)return;RECT rect{};GetClientRect(window,&rect);const int width=rect.right,height=rect.bottom,gap=px(12),margin=px(24),control=ui::control_height(dpi),label_height=type_px(18)+px(8);
+        if(!window||!filter)return;RECT rect{};GetClientRect(window,&rect);const int width=rect.right,height=rect.bottom;
+        const bool condensed=ui::text_percent>125&&height<px(850);
+        const int gap=condensed?px(8):px(12),margin=px(24),control=ui::control_height(dpi),label_height=type_px(18)+px(8);
         compact=sidebar_hidden||width<px(1100)||((ui::text_percent>125)&&width<px(1600));
         const int sidebar=compact?0:std::max(px(224),type_px(18)*13),left=sidebar+margin,right=margin,content=std::max(px(240),width-left-right);
-        content_left=left;content_width=content;title_y=margin;title_height=type_px(28)+px(12);
+        content_left=left;content_width=content;title_y=condensed?px(12):px(20);title_height=type_px(28)+px(10);
         for(auto item:nav)ui::show_if(item,false);
-        const int nav_top=px(145),nav_height=std::max(px(46),label_height+px(16));
-        for(size_t i=0;i<section_nav.size();++i){ui::show_if(section_nav[i],!compact);if(!compact)ui::move_if(section_nav[i],px(16),nav_top+static_cast<int>(i)*(nav_height+gap),sidebar-px(32),nav_height);}
+        const int nav_top=px(112),nav_height=std::max(px(44),label_height+px(14)),nav_gap=px(6);
+        for(size_t i=0;i<section_nav.size();++i){ui::show_if(section_nav[i],!compact);if(!compact)ui::move_if(section_nav[i],px(16),nav_top+static_cast<int>(i)*(nav_height+nav_gap),sidebar-px(32),nav_height);}
         int y=title_y+title_height+gap;
-        const bool condensed=ui::text_percent>125&&height<px(850);
         const bool show_project=project.has_value()&&!condensed;
         const int project_width=std::min(content/3,std::max(px(210),type_px(14)*18));
         title_width=content-(show_project?project_width+gap:0);
@@ -868,25 +890,26 @@ struct App {
         ui::show_if(section_compact,compact);
         const bool section_visible=(project&&page!=0)||page==14;
         const bool has_search=navigation_search(page)&&project.has_value();
-        const bool combined=section_visible&&has_search&&!compact&&content>type_px(18)*53;
+        const bool combined=section_visible&&has_search&&!compact&&content>=type_px(18)*38;
         ui::show_if(section_selector,section_visible);
         if(compact){int group_width=section_visible?std::min(content/3,std::max(px(150),type_px(18)*8)):content;
             ui::move_if(section_compact,left,y,group_width,control+px(320));
             if(section_visible)ui::move_if(section_selector,left+group_width+gap,y,content-group_width-gap,control+px(420));y+=control+gap;
-        }else if(section_visible){const int section_width=combined?std::max(px(260),content/3):content;ui::move_if(section_selector,left,y,section_width,control+px(420));if(combined)ui::move_if(filter,left+section_width+gap,y,content-section_width-gap,control);y+=control+gap;}
-        const int hint_height=label_height*(content<type_px(18)*55?2:1)+px(4);
+        }else if(section_visible){const int section_width=combined?std::min(content/2,std::max(px(240),type_px(18)*15)):content;ui::move_if(section_selector,left,y,section_width,control+px(420));if(combined)ui::move_if(filter,left+section_width+gap,y,content-section_width-gap,control);y+=control+gap;}
+        const int hint_height=label_height*(content<type_px(18)*55?2:1)+px(2);
         ui::show_if(subtitle,!condensed);if(!condensed){ui::move_if(subtitle,left,y,content,hint_height);y+=hint_height+gap;}
+        int filter_row_y=y;
         ui::show_if(filter,has_search);if(has_search&&!combined){ui::move_if(filter,left,y,content,control);y+=control+gap;}
         const wchar_t* cue=page==1?L"Buscar un archivo de origen o destino…":page==17?L"Buscar en esta carpeta…":L"Buscar en esta vista…";
         if(last_cue_banner!=cue){last_cue_banner=cue;SendMessageW(filter,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(cue));}
-        cards_columns=content>=type_px(18)*65?4:2;cards_y=y;cards_height=type_px(30)+type_px(14)*2+px(30);
+        cards_columns=content>=type_px(18)*60?4:2;cards_y=y;cards_height=type_px(30)+type_px(14)*2+px(32);
         const int card_rows=4/cards_columns;
         cards_visible=page==0&&project&&y+card_rows*(cards_height+gap)+control+px(160)<height;
         const int card_width=(content-(cards_columns-1)*gap)/cards_columns;
         for(size_t i=0;i<card_values.size();++i){for(auto item:{card_values[i],card_labels[i]})ui::show_if(item,cards_visible);
             if(cards_visible){const int x=left+static_cast<int>(i%cards_columns)*(card_width+gap),top=y+static_cast<int>(i/cards_columns)*(cards_height+gap);
-            ui::move_if(card_values[i],x+gap,top+gap,card_width-gap*2,type_px(30)+px(8));
-            ui::move_if(card_labels[i],x+gap,top+gap+type_px(30)+px(10),card_width-gap*2,type_px(14)*2+px(4));}
+            ui::move_if(card_values[i],x+px(16),top+px(14),card_width-px(32),type_px(30)+px(8));
+            ui::move_if(card_labels[i],x+px(16),top+px(14)+type_px(30)+px(8),card_width-px(32),type_px(14)*2+px(4));}
         }
         if(cards_visible)y+=card_rows*(cards_height+gap);
         ui::show_if(welcome,!project&&page==0);
@@ -899,29 +922,39 @@ struct App {
         if(condensed&&actions.size()>1&&!busy)actions.resize(1);
         for(auto button:buttons){const int bid=GetDlgCtrlID(button);if(std::find(actions.begin(),actions.end(),bid)==actions.end())ui::show_if(button,false);}
         int x=left,action_y=y;bool first=true;
-        HDC measure_dc=actions.empty()?nullptr:GetDC(window);
+        HDC measure_dc=GetDC(window);
         HGDIOBJ prev_font=measure_dc?SelectObject(measure_dc,body):nullptr;
+        const bool inline_condensed_action=condensed&&has_search&&!combined&&actions.size()==1&&content>=px(480);
         for(const auto id:actions){auto button=GetDlgItem(window,id);if(!button)continue;
             const wchar_t* title=id==ID_EXPORT_INVENTORY?L"Exportar inventario…":id==ID_NEW?L"Crear proyecto…":id==ID_OPEN?L"Abrir proyecto…":id==ID_CONFIG?(page==15?L"Configurar duplicados…":L"Carpetas y filtros…"):id==ID_SCAN?L"Escanear proyecto":id==ID_MARK?L"Registrar avance…":id==ID_NOTE?L"Añadir nota…":id==ID_TEST?L"Ejecutar pruebas":id==ID_BUILD?L"Compilar":id==ID_COVERAGE?L"Importar cobertura…":id==ID_NEXT_STEP?L"Ver pendientes":id==ID_CONFIG_ADVANCED?L"JSON avanzado…":id==ID_CODE_SETTINGS?L"Tipos de código y analizadores…":id==ID_VERIFY_CONFIG?L"Compilación y pruebas…":id==ID_RESOURCES?L"Recursos…":id==ID_IMPORT_WORK?L"Importar trabajo…":id==ID_REVALIDATE_WORK?L"Revalidar selección":id==ID_CONTINUE_IMPORT?L"Continuar importación":id==ID_PHASE_UPSERT?L"Nueva / editar fase…":id==ID_TASK_UPSERT?L"Nueva / editar tarea…":id==ID_TASK_TRANSITION?L"Cambiar estado…":id==ID_DOC_AUDIT?L"Auditar documento…":id==ID_MODULE_FILTER_FILES?L"Ver archivos":id==ID_TASK_DELETE?L"Eliminar tarea":L"Cancelar";
             if(text(button)!=title)SetWindowTextW(button,title);
             SIZE size{};if(measure_dc)GetTextExtentPoint32W(measure_dc,title,static_cast<int>(wcslen(title)),&size);
-            const int item_width=std::min(content,std::max(px(110),static_cast<int>(size.cx)+px(32)));
-            if(x>left&&x+item_width>width-right){x=left;action_y+=control+gap;}
+            const int item_width=std::min(content,std::max(px(105),static_cast<int>(size.cx)+px(28)));
             const DWORD want_style=(first&&id!=ID_CANCEL)?BS_DEFPUSHBUTTON:BS_PUSHBUTTON;
             if(first&&id!=ID_CANCEL)first=false;
             if((GetWindowLongPtrW(button,GWL_STYLE)&0x0F)!=want_style)SendMessageW(button,BM_SETSTYLE,want_style,FALSE);
-            ui::move_if(button,x,action_y,item_width,control);ui::show_if(button,true);x+=item_width+gap;
+            if(inline_condensed_action&&content>item_width+px(200)){
+                const int filter_w=content-item_width-gap;
+                ui::move_if(filter,left,filter_row_y,filter_w,control);
+                ui::move_if(button,left+filter_w+gap,filter_row_y,item_width,control);
+                ui::show_if(button,true);
+                action_y=filter_row_y;
+            }else{
+                if(x>left&&x+item_width>width-right){x=left;action_y+=control+gap;}
+                ui::move_if(button,x,action_y,item_width,control);ui::show_if(button,true);x+=item_width+gap;
+            }
         }
-        if(measure_dc){SelectObject(measure_dc,prev_font);ReleaseDC(window,measure_dc);}
         if(!actions.empty())y=action_y+control+gap;
         if(!project&&page==0)ui::move_if(welcome,left,y+gap,content,std::max(px(80),height-y-px(75)));
         const int footer=std::max(px(36),type_px(14)+px(16)),logs=logs_visible?std::min(px(140),std::max(px(50),(height-y)/3)):0;
         const int body_height=std::max(px(30),height-y-logs-footer-gap);
         for(auto view:{list,comparison.window(),scalable_view.window()})if(view)ui::move_if(view,left,y,content,body_height);
         ui::show_if(logbox,logs_visible);if(logs_visible)ui::move_if(logbox,left,height-footer-logs,content,logs);
-        const int details_width=std::min(content/2,std::max(px(170),type_px(14)*15));
-        ui::move_if(log_toggle,width-right-details_width,height-footer,details_width,footer-px(4));
         const wchar_t* lt_txt=logs_visible?L"Ocultar detalles":L"Detalles técnicos";if(text(log_toggle)!=lt_txt)SetWindowTextW(log_toggle,lt_txt);
+        SIZE lt_size{};
+        if(measure_dc){SelectObject(measure_dc,small_font);GetTextExtentPoint32W(measure_dc,lt_txt,static_cast<int>(wcslen(lt_txt)),&lt_size);SelectObject(measure_dc,prev_font);ReleaseDC(window,measure_dc);}
+        const int details_width=std::min(content/3,std::max(px(145),static_cast<int>(lt_size.cx)+px(28)));
+        ui::move_if(log_toggle,width-right-details_width,height-footer+px(2),details_width,footer-px(6));
         ui::move_if(statusbar,left,height-footer+px(6),std::max(px(50),content-details_width-gap),type_px(14)+px(8));
         std::vector<HWND> keyboard=section_nav;
         keyboard.insert(keyboard.end(),{project_selector,section_compact,section_selector,filter});
@@ -934,11 +967,28 @@ struct App {
     void paint() {
         PAINTSTRUCT ps{};auto dc=BeginPaint(window,&ps);RECT area{};GetClientRect(window,&area);FillRect(dc,&area,background_brush?background_brush:GetSysColorBrush(COLOR_WINDOW));SetBkMode(dc,TRANSPARENT);
         auto draw=[&](const std::wstring& value,RECT bounds,HFONT selected_font,COLORREF color,UINT flags=DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS){auto old=SelectObject(dc,selected_font);SetTextColor(dc,color);DrawTextW(dc,value.c_str(),-1,&bounds,flags);SelectObject(dc,old);};
-        if(!compact){RECT sidebar{0,0,content_left-px(24),area.bottom};auto brush=CreateSolidBrush(NAV);FillRect(dc,&sidebar,brush);DeleteObject(brush);
-            draw(L"Migratool",{px(24),px(28),sidebar.right-px(14),px(28)+type_px(28)+px(8)},heading,INK);
+        if(!compact){
+            const int side_right=content_left-px(24);
+            RECT sidebar{0,0,side_right,area.bottom};auto brush=CreateSolidBrush(NAV);FillRect(dc,&sidebar,brush);DeleteObject(brush);
+            RECT side_border{side_right-1,0,side_right,area.bottom};
+            auto border_br=CreateSolidBrush(palette.border);FillRect(dc,&side_border,border_br);DeleteObject(border_br);
+            draw(L"Migratool",{px(22),px(22),sidebar.right-px(14),px(22)+type_px(28)+px(8)},heading,INK);
+            draw(L"Auditoría y organización",{px(24),px(26)+type_px(28),sidebar.right-px(14),px(32)+type_px(28)+type_px(14)},small_font,MUTED);
+            RECT side_div{px(18),px(98),side_right-px(18),px(99)};
+            auto div_br=CreateSolidBrush(palette.divider);FillRect(dc,&side_div,div_br);DeleteObject(div_br);
         }
         draw(!project&&page==0?L"Empiece una migración":pages[page],{content_left,title_y,content_left+title_width,title_y+title_height},heading,INK);
-        if(cards_visible){const int gap=px(12),card_width=(content_width-(cards_columns-1)*gap)/cards_columns;for(size_t i=0;i<card_values.size();++i){const int x=content_left+static_cast<int>(i%cards_columns)*(card_width+gap),top=cards_y+static_cast<int>(i/cards_columns)*(cards_height+gap);RECT card{x,top,x+card_width,top+cards_height};FillRect(dc,&card,surface_brush);}}
+        if(cards_visible){
+            const int gap=px(12),card_width=(content_width-(cards_columns-1)*gap)/cards_columns;
+            for(size_t i=0;i<card_values.size();++i){
+                const int x=content_left+static_cast<int>(i%cards_columns)*(card_width+gap),top=cards_y+static_cast<int>(i/cards_columns)*(cards_height+gap);
+                RECT card{x,top,x+card_width,top+cards_height};
+                ui::draw_card(dc,card,palette,px(10),true,palette.accent);
+            }
+        }
+        const int footer=std::max(px(36),type_px(14)+px(16));
+        RECT footer_div{content_left,area.bottom-footer-px(3),area.right-px(24),area.bottom-footer-px(3)+1};
+        auto fdiv_br=CreateSolidBrush(palette.divider);FillRect(dc,&footer_div,fdiv_br);DeleteObject(fdiv_br);
         EndPaint(window,&ps);
     }
     void action(int id) {
@@ -947,6 +997,8 @@ struct App {
             help+=L"\r\n\r\nEsta pantalla: ";help+=navigation_groups()[navigation_group(page)].description;f.values={help};show_form(f);return;}
         if(id==ID_EXIT){SendMessageW(window,WM_CLOSE,0,0);return;}
         if(id==ID_ZOOM_IN||id==ID_ZOOM_OUT||id==ID_ZOOM_RESET){zoom(id==ID_ZOOM_IN?25:id==ID_ZOOM_OUT?-25:0);return;}
+        if(id==ID_INCREASE_CONTRAST){ui::g_increased_contrast=!ui::g_increased_contrast;apply_appearance();log(ui::g_increased_contrast?"Contraste reforzado y bordes nítidos activados (WCAG AAA).":"Contraste estándar restaurado.");return;}
+        if(id==ID_TOGGLE_THEME){ui::g_theme_mode=(ui::g_theme_mode==0)?1:0;apply_appearance();log(ui::g_theme_mode==1?"Modo oscuro calibrado activado.":"Tema Porcelana Claro activado.");return;}
         if(id==ID_SIDEBAR){sidebar_hidden=!sidebar_hidden;save_preferences();layout();return;}
         if(id==ID_FOCUS_SEARCH){if(IsWindowVisible(filter))SetFocus(filter);else log("Esta pantalla no tiene búsqueda. Elija una lista desde el menú Ir a.");return;}
         if(id==ID_RELOAD_VIEW){if(!loading)refresh_view();return;}
@@ -1473,6 +1525,23 @@ struct App {
                 SetFocus(panes[idx]);
             }return;
         }
+        if(id==ID_HOUSEKEEP){
+            start([](Project& p,Log l,Cancel*){
+                auto res=agent_request(p,"housekeep",Json::object());
+                l("Autoaseo completado: "+std::to_string(res.value("jobs_pruned",0))+" trabajos antiguos depurados · "+std::to_string(res.value("requests_pruned",0))+" solicitudes liberadas.");
+            },"Autoaseo del catálogo");
+            return;
+        }
+        if(id==ID_TOPOLOGY_AUDIT){
+            Form f;f.parent=window;f.title=L"Topología y seguridad del workspace";f.width=980;f.height=720;f.read_only=true;
+            f.labels={L"Diagnóstico de repositorios Git, worktrees, enlaces NTFS, rutas absolutas y marcadores en la nube"};
+            Json report=Json::object();
+            try{Database db(*project);report=tool_inspect_workspace_topology(*project,db,Json::object());}
+            catch(const std::exception& e){report={{"error",e.what()}};}
+            f.values={wide(report.dump(2))};
+            show_form(f);
+            return;
+        }
         if(id==ID_COVERAGE){auto input=open_file(window,L"Importar informe de cobertura");if(!input)return;Form f;f.parent=window;f.title=L"Importar cobertura";f.labels={L"Raíz (identificador exacto en configuración)",L"Formato: llvm, cobertura o generic"};f.values={L"target1",L"llvm"};f.height=400;if(show_form(f)){auto root=utf8(f.values[0]),format=utf8(f.values[1]);start([input,root,format](Project& p,Log l,Cancel*){import_coverage(p,*input,root,format,l);});}return;}
         if(id==ID_SCAN){Database db(*project);if(scale_enabled(*project,db)){auto job=scale_start(*project,{{"actor","GUI"}});log("Trabajo iniciado: "+job["job_id"].get<std::string>());durable=true;page=16;refresh_view();layout();}else start([](Project& p,Log l,Cancel* c){scan(p,l,c);});}
         else if(id==ID_BUILD)start([](Project& p,Log l,Cancel* c){auto r=run_builds(p,l,c);if(r["builds"].empty())l("Sin comandos de compilación configurados.");});
@@ -1508,12 +1577,12 @@ LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             for(const auto* label:{L"Archivos de origen",L"Migración registrada",L"Con pruebas vigentes",L"Análisis pendientes"}){a->card_values.push_back(control(w,L"STATIC",L"Por calcular",SS_ENDELLIPSIS,0,body));a->card_labels.push_back(control(w,L"STATIC",label,0,0,small_font));}
              a->project_selector=control(w,WC_COMBOBOXW,L"Proyecto visible",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,ID_PROJECT,small_font);
              SendMessageW(a->project_selector,CB_SETDROPPEDWIDTH,a->px(900),0);
-            a->filter=control(w,L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,ID_FILTER,body);ui::name(a->filter,L"Buscar en esta vista");SendMessageW(a->filter,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"Filtrar por nombre, ruta exacta, estado o nota…"));
+            a->filter=control(w,L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,ID_FILTER,body);ui::apply_control_polish(a->filter,true,a->px(8));ui::name(a->filter,L"Buscar en esta vista");SendMessageW(a->filter,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"Filtrar por nombre, ruta exacta, estado o nota…"));
             a->list=control(w,WC_LISTVIEWW,L"Resultados de la pantalla actual",WS_TABSTOP|WS_BORDER|LVS_REPORT|LVS_SHOWSELALWAYS,40,body);ListView_SetExtendedListViewStyle(a->list,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_LABELTIP);
-            a->logbox=control(w,L"EDIT",L"",ES_MULTILINE|ES_READONLY|WS_VSCROLL,41,small_font);ui::name(a->logbox,L"Registro técnico de actividad");
-            a->statusbar=control(w,L"STATIC",a->status_text,SS_PATHELLIPSIS,42,small_font);
+            a->logbox=control(w,L"EDIT",L"",WS_BORDER|ES_MULTILINE|ES_READONLY|WS_VSCROLL,41,small_font);ui::apply_control_polish(a->logbox,true,a->px(8));ui::name(a->logbox,L"Registro técnico de actividad");
+            a->statusbar=control(w,L"STATIC",a->status_text,SS_ENDELLIPSIS,42,small_font);
              a->comparison.create(w,body,a->dpi);a->scalable_view.create(w,body,a->dpi);
-             SetWindowTheme(a->list,L"Explorer",nullptr);a->menus();a->apply_appearance();SetTimer(w,1,1000,nullptr);a->set_busy(false);a->refresh_view();a->layout();return 0;
+             ui::apply_control_polish(a->list,false);a->menus();a->apply_appearance();SetTimer(w,1,1000,nullptr);a->set_busy(false);a->refresh_view();a->layout();return 0;
           }
           case WM_SIZE:a->layout();return 0;
           case WM_OPEN_PROJECT:{std::unique_ptr<OpenProjectResult> result(reinterpret_cast<OpenProjectResult*>(lp));a->finish_open(*result,wp!=0);return 0;}
@@ -1531,10 +1600,30 @@ LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
           case WM_SETTINGCHANGE:case WM_THEMECHANGED:case WM_SYSCOLORCHANGE:a->apply_appearance();return 0;
           case WM_CTLCOLORSTATIC:case WM_CTLCOLOREDIT:case WM_CTLCOLORBTN:{auto child=reinterpret_cast<HWND>(lp);auto dc=reinterpret_cast<HDC>(wp);for(auto item:a->card_values)if(item==child){SetTextColor(dc,BLUE);SetBkColor(dc,palette.surface);return reinterpret_cast<LRESULT>(a->surface_brush);}for(auto item:a->card_labels)if(item==child){SetTextColor(dc,MUTED);SetBkColor(dc,palette.surface);return reinterpret_cast<LRESULT>(a->surface_brush);}return reinterpret_cast<LRESULT>(ui::color_control(dc,child,palette,a->background_brush,a->surface_brush));}
           case WM_DRAWITEM:{auto d=reinterpret_cast<DRAWITEMSTRUCT*>(lp);if(d->CtlID>=2000&&d->CtlID<2005){const int group=static_cast<int>(d->CtlID)-2000;const bool active=navigation_group(a->page)==group;auto background=CreateSolidBrush(NAV);FillRect(d->hDC,&d->rcItem,background);DeleteObject(background);
-                const bool pressed=(d->itemState&ODS_SELECTED)!=0,hover=a->hovered==static_cast<int>(d->CtlID);if(active||pressed||hover){auto fill=CreateSolidBrush(pressed?palette.selection:active?palette.selection:palette.hover);auto old=SelectObject(d->hDC,fill);auto pen=SelectObject(d->hDC,GetStockObject(NULL_PEN));RoundRect(d->hDC,d->rcItem.left,d->rcItem.top,d->rcItem.right,d->rcItem.bottom,a->px(12),a->px(12));SelectObject(d->hDC,pen);SelectObject(d->hDC,old);DeleteObject(fill);}
-                SetBkMode(d->hDC,TRANSPARENT);SetTextColor(d->hDC,active||pressed?palette.selection_text:palette.high_contrast&&hover?palette.selection_text:INK);auto old=SelectObject(d->hDC,body);auto bounds=d->rcItem;bounds.left+=a->px(18);DrawTextW(d->hDC,navigation_groups()[group].title,-1,&bounds,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS);SelectObject(d->hDC,old);if(d->itemState&ODS_FOCUS){auto focus=d->rcItem;InflateRect(&focus,-a->px(3),-a->px(3));DrawFocusRect(d->hDC,&focus);}return TRUE;}
+                const bool pressed=(d->itemState&ODS_SELECTED)!=0,hover=a->hovered==static_cast<int>(d->CtlID);
+                if(active||pressed||hover){
+                    auto fill=CreateSolidBrush(pressed?palette.selection:active?palette.selection:palette.hover);
+                    auto border_pen=CreatePen(PS_SOLID,1,(active&&palette.increased_contrast)?palette.accent:(active?palette.border:palette.hover));
+                    auto old_br=SelectObject(d->hDC,fill);auto old_pen=SelectObject(d->hDC,active?border_pen:GetStockObject(NULL_PEN));
+                    RoundRect(d->hDC,d->rcItem.left,d->rcItem.top,d->rcItem.right,d->rcItem.bottom,a->px(8),a->px(8));
+                    SelectObject(d->hDC,old_pen);SelectObject(d->hDC,old_br);DeleteObject(border_pen);DeleteObject(fill);
+                }
+                const int cy=(d->rcItem.top+d->rcItem.bottom)/2;
+                if(active){
+                    RECT pill{d->rcItem.left+a->px(4),cy-a->px(9),d->rcItem.left+a->px(7),cy+a->px(9)};
+                    auto pill_br=CreateSolidBrush(palette.accent);FillRect(d->hDC,&pill,pill_br);DeleteObject(pill_br);
+                }
+                const COLORREF fg_text=active||pressed?palette.selection_text:palette.high_contrast&&hover?palette.selection_text:INK;
+                const COLORREF fg_icon=active||pressed?(palette.high_contrast?palette.selection_text:palette.accent):MUTED;
+                const int icon_sz=std::max<int>(a->px(16),std::min<int>(a->px(20),static_cast<int>(d->rcItem.bottom-d->rcItem.top)/2));
+                RECT icon_rc{d->rcItem.left+a->px(14),cy-icon_sz/2,d->rcItem.left+a->px(14)+icon_sz,cy+icon_sz/2};
+                ui::draw_nav_icon(d->hDC,group,icon_rc,fg_icon,std::max(1,a->px(2)));
+                SetBkMode(d->hDC,TRANSPARENT);SetTextColor(d->hDC,fg_text);auto old=SelectObject(d->hDC,body);
+                auto bounds=d->rcItem;bounds.left+=a->px(14)+icon_sz+a->px(10);
+                DrawTextW(d->hDC,navigation_groups()[group].title,-1,&bounds,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS);
+                SelectObject(d->hDC,old);if(d->itemState&ODS_FOCUS){auto focus=d->rcItem;InflateRect(&focus,-a->px(3),-a->px(3));DrawFocusRect(d->hDC,&focus);}return TRUE;}
             if(d->CtlID>=1000&&d->CtlID<1000+std::size(pages))return TRUE;break;}
-          case WM_INITMENUPOPUP:{auto menu=reinterpret_cast<HMENU>(wp);for(auto id:{ID_CONFIG,ID_CONFIG_ADVANCED,ID_CODE_SETTINGS,ID_RESOURCES,ID_VERIFY_CONFIG,ID_IMPORT_WORK,ID_SCAN,ID_MARK,ID_NOTE,ID_PHASE_UPSERT,ID_TASK_UPSERT,ID_TASK_TRANSITION,ID_DOC_AUDIT,ID_BUILD,ID_TEST,ID_COVERAGE,ID_REPORT,ID_EXPORT_INVENTORY})EnableMenuItem(menu,id,MF_BYCOMMAND|(a->project&&!a->busy?MF_ENABLED:MF_GRAYED));const auto sel_row=a->scalable_view.selected_row();EnableMenuItem(menu,ID_TASK_DELETE,MF_BYCOMMAND|(a->project&&!a->busy&&a->page==24&&sel_row.is_object()&&sel_row.value("record_type","")=="task"?MF_ENABLED:MF_GRAYED));EnableMenuItem(menu,ID_REVALIDATE_WORK,MF_BYCOMMAND|(a->project&&!a->busy&&a->page==18&&!a->selected().empty()?MF_ENABLED:MF_GRAYED));EnableMenuItem(menu,ID_CONTINUE_IMPORT,MF_BYCOMMAND|(!a->busy&&a->can_continue_import()?MF_ENABLED:MF_GRAYED));for(auto id:{ID_NEW,ID_OPEN})EnableMenuItem(menu,id,MF_BYCOMMAND|(a->busy?MF_GRAYED:MF_ENABLED));CheckMenuItem(menu,ID_SIDEBAR,MF_BYCOMMAND|(!a->compact?MF_CHECKED:MF_UNCHECKED));CheckMenuItem(menu,ID_LOG_TOGGLE,MF_BYCOMMAND|(a->logs_visible?MF_CHECKED:MF_UNCHECKED));EnableMenuItem(menu,ID_ZOOM_IN,MF_BYCOMMAND|(ui::text_percent<200?MF_ENABLED:MF_GRAYED));EnableMenuItem(menu,ID_ZOOM_OUT,MF_BYCOMMAND|(ui::text_percent>100?MF_ENABLED:MF_GRAYED));return 0;}
+          case WM_INITMENUPOPUP:{auto menu=reinterpret_cast<HMENU>(wp);for(auto id:{ID_CONFIG,ID_CONFIG_ADVANCED,ID_CODE_SETTINGS,ID_RESOURCES,ID_VERIFY_CONFIG,ID_IMPORT_WORK,ID_SCAN,ID_MARK,ID_NOTE,ID_PHASE_UPSERT,ID_TASK_UPSERT,ID_TASK_TRANSITION,ID_DOC_AUDIT,ID_BUILD,ID_TEST,ID_COVERAGE,ID_REPORT,ID_EXPORT_INVENTORY,ID_HOUSEKEEP,ID_TOPOLOGY_AUDIT})EnableMenuItem(menu,id,MF_BYCOMMAND|(a->project&&!a->busy?MF_ENABLED:MF_GRAYED));const auto sel_row=a->scalable_view.selected_row();EnableMenuItem(menu,ID_TASK_DELETE,MF_BYCOMMAND|(a->project&&!a->busy&&a->page==24&&sel_row.is_object()&&sel_row.value("record_type","")=="task"?MF_ENABLED:MF_GRAYED));EnableMenuItem(menu,ID_REVALIDATE_WORK,MF_BYCOMMAND|(a->project&&!a->busy&&a->page==18&&!a->selected().empty()?MF_ENABLED:MF_GRAYED));EnableMenuItem(menu,ID_CONTINUE_IMPORT,MF_BYCOMMAND|(!a->busy&&a->can_continue_import()?MF_ENABLED:MF_GRAYED));for(auto id:{ID_NEW,ID_OPEN})EnableMenuItem(menu,id,MF_BYCOMMAND|(a->busy?MF_GRAYED:MF_ENABLED));CheckMenuItem(menu,ID_SIDEBAR,MF_BYCOMMAND|(!a->compact?MF_CHECKED:MF_UNCHECKED));CheckMenuItem(menu,ID_LOG_TOGGLE,MF_BYCOMMAND|(a->logs_visible?MF_CHECKED:MF_UNCHECKED));CheckMenuItem(menu,ID_INCREASE_CONTRAST,MF_BYCOMMAND|(ui::g_increased_contrast?MF_CHECKED:MF_UNCHECKED));CheckMenuItem(menu,ID_TOGGLE_THEME,MF_BYCOMMAND|(ui::g_theme_mode==1?MF_CHECKED:MF_UNCHECKED));EnableMenuItem(menu,ID_ZOOM_IN,MF_BYCOMMAND|(ui::text_percent<200?MF_ENABLED:MF_GRAYED));EnableMenuItem(menu,ID_ZOOM_OUT,MF_BYCOMMAND|(ui::text_percent>100?MF_ENABLED:MF_GRAYED));return 0;}
           case WM_COMMAND:if(LOWORD(wp)==ID_FILTER&&HIWORD(wp)==EN_CHANGE){SetTimer(w,3,160,nullptr);return 0;}if((LOWORD(wp)==ID_PROJECT||LOWORD(wp)==ID_SECTION_VIEW||LOWORD(wp)==ID_SECTION_COMPACT)&&HIWORD(wp)!=CBN_SELCHANGE&&HIWORD(wp)!=1)return 0;a->action(LOWORD(wp));return 0;
           case WM_LOG:{std::unique_ptr<std::string> s(reinterpret_cast<std::string*>(lp));a->log(*s);return 0;}
           case WM_DONE:{std::unique_ptr<std::string> s(reinterpret_cast<std::string*>(lp));if(a->worker.joinable())a->worker.join();a->set_busy(false);
@@ -1567,7 +1656,7 @@ LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
                   }
               }else a->capture_settled_since=0;
           }return 0;
-          case WM_NOTIFY:{auto n=reinterpret_cast<NMHDR*>(lp);if(n->hwndFrom==a->list&&n->code==NM_DBLCLK){auto id=a->selected();if(a->page==14&&!id.empty()){a->load(fs::path(wide(id)));a->layout();return 0;}if(!id.empty()){Form f;f.parent=w;f.title=L"Identificador exacto · copiar para CLI o configuración";f.labels={L"Unidad seleccionada"};f.values={wide(id)};f.height=300;show_form(f);}return 0;}break;}
+          case WM_NOTIFY:{auto n=reinterpret_cast<NMHDR*>(lp);if(n->hwndFrom==a->list&&n->code==NM_CUSTOMDRAW)return ui::handle_listview_customdraw(lp,palette);if(n->hwndFrom==a->list&&n->code==NM_DBLCLK){auto id=a->selected();if(a->page==14&&!id.empty()){a->load(fs::path(wide(id)));a->layout();return 0;}if(!id.empty()){Form f;f.parent=w;f.title=L"Identificador exacto · copiar para CLI o configuración";f.labels={L"Unidad seleccionada"};f.values={wide(id)};f.height=300;show_form(f);}return 0;}break;}
           case WM_CLOSE:if(a->busy||a->polling){a->closing=true;a->cancel.requested=true;a->log("Cerrando la ventana. Guardando el estado de la operación…");return 0;}DestroyWindow(w);return 0;
           case WM_DESTROY:KillTimer(w,1);KillTimer(w,3);KillTimer(w,4);KillTimer(w,5);a->cancel.requested=true;if(a->worker.joinable())a->worker.join();if(a->prefs_worker.joinable())a->prefs_worker.join();if(a->prefs_dirty){a->prefs_dirty=false;a->flush_preferences_sync();}if(a->poll_worker.joinable())a->poll_worker.join();a->watcher.reset();if(a->gui_session){a->gui_session->finish(0);a->gui_session.reset();}PostQuitMessage(0);return 0;
         }
@@ -1626,7 +1715,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
         app.capture_active=true;app.capture_index=0;app.capture_wait_started=GetTickCount64();
         SetTimer(w,5,50,nullptr);
     }
-    std::vector<ACCEL> shortcuts={{FCONTROL|FVIRTKEY,'O',ID_OPEN},{FCONTROL|FVIRTKEY,'N',ID_NEW},{FCONTROL|FVIRTKEY,'F',ID_FOCUS_SEARCH},{FVIRTKEY,VK_F5,ID_RELOAD_VIEW},{FVIRTKEY,VK_F6,ID_CYCLE_PANE},{FVIRTKEY,VK_F1,ID_HELP},{FCONTROL|FVIRTKEY,VK_OEM_COMMA,ID_CONFIG},{FCONTROL|FVIRTKEY,VK_OEM_PLUS,ID_ZOOM_IN},{FCONTROL|FSHIFT|FVIRTKEY,VK_OEM_PLUS,ID_ZOOM_IN},{FCONTROL|FVIRTKEY,VK_ADD,ID_ZOOM_IN},{FCONTROL|FVIRTKEY,VK_OEM_MINUS,ID_ZOOM_OUT},{FCONTROL|FVIRTKEY,VK_SUBTRACT,ID_ZOOM_OUT},{FCONTROL|FVIRTKEY,'0',ID_ZOOM_RESET},{FCONTROL|FVIRTKEY,'B',ID_SIDEBAR},{FCONTROL|FSHIFT|FVIRTKEY,'D',ID_LOG_TOGGLE}};
+    std::vector<ACCEL> shortcuts={{FCONTROL|FVIRTKEY,'O',ID_OPEN},{FCONTROL|FVIRTKEY,'N',ID_NEW},{FCONTROL|FVIRTKEY,'F',ID_FOCUS_SEARCH},{FVIRTKEY,VK_F5,ID_RELOAD_VIEW},{FVIRTKEY,VK_F6,ID_CYCLE_PANE},{FVIRTKEY,VK_F1,ID_HELP},{FCONTROL|FVIRTKEY,VK_OEM_COMMA,ID_CONFIG},{FCONTROL|FVIRTKEY,VK_OEM_PLUS,ID_ZOOM_IN},{FCONTROL|FSHIFT|FVIRTKEY,VK_OEM_PLUS,ID_ZOOM_IN},{FCONTROL|FVIRTKEY,VK_ADD,ID_ZOOM_IN},{FCONTROL|FVIRTKEY,VK_OEM_MINUS,ID_ZOOM_OUT},{FCONTROL|FVIRTKEY,VK_SUBTRACT,ID_ZOOM_OUT},{FCONTROL|FVIRTKEY,'0',ID_ZOOM_RESET},{FCONTROL|FVIRTKEY,'B',ID_SIDEBAR},{FCONTROL|FSHIFT|FVIRTKEY,'D',ID_LOG_TOGGLE},{FCONTROL|FALT|FVIRTKEY,'C',ID_INCREASE_CONTRAST},{FCONTROL|FALT|FVIRTKEY,'T',ID_TOGGLE_THEME}};
     for(WORD i=0;i<5;++i)shortcuts.push_back({FCONTROL|FVIRTKEY,static_cast<WORD>('1'+i),static_cast<WORD>(2000+i)});
     auto accelerator=CreateAcceleratorTableW(shortcuts.data(),static_cast<int>(shortcuts.size()));MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){if(!TranslateAcceleratorW(w,accelerator,&msg)&&!IsDialogMessageW(w,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}}
     DestroyAcceleratorTable(accelerator);for(auto f:{body,heading,small_font,cardfont})if(f)DeleteObject(f);if(app.background_brush)DeleteObject(app.background_brush);if(app.surface_brush)DeleteObject(app.surface_brush);CoUninitialize();return 0;

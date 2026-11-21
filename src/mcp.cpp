@@ -19,13 +19,18 @@ namespace {
 bool is_read_only_mcp_tool(const std::string& name, const Json& args) {
     static const std::set<std::string> ro_tools = {
         "explore_tree", "find_files", "changes_feed", "search_pattern", "read_file",
+        "find_duplicates", "verify_archive_vs_dir", "inspect_workspace_topology",
+        "organize_plan", "organize_verify",
         "query", "session_bootstrap", "migration_status", "project_context",
         "project_diagnostics", "next_tasks", "evidence_report", "history",
         "changes_since", "statistics", "connections", "get_task_context",
-        "list_workspaces", "query_workspace", "job_status",
+        "query_workspace", "job_status",
         "get_diagnostics", "find_implementations", "find_declaration"
     };
     if (ro_tools.contains(name)) return true;
+    if (name == "list_workspaces") {
+        return args.value("action", "list") != "prune" || args.value("dry_run", false);
+    }
     if (name == "memory") {
         std::string act = args.value("action", args.value("op", "list"));
         return act == "list" || act == "read" || act == "search";
@@ -43,12 +48,16 @@ bool is_read_only_mcp_tool(const std::string& name, const Json& args) {
 } // namespace
 
 int mcp_server(const Project& initial_project) {
-    // MCP stdio: negociación explícita + pool concurrente de lecturas WAL (hasta 4 simultáneas) + carril de escritura serializado.
+    return mcp_server(std::optional<Project>(initial_project));
+}
+
+int mcp_server(const std::optional<Project>& initial_project) {
+    // MCP stdio: negociación explícita + modo projectless opcional + pool concurrente de lecturas WAL (hasta 4 simultáneas).
     const std::set<std::string> supported = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"};
     std::mutex output_mutex, state_mutex;
     bool initialized = false, ready = false;
     std::string client = "unknown", protocol = "2025-11-25", connection = unique_id();
-    fs::path active_project_file = initial_project.file;
+    fs::path active_project_file = initial_project ? initial_project->file : fs::path{};
     std::unique_ptr<IndexWatcher> watcher;
 
     struct ActiveOp {
@@ -71,9 +80,12 @@ int mcp_server(const Project& initial_project) {
         for (auto& t : to_join) if (t.joinable()) t.join();
     };
 
-    Database db(initial_project);
-    db.exec("INSERT INTO connections(id,pid,client,opened)VALUES(?,?,?,?)",
-            {connection, GetCurrentProcessId(), client, now()});
+    std::unique_ptr<Database> db;
+    if (initial_project) {
+        db = std::make_unique<Database>(*initial_project);
+        db->exec("INSERT INTO connections(id,pid,client,opened)VALUES(?,?,?,?)",
+                 {connection, GetCurrentProcessId(), client, now()});
+    }
     auto send = [&](const Json& value) {
         std::lock_guard lock(output_mutex);
         std::cout << value.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n' << std::flush;
@@ -112,9 +124,11 @@ int mcp_server(const Project& initial_project) {
             if (method == "notifications/initialized") {
                 if (initialized && !ready) {
                     ready = true;
-                    watcher = std::make_unique<IndexWatcher>(
-                        Project::load(active_project_file), 900000,
-                        [](const std::string& text) { std::cerr << text << '\n'; }, true);
+                    if (!active_project_file.empty()) {
+                        watcher = std::make_unique<IndexWatcher>(
+                            Project::load(active_project_file), 900000,
+                            [](const std::string& text) { std::cerr << text << '\n'; }, true);
+                    }
                 }
                 continue;
             }
@@ -126,16 +140,16 @@ int mcp_server(const Project& initial_project) {
                 initialized = true;
                 protocol = version;
                 client = params.value("clientInfo", Json::object()).value("name", "unknown");
-                db.exec("UPDATE connections SET client=? WHERE id=?", {client, connection});
+                if (db) db->exec("UPDATE connections SET client=? WHERE id=?", {client, connection});
                 response(id, {
                     {"protocolVersion", version},
                     {"capabilities", {{"tools", {{"listChanged", false}}}}},
                     {"serverInfo", {{"name", "migratool"}, {"version", build_identity()["version"]}}},
                     {"instructions",
-                     "Migratool v2.0 (Ultra-Escala 6M+ archivos + Workspace/Super-Serena + Migraciones). "
-                     "Para explorar millones de archivos/carpetas en <25ms: use activate_workspace (modo archive/workspace sin ensuciar la raíz), explore_tree, find_files y changes_feed. "
-                     "Para código y refactorización: use onboard_workspace, memory (write/read/edit/list/search), read_file, create_file, edit_file (atómico con rollback), search_pattern, edit_symbol, get_diagnostics, find_declaration, find_implementations, lsp_rename_symbol y query_workspace (consultas federadas). "
-                     "Para migraciones: session_bootstrap, get_task_context, complete_task, batch_update y verify. "
+                     "Migratool v2.1 (Ultra-Escala 6M+ archivos + Organización/Deduplicación Transaccional + Workspace/LSP + Migraciones). "
+                     "Para explorar millones de archivos: activate_workspace (modo archive/workspace sin ensuciar la raíz), explore_tree (flat/columnar), find_files y changes_feed. "
+                     "Para ordenar y deduplicar directorios masivos: inspect_workspace_topology, find_duplicates, verify_archive_vs_dir, organize_plan, organize_apply (execute:true, SHA-256 + journal), organize_verify y organize_undo. "
+                     "Para código y migraciones: onboard_workspace, memory, read_file, edit_file, search_pattern, LSP, session_bootstrap, get_task_context y complete_task. "
                      "Lecturas concurrentes habilitadas (hasta 4 en paralelo sobre SQLite WAL)."}
                 });
                 continue;
@@ -205,6 +219,9 @@ int mcp_server(const Project& initial_project) {
                             selected = fs::path(wide(arguments["project"].get<std::string>()));
                             if (!selected.is_absolute()) throw std::runtime_error("project debe ser ruta absoluta");
                         }
+                        if (selected.empty()) {
+                            throw std::runtime_error("NO_ACTIVE_WORKSPACE: llame primero a activate_workspace o pase project absoluto.");
+                        }
                         auto current = Project::load(selected);
                         auto request_args = arguments;
                         request_args.erase("project");
@@ -255,7 +272,7 @@ int mcp_server(const Project& initial_project) {
     for (auto& t : remaining) if (t.joinable()) t.join();
     watcher.reset();
     lsp_shutdown_all();
-    db.exec("UPDATE connections SET closed=? WHERE id=?", {now(), connection});
+    if (db) db->exec("UPDATE connections SET closed=? WHERE id=?", {now(), connection});
     return 0;
 }
 
