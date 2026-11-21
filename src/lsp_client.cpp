@@ -811,21 +811,24 @@ Json tool_lsp_rename_symbol(const Project& p, Database& db, const Json& args) {
     }
     const Json& we = resp["result"];
 
-    // Parse LSP WorkspaceEdit (supports both `changes` and `documentChanges`)
+    // Parse LSP WorkspaceEdit (per LSP 3.17, `documentChanges` takes exclusive precedence over `changes` when present)
     std::map<fs::path, std::vector<Json>> file_edits;
-    if (we.contains("changes") && we["changes"].is_object()) {
+    if (we.contains("documentChanges") && we["documentChanges"].is_array()) {
+        for (const auto& dc : we["documentChanges"]) {
+            if (!dc.is_object()) continue;
+            if (dc.contains("kind") && dc["kind"].is_string()) {
+                throw std::runtime_error("LSP_RENAME_UNSUPPORTED_RESOURCE_OP: " + dc["kind"].get<std::string>());
+            }
+            if (dc.contains("textDocument") && dc.contains("edits") && dc["edits"].is_array()) {
+                fs::path fp = uri_to_path(dc["textDocument"].at("uri").get<std::string>());
+                for (const auto& te : dc["edits"]) file_edits[fp].push_back(te);
+            }
+        }
+    } else if (we.contains("changes") && we["changes"].is_object()) {
         for (auto it = we["changes"].begin(); it != we["changes"].end(); ++it) {
             if (it.value().is_array()) {
                 fs::path fp = uri_to_path(it.key());
                 for (const auto& te : it.value()) file_edits[fp].push_back(te);
-            }
-        }
-    }
-    if (we.contains("documentChanges") && we["documentChanges"].is_array()) {
-        for (const auto& dc : we["documentChanges"]) {
-            if (dc.is_object() && dc.contains("textDocument") && dc.contains("edits") && dc["edits"].is_array()) {
-                fs::path fp = uri_to_path(dc["textDocument"].at("uri").get<std::string>());
-                for (const auto& te : dc["edits"]) file_edits[fp].push_back(te);
             }
         }
     }
@@ -843,15 +846,32 @@ Json tool_lsp_rename_symbol(const Project& p, Database& db, const Json& args) {
         std::vector<SpanEdit> spans;
         for (const auto& te : edits) {
             const auto& rng = te.at("range");
-            size_t s = line_col_to_offset(orig, rng["start"].at("line").get<int>(), rng["start"].at("character").get<int>());
-            size_t e = line_col_to_offset(orig, rng["end"].at("line").get<int>(), rng["end"].at("character").get<int>());
+            const int sl = rng["start"].at("line").get<int>();
+            const int sc = rng["start"].at("character").get<int>();
+            const int el = rng["end"].at("line").get<int>();
+            const int ec = rng["end"].at("character").get<int>();
+            if (sl < 0 || sc < 0 || el < 0 || ec < 0 || sl > el || (sl == el && sc > ec)) {
+                throw std::runtime_error("LSP_RENAME_INVALID_RANGE: " + path_text(fp));
+            }
+            size_t s = line_col_to_offset(orig, sl, sc);
+            size_t e = line_col_to_offset(orig, el, ec);
+            if (s > e || e > orig.size()) {
+                throw std::runtime_error("LSP_RENAME_INVALID_RANGE: " + path_text(fp));
+            }
             spans.push_back(SpanEdit{s, e, te.at("newText").get<std::string>()});
         }
-        // Apply right-to-left so offsets stay exact
-        std::sort(spans.begin(), spans.end(), [](const SpanEdit& a, const SpanEdit& b) { return a.start > b.start; });
+        // Apply right-to-left so offsets stay exact, and reject overlapping edits
+        std::sort(spans.begin(), spans.end(), [](const SpanEdit& a, const SpanEdit& b) {
+            return (a.start != b.start) ? (a.start > b.start) : (a.end > b.end);
+        });
+        for (size_t i = 1; i < spans.size(); ++i) {
+            if (spans[i].end > spans[i - 1].start) {
+                throw std::runtime_error("LSP_RENAME_OVERLAPPING_EDITS: " + path_text(fp));
+            }
+        }
         std::string upd = orig;
         for (const auto& sp : spans) {
-            if (sp.end <= upd.size() && sp.start <= sp.end) upd.replace(sp.start, sp.end - sp.start, sp.text);
+            upd.replace(sp.start, sp.end - sp.start, sp.text);
         }
         plan.push_back(PlannedFile{fp, std::move(orig), std::move(upd), spans.size()});
     }

@@ -783,6 +783,59 @@ int main(int argc, char** argv) {
                     "SELECT COUNT(*) FROM fs_hashes h WHERE NOT EXISTS(SELECT 1 FROM fs_nodes n WHERE n.root_id=h.root_id AND n.frn=h.frn AND (n.flags & 1)=0)");
                 check(orphan_hashes == 0, "A15 AGGRAVATING #7: directory delete cleans child file FRNs from fs_hashes (orphan_hashes=" + std::to_string(orphan_hashes) + ")");
             }
+
+            // Cross-Volume Move Protocol (Copy -> Verify SHA-256 -> Atomic Stage Rename -> Delete Source) for file + dir
+            {
+                write_bytes_ext(root / L"xvol_file.bin", "CROSS_VOLUME_FILE_PAYLOAD_12345");
+                write_bytes_ext(root / L"xvol_dir" / L"sub" / L"nested.txt", "CROSS_VOLUME_DIR_PAYLOAD_67890");
+                agent_request(p, "inventory_sync", {{"full", false}});
+
+                SetEnvironmentVariableW(L"MIGRATOOL_FORCE_CROSS_VOLUME_MOVE", L"1");
+                agent_request(p, "organize_plan", {
+                    {"plan_id", "xvol_plan"},
+                    {"operations", Json::array({
+                        {{"op", "quarantine_file"}, {"category", "xvol"}, {"src", "xvol_file.bin"}},
+                        {{"op", "quarantine_dir"}, {"category", "xvol"}, {"src", "xvol_dir"}}
+                    })}
+                });
+                auto xv_app = agent_request(p, "organize_apply", {{"plan_id", "xvol_plan"}, {"execute", true}, {"sync_after", true}});
+                check(xv_app["executed_now"].get<int64_t>() == 2 && xv_app["quarantined_files"].get<int64_t>() == 2,
+                      "M0+ Cross-volume: organize_apply moved both file and directory tree across volumes with SHA-256 verification");
+                check(!fs::exists(native_path(root / L"xvol_file.bin")) && !fs::exists(native_path(root / L"xvol_dir")),
+                      "M0+ Cross-volume: source file and directory removed after verified staging copy");
+
+                auto xv_ver = agent_request(p, "organize_verify", {{"plan_id", "xvol_plan"}, {"verify_sha256", true}});
+                check(xv_ver["all_passed"] == true, "M0+ Cross-volume: organize_verify passed all 3 gates with SHA-256");
+
+                auto xv_undo = agent_request(p, "organize_undo", {{"plan_id", "xvol_plan"}, {"execute", true}});
+                SetEnvironmentVariableW(L"MIGRATOOL_FORCE_CROSS_VOLUME_MOVE", nullptr);
+                check(xv_undo["undone"] == true && xv_undo["moves_undone"].get<int64_t>() == 2,
+                      "M0+ Cross-volume: organize_undo restored both file and directory tree across volumes");
+                check(read_text(root / L"xvol_file.bin") == "CROSS_VOLUME_FILE_PAYLOAD_12345" &&
+                      read_text(root / L"xvol_dir" / L"sub" / L"nested.txt") == "CROSS_VOLUME_DIR_PAYLOAD_67890",
+                      "M0+ Cross-volume: restored file and directory payloads match byte-for-byte");
+                remove_tree_ext(root / L"xvol_file.bin");
+                remove_tree_ext(root / L"xvol_dir");
+                agent_request(p, "inventory_sync", {{"full", false}});
+            }
+
+            // USN Journal Discontinuity Recovery: fs_reconcile_incremental MUST re-anchor next_usn in fs_roots
+            {
+                Database udb(p);
+                const int64_t jid = udb.integer("SELECT usn_journal_id FROM fs_roots WHERE root_id=1");
+                if (jid > 0) {
+                    // Force an expired USN cursor (next_usn = -1) so the next incremental sync falls back to fs_reconcile_incremental
+                    udb.exec("UPDATE fs_roots SET next_usn=-1 WHERE root_id=1");
+                    write_bytes_ext(root / L"usn_reanchor.txt", "reanchor test");
+                    auto sync_reanchor = agent_request(p, "inventory_sync", {{"full", false}});
+                    (void)sync_reanchor;
+                    const int64_t reanchored_usn = udb.integer("SELECT next_usn FROM fs_roots WHERE root_id=1");
+                    check(reanchored_usn > 0,
+                          "M0+ USN Gap: fs_reconcile_incremental re-anchored fs_roots.next_usn after expired USN checkpoint (next_usn=" + std::to_string(reanchored_usn) + ")");
+                    remove_tree_ext(root / L"usn_reanchor.txt");
+                    agent_request(p, "inventory_sync", {{"full", false}});
+                }
+            }
         }
 
         std::cout << "fs_organize_tests PASSED (" << checks << " checks)\n";

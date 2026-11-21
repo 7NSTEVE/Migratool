@@ -172,23 +172,6 @@ std::vector<std::string> win32_ensure_dir(const fs::path& dir_path) {
     return created;
 }
 
-void win32_move_no_overwrite(const fs::path& src, const fs::path& dst) {
-    const auto nsrc = native_path(src);
-    const auto ndst = native_path(dst);
-    if (GetFileAttributesW(nsrc.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        throw std::runtime_error("Origen no existe: " + path_text(src));
-    }
-    if (GetFileAttributesW(ndst.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        throw std::runtime_error("Destino ya existe (sin sobrescritura): " + path_text(dst));
-    }
-    win32_ensure_dir(dst.parent_path());
-    if (!MoveFileExW(nsrc.c_str(), ndst.c_str(), 0)) {
-        DWORD err = GetLastError();
-        throw std::runtime_error("MoveFileExW falló (Win32 " + std::to_string(err) + "): " +
-                                 path_text(src) + " -> " + path_text(dst));
-    }
-}
-
 bool win32_rmdir_empty(const fs::path& p) {
     const auto np = native_path(p);
     DWORD attrs = GetFileAttributesW(np.c_str());
@@ -197,6 +180,16 @@ bool win32_rmdir_empty(const fs::path& p) {
         SetFileAttributesW(np.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
     }
     return RemoveDirectoryW(np.c_str()) != FALSE;
+}
+
+bool win32_delete_file_clear_ro(const fs::path& p) {
+    const auto np = native_path(p);
+    DWORD attrs = GetFileAttributesW(np.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return true;
+    if (attrs & FILE_ATTRIBUTE_READONLY) {
+        SetFileAttributesW(np.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+    }
+    return DeleteFileW(np.c_str()) != FALSE;
 }
 
 struct WalkedFile {
@@ -258,6 +251,102 @@ WalkResult win32_safe_walk(const fs::path& root, Cancel* cancel = nullptr) {
         for (auto& sd : subdirs) stack.push_back(std::move(sd));
     }
     return res;
+}
+
+void win32_remove_tree_no_reparse(const fs::path& root) {
+    DWORD attrs = GetFileAttributesW(native_path(root).c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return;
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        win32_delete_file_clear_ro(root);
+        return;
+    }
+    auto w = win32_safe_walk(root);
+    for (const auto& f : w.files) {
+        win32_delete_file_clear_ro(root / fs::path(wide(f.rel_fwd)));
+    }
+    std::sort(w.dirs.begin(), w.dirs.end(), [](const std::string& a, const std::string& b) {
+        return a.size() > b.size();
+    });
+    for (const auto& d : w.dirs) {
+        win32_rmdir_empty(root / fs::path(wide(d)));
+    }
+    win32_rmdir_empty(root);
+}
+
+void win32_copy_verified_file(const fs::path& src_f, const fs::path& dst_f) {
+    win32_ensure_dir(dst_f.parent_path());
+    if (!CopyFileExW(native_path(src_f).c_str(), native_path(dst_f).c_str(), nullptr, nullptr, nullptr, COPY_FILE_FAIL_IF_EXISTS)) {
+        DWORD err = GetLastError();
+        throw std::runtime_error("CopyFileExW falló (Win32 " + std::to_string(err) + "): " +
+                                 path_text(src_f) + " -> " + path_text(dst_f));
+    }
+    const std::string h_src = sha256_file_bounded(src_f, 0, nullptr);
+    const std::string h_dst = sha256_file_bounded(dst_f, 0, nullptr);
+    if (h_src.empty() || h_src != h_dst) {
+        win32_delete_file_clear_ro(dst_f);
+        throw std::runtime_error("Verificación SHA-256 falló en copia cross-volume: " + path_text(src_f));
+    }
+}
+
+void win32_move_no_overwrite(const fs::path& src, const fs::path& dst) {
+    const auto nsrc = native_path(src);
+    const auto ndst = native_path(dst);
+    const DWORD attrs = GetFileAttributesW(nsrc.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        throw std::runtime_error("Origen no existe: " + path_text(src));
+    }
+    if (GetFileAttributesW(ndst.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        throw std::runtime_error("Destino ya existe (sin sobrescritura): " + path_text(dst));
+    }
+    win32_ensure_dir(dst.parent_path());
+
+    wchar_t force_xvol[16]{};
+    const bool simulate_xvol = (GetEnvironmentVariableW(L"MIGRATOOL_FORCE_CROSS_VOLUME_MOVE", force_xvol, 16) > 0 &&
+                                std::wstring_view(force_xvol) == L"1");
+
+    if (!simulate_xvol && MoveFileExW(nsrc.c_str(), ndst.c_str(), 0)) {
+        return;
+    }
+    const DWORD err = simulate_xvol ? ERROR_NOT_SAME_DEVICE : GetLastError();
+    if (err != ERROR_NOT_SAME_DEVICE) {
+        throw std::runtime_error("MoveFileExW falló (Win32 " + std::to_string(err) + "): " +
+                                 path_text(src) + " -> " + path_text(dst));
+    }
+
+    // Cross-volume durable move: Stage on destination volume -> Verify SHA-256 -> Atomic Rename on destination -> Remove source
+    const fs::path stage = dst.parent_path() / (dst.filename().wstring() + L".xvol_stage_" + std::to_wstring(GetCurrentProcessId()));
+    win32_remove_tree_no_reparse(stage);
+
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        win32_copy_verified_file(src, stage);
+        if (!MoveFileExW(native_path(stage).c_str(), ndst.c_str(), 0)) {
+            DWORD rerr = GetLastError();
+            win32_delete_file_clear_ro(stage);
+            throw std::runtime_error("MoveFileExW stage->dst falló (Win32 " + std::to_string(rerr) + "): " + path_text(dst));
+        }
+        if (!win32_delete_file_clear_ro(src)) {
+            throw std::runtime_error("No se pudo eliminar archivo origen tras copia cross-volume verificada: " + path_text(src));
+        }
+    } else {
+        const auto walk = win32_safe_walk(src);
+        if (!walk.junctions.empty()) {
+            throw std::runtime_error("Cross-volume move rechazado por contener junctions/symlinks internos: " + path_text(src));
+        }
+        win32_ensure_dir(stage);
+        for (const auto& d : walk.dirs) {
+            win32_ensure_dir(stage / fs::path(wide(d)));
+        }
+        for (const auto& f : walk.files) {
+            const fs::path r = fs::path(wide(f.rel_fwd));
+            win32_copy_verified_file(src / r, stage / r);
+        }
+        if (!MoveFileExW(native_path(stage).c_str(), ndst.c_str(), 0)) {
+            DWORD rerr = GetLastError();
+            win32_remove_tree_no_reparse(stage);
+            throw std::runtime_error("MoveFileExW dir stage->dst falló (Win32 " + std::to_string(rerr) + "): " + path_text(dst));
+        }
+        win32_remove_tree_no_reparse(src);
+    }
 }
 
 // Fast pipe-based git invocation (no temp files on disk!)
@@ -1681,8 +1770,13 @@ std::vector<Json> load_reconciled_journal(const fs::path& journal_path,
         if (op == "move") {
             const fs::path src(wide(intent.at("src").get<std::string>()));
             const fs::path dst(wide(intent.at("dst").get<std::string>()));
-            if (!win32_exists(src) && win32_exists(dst)) {
-                completed_on_disk = true;
+            if (win32_exists(dst)) {
+                if (write_back_reconciled && win32_exists(src)) {
+                    win32_remove_tree_no_reparse(src);
+                }
+                if (!win32_exists(src)) {
+                    completed_on_disk = true;
+                }
             }
         } else if (op == "edit_text") {
             const fs::path target(wide(intent.at("target").get<std::string>()));

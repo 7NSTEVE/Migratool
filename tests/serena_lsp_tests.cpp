@@ -297,7 +297,30 @@ while True:
     elif method == 'textDocument/rename':
         uri = params['textDocument']['uri']
         new_name = params['newName']
-        if 'unicode_lsp.py' in uri:
+        if new_name == '__overlap__':
+            send({'jsonrpc': '2.0', 'id': mid, 'result': {'changes': {
+                uri: [
+                    {'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 8}}, 'newText': 'A'},
+                    {'range': {'start': {'line': 0, 'character': 4}, 'end': {'line': 0, 'character': 12}}, 'newText': 'B'}
+                ]
+            }}})
+        elif new_name == '__invalid_range__':
+            send({'jsonrpc': '2.0', 'id': mid, 'result': {'changes': {
+                uri: [
+                    {'range': {'start': {'line': 0, 'character': 12}, 'end': {'line': 0, 'character': 4}}, 'newText': 'X'}
+                ]
+            }}})
+        elif new_name == 'doc_precedence_fn':
+            send({'jsonrpc': '2.0', 'id': mid, 'result': {
+                'changes': {
+                    uri: [{'range': {'start': {'line': 0, 'character': 27}, 'end': {'line': 0, 'character': 37}}, 'newText': 'WRONG_DUPLICATE'}]
+                },
+                'documentChanges': [{
+                    'textDocument': {'uri': uri, 'version': 1},
+                    'edits': [{'range': {'start': {'line': 0, 'character': 27}, 'end': {'line': 0, 'character': 37}}, 'newText': new_name}]
+                }]
+            }})
+        elif 'unicode_lsp.py' in uri:
             # Line 0: 'msg = "¡Camión 🚀 "; val = target_fn(1)\n'
             # UTF-16 code units before 'target_fn' = 27 (UTF-8 bytes = 31)
             send({'jsonrpc': '2.0', 'id': mid, 'result': {'changes': {
@@ -359,6 +382,22 @@ while True:
         const std::string after_u_ren = read_text(repo_a / L"src" / L"unicode_lsp.py");
         check(after_u_ren == "msg = \"\xC2\xA1" "Cami\xC3\xB3n \xF0\x9F\x9A\x80 \"; val = renamed_fn(1)\n",
               "A10: UTF-16 code units converted to exact UTF-8 byte offsets without shifting (got: " + after_u_ren + ")");
+
+        // A10+ NEGATIVE: Overlapping TextEdits & inverted ranges MUST be rejected before touching disk
+        expect_throws([&]() {
+            agent_request(p_a, "lsp_rename_symbol", {{"path", "src/unicode_lsp.py"}, {"line", 1}, {"column", 28}, {"new_name", "__overlap__"}});
+        }, "A10+: overlapping LSP TextEdits rejected");
+        expect_throws([&]() {
+            agent_request(p_a, "lsp_rename_symbol", {{"path", "src/unicode_lsp.py"}, {"line", 1}, {"column", 28}, {"new_name", "__invalid_range__"}});
+        }, "A10+: inverted LSP TextEdit range rejected");
+        check(read_text(repo_a / L"src" / L"unicode_lsp.py") == after_u_ren,
+              "A10+: file untouched after overlapping/invalid LSP WorkspaceEdit rejections");
+
+        // A10+: When both documentChanges and changes are present, documentChanges takes exclusive precedence (no double apply)
+        auto dc_ren = agent_request(p_a, "lsp_rename_symbol", {{"path", "src/unicode_lsp.py"}, {"line", 1}, {"column", 28}, {"new_name", "doc_precedence_fn"}});
+        check(dc_ren["ok"] == true, "A10+: documentChanges precedence rename succeeded");
+        check(read_text(repo_a / L"src" / L"unicode_lsp.py") == "msg = \"\xC2\xA1" "Cami\xC3\xB3n \xF0\x9F\x9A\x80 \"; val = doc_precedence_fn(1)\n",
+              "A10+: documentChanges took exclusive precedence over changes without duplicate application");
 
         auto rst_res = agent_request(p_a, "restart_language_server", {{"language", "python"}});
         check(rst_res["ok"] == true && rst_res["servers_restarted"].get<int>() == 1, "restart_language_server cleanly stopped and cleared session");

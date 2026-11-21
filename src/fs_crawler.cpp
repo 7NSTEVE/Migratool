@@ -1343,6 +1343,7 @@ Json fs_reconcile_incremental(const Project& p, Database& db, const Json& root_c
     const fs::path base = fs::path(wide(rrows[0]["abs_path"].get<std::string>()));
     const uint64_t root_frn = static_cast<uint64_t>(rrows[0]["root_frn"].get<int64_t>());
     const CrawlFilters filters = build_filters(p, base, false);
+    const VolumeUsnInfo usn_pre = probe_volume_usn(base);
 
     // Load known directory table (only ~5% of entries!)
     struct KnownDir {
@@ -1578,7 +1579,12 @@ Json fs_reconcile_incremental(const Project& p, Database& db, const Json& root_c
         if (moved_cnt + created_cnt + modified_cnt + deleted_cnt > 0) {
             fs_rebuild_dir_rollups(db, root_id);
         }
-        db.exec("UPDATE fs_roots SET last_sync_ns=? WHERE root_id=?", {now_ns(), root_id});
+        if (usn_pre.available) {
+            db.exec("UPDATE fs_roots SET last_sync_ns=?, usn_journal_id=?, next_usn=? WHERE root_id=?",
+                    {now_ns(), static_cast<int64_t>(usn_pre.journal_id), usn_pre.next_usn, root_id});
+        } else {
+            db.exec("UPDATE fs_roots SET last_sync_ns=? WHERE root_id=?", {now_ns(), root_id});
+        }
         db.commit();
     } catch (...) {
         db.rollback();
