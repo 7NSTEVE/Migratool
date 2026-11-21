@@ -180,6 +180,12 @@ int main(int argc, char** argv) {
         auto ff_created = agent_request(p_a, "find_files", {{"query", "created.py"}});
         check(ff_created["items"].size() == 1, "create_file immediately synced into fs_nodes");
 
+        // A09 NEGATIVE: create_file with inject_db_failure MUST roll back the file on disk!
+        expect_throws([&]() {
+            agent_request(p_a, "create_file", {{"path", "src/ghost_fail.py"}, {"content", "GHOST = 1\n"}, {"inject_db_failure", true}});
+        }, "A09: create_file inject_db_failure throws");
+        check(!fs::exists(repo_a / L"src" / L"ghost_fail.py"), "A09: create_file removed file from disk when SQLite phase failed");
+
         // Multi-file replace_in_files ROLLBACK negative test (inject failure after file #1!)
         const std::string app_before = read_text(repo_a / L"src" / L"app.py");
         const std::string helper_before = read_text(repo_a / L"src" / L"helper.py");
@@ -194,6 +200,19 @@ int main(int argc, char** argv) {
         }, "replace_in_files injected failure triggers exception");
         check(read_text(repo_a / L"src" / L"app.py") == app_before, "atomic rollback restored src/app.py byte-for-byte");
         check(read_text(repo_a / L"src" / L"helper.py") == helper_before, "atomic rollback kept src/helper.py byte-for-byte");
+
+        // A09 NEGATIVE: edit_file with inject_db_failure (after ALL files were written to disk!) MUST restore all files on disk!
+        expect_throws([&]() {
+            agent_request(p_a, "edit_file", {
+                {"mode", "replace_in_files"},
+                {"paths", Json::array({"src/app.py", "src/helper.py"})},
+                {"needle", "greet("},
+                {"replacement", "salute("},
+                {"inject_db_failure", true}
+            });
+        }, "A09: edit_file inject_db_failure throws");
+        check(read_text(repo_a / L"src" / L"app.py") == app_before, "A09: DB failure rolled back src/app.py on disk byte-for-byte");
+        check(read_text(repo_a / L"src" / L"helper.py") == helper_before, "A09: DB failure rolled back src/helper.py on disk byte-for-byte");
 
         // Now perform real atomic multi-file edit + verify with search_pattern!
         auto ef = agent_request(p_a, "edit_file", {
@@ -278,12 +297,21 @@ while True:
     elif method == 'textDocument/rename':
         uri = params['textDocument']['uri']
         new_name = params['newName']
-        send({'jsonrpc': '2.0', 'id': mid, 'result': {'changes': {
-            uri: [
-                {'range': {'start': {'line': 0, 'character': 4}, 'end': {'line': 0, 'character': 10}}, 'newText': new_name},
-                {'range': {'start': {'line': 4, 'character': 11}, 'end': {'line': 4, 'character': 17}}, 'newText': new_name}
-            ]
-        }}})
+        if 'unicode_lsp.py' in uri:
+            # Line 0: 'msg = "¡Camión 🚀 "; val = target_fn(1)\n'
+            # UTF-16 code units before 'target_fn' = 27 (UTF-8 bytes = 31)
+            send({'jsonrpc': '2.0', 'id': mid, 'result': {'changes': {
+                uri: [
+                    {'range': {'start': {'line': 0, 'character': 27}, 'end': {'line': 0, 'character': 36}}, 'newText': new_name}
+                ]
+            }}})
+        else:
+            send({'jsonrpc': '2.0', 'id': mid, 'result': {'changes': {
+                uri: [
+                    {'range': {'start': {'line': 0, 'character': 4}, 'end': {'line': 0, 'character': 10}}, 'newText': new_name},
+                    {'range': {'start': {'line': 4, 'character': 11}, 'end': {'line': 4, 'character': 17}}, 'newText': new_name}
+                ]
+            }}})
     elif method == 'shutdown':
         send({'jsonrpc': '2.0', 'id': mid, 'result': None})
     elif method == 'exit':
@@ -311,11 +339,26 @@ while True:
         auto impl_res = agent_request(p_a, "find_implementations", {{"path", "src/app.py"}, {"line", 1}, {"column", 5}});
         check(impl_res["count"].get<int64_t>() == 1 && impl_res["items"][0]["line"] == 4, "find_implementations resolved line 4 via LSP");
 
+        // A09 NEGATIVE: lsp_rename_symbol with inject_db_failure MUST roll back file on disk!
+        const std::string app_pre_lsp = read_text(repo_a / L"src" / L"app.py");
+        expect_throws([&]() {
+            agent_request(p_a, "lsp_rename_symbol", {{"path", "src/app.py"}, {"line", 1}, {"column", 5}, {"new_name", "welcome"}, {"inject_db_failure", true}});
+        }, "A09: lsp_rename_symbol inject_db_failure throws");
+        check(read_text(repo_a / L"src" / L"app.py") == app_pre_lsp, "A09: lsp_rename_symbol rolled back src/app.py on disk when SQLite phase failed");
+
         auto ren_res = agent_request(p_a, "lsp_rename_symbol", {{"path", "src/app.py"}, {"line", 1}, {"column", 5}, {"new_name", "welcome"}});
         check(ren_res["ok"] == true && ren_res["files_modified"] == 1, "lsp_rename_symbol applied WorkspaceEdit transactionally");
         auto after_ren = read_text(repo_a / L"src" / L"app.py");
         check(after_ren.find("def welcome(name):") != std::string::npos && after_ren.find("return welcome('world')") != std::string::npos,
               "lsp_rename_symbol renamed both definition and call cleanly");
+
+        // A10: UTF-16 code unit column conversion on line with UTF-8 accents + 4-byte emoji (surrogate pair)
+        write_text(repo_a / L"src" / L"unicode_lsp.py", "msg = \"\xC2\xA1" "Cami\xC3\xB3n \xF0\x9F\x9A\x80 \"; val = target_fn(1)\n");
+        auto u_ren = agent_request(p_a, "lsp_rename_symbol", {{"path", "src/unicode_lsp.py"}, {"line", 1}, {"column", 28}, {"new_name", "renamed_fn"}});
+        check(u_ren["ok"] == true, "A10: lsp_rename_symbol succeeded on multibyte UTF-8 + emoji line");
+        const std::string after_u_ren = read_text(repo_a / L"src" / L"unicode_lsp.py");
+        check(after_u_ren == "msg = \"\xC2\xA1" "Cami\xC3\xB3n \xF0\x9F\x9A\x80 \"; val = renamed_fn(1)\n",
+              "A10: UTF-16 code units converted to exact UTF-8 byte offsets without shifting (got: " + after_u_ren + ")");
 
         auto rst_res = agent_request(p_a, "restart_language_server", {{"language", "python"}});
         check(rst_res["ok"] == true && rst_res["servers_restarted"].get<int>() == 1, "restart_language_server cleanly stopped and cleared session");

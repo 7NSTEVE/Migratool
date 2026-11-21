@@ -315,6 +315,9 @@ Json tool_query_workspace(const Json& args, Log log, Cancel* cancel) {
     if (!ok_tool) {
         throw std::runtime_error("QUERY_WORKSPACE_READONLY: herramienta no permitida en consulta federada: " + target_tool);
     }
+    if (target_tool == "find_duplicates") {
+        target_args["persist_cache"] = false;
+    }
 
     fs::path pfile = find_registered_workspace_path(ws_sel);
     auto target_project = Project::load(pfile);

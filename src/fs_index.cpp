@@ -1120,6 +1120,8 @@ bool fs_apply_delete(Database& db, int64_t root_id, uint64_t frn, bool log_chang
                     ++actual_links;
                 }
             }
+            db.exec("DELETE FROM fs_hashes WHERE root_id=? AND frn IN (SELECT frn FROM fs_nodes WHERE root_id=? AND parent_frn=?)",
+                    {root_id, root_id, sd_frn});
             db.exec("DELETE FROM fs_nodes WHERE root_id=? AND parent_frn=?", {root_id, sd_frn});
             db.exec("DELETE FROM fs_hashes WHERE root_id=? AND frn=?", {root_id, sd_frn});
             db.exec("DELETE FROM fs_dir_fts WHERE root_id=? AND frn=?", {root_id, sd_frn});

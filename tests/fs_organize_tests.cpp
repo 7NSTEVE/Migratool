@@ -552,8 +552,15 @@ int main(int argc, char** argv) {
                     if (t["name"] == "find_duplicates") {
                         saw_find_dups = true;
                         check(t["inputSchema"]["properties"].size() <= 15, "P2: compact per-tool schema for find_duplicates");
+                        check(t["annotations"]["readOnlyHint"] == false, "A08: find_duplicates annotated readOnlyHint:false");
                     }
-                    if (t["name"] == "organize_plan") saw_org_plan = true;
+                    if (t["name"] == "organize_plan") {
+                        saw_org_plan = true;
+                        check(t["annotations"]["readOnlyHint"] == false, "A08: organize_plan annotated readOnlyHint:false");
+                    }
+                    if (t["name"] == "organize_apply" || t["name"] == "edit_file") {
+                        check(t["annotations"]["destructiveHint"] == true, "A08: mutating tool annotated destructiveHint:true");
+                    }
                 }
                 check(found_tools >= 45, "D5: projectless MCP exposes >=45 tools (got " + std::to_string(found_tools) + ")");
                 check(saw_find_dups && saw_org_plan, "D5/P3: MCP exposes find_duplicates and organize_plan");
@@ -568,6 +575,13 @@ int main(int argc, char** argv) {
                       r4["result"]["content"][0]["text"].get<std::string>().find("NO_ACTIVE_WORKSPACE") != std::string::npos,
                       "D5 NEGATIVE: calling explore_tree before activate_workspace returns NO_ACTIVE_WORKSPACE");
 
+                // A07: Pipelined duplicate JSON-RPC request IDs MUST NOT crash MCP server with std::terminate()!
+                send_msg("{\"jsonrpc\":\"2.0\",\"id\":777,\"method\":\"tools/call\",\"params\":{\"name\":\"list_workspaces\",\"arguments\":{\"available_only\":true}}}\n"
+                         "{\"jsonrpc\":\"2.0\",\"id\":777,\"method\":\"tools/call\",\"params\":{\"name\":\"list_workspaces\",\"arguments\":{\"available_only\":true}}}");
+                auto r_dup1 = read_msg();
+                auto r_dup2 = read_msg();
+                check(r_dup1["id"] == 777 && r_dup2["id"] == 777, "A07: both duplicate-ID responses correlated cleanly without std::terminate");
+
                 CloseHandle(in_w);
                 CloseHandle(out_r);
                 WaitForSingleObject(pi.hProcess, 10000);
@@ -575,7 +589,199 @@ int main(int argc, char** argv) {
                 GetExitCodeProcess(pi.hProcess, &exit_rc);
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
-                check(exit_rc == 0, "D5: projectless MCP exited cleanly with 0 on EOF");
+                check(exit_rc == 0, "D5/A07: projectless MCP exited cleanly with 0 on EOF after duplicate request ID test");
+            }
+        }
+
+        // =====================================================================
+        // TEST 7: Forensic Hardening Regressions (A01..A06, A12, A15 + 7 Aggravating Bugs)
+        // =====================================================================
+        {
+            auto expect_safety_reject = [&](const Json& plan_args, const std::string& label) {
+                bool rejected = false;
+                try {
+                    agent_request(p, "organize_plan", plan_args);
+                } catch (const std::exception& e) {
+                    rejected = std::string(e.what()).find("SAFETY_VIOLATION") != std::string::npos;
+                }
+                check(rejected, "A01 NEGATIVE: " + label);
+            };
+
+            // A01: Path traversal & root escape rejections across all fields
+            expect_safety_reject({{"plan_id", "../escape_plan"}, {"operations", Json::array({{{"op", "quarantine_file"}, {"src", "stray.obj"}}})}},
+                                 "rejects plan_id with ..");
+            expect_safety_reject({{"plan_id", "bad/slash"}, {"operations", Json::array({{{"op", "quarantine_file"}, {"src", "stray.obj"}}})}},
+                                 "rejects plan_id with slash");
+            expect_safety_reject({{"plan_id", "p_cat"}, {"operations", Json::array({{{"op", "quarantine_file"}, {"category", "../bad_cat"}, {"src", "stray.obj"}}})}},
+                                 "rejects category with ..");
+            expect_safety_reject({{"plan_id", "p_src_rel"}, {"operations", Json::array({{{"op", "quarantine_file"}, {"src", "../outside.txt"}}})}},
+                                 "rejects src with ..");
+            expect_safety_reject({{"plan_id", "p_src_abs"}, {"operations", Json::array({{{"op", "quarantine_file"}, {"src", path_text(base / L"outside.txt")}}})}},
+                                 "rejects absolute src outside root");
+            expect_safety_reject({{"plan_id", "p_dst_rel"}, {"operations", Json::array({{{"op", "move_file"}, {"src", "stray.obj"}, {"dst", "../outside.obj"}}})}},
+                                 "rejects move_file dst with ..");
+            expect_safety_reject({{"plan_id", "p_qdst_rel"}, {"operations", Json::array({{{"op", "quarantine_file"}, {"src", "stray.obj"}, {"dst_rel", "../../outside.obj"}}})}},
+                                 "rejects quarantine_file dst_rel with ..");
+            expect_safety_reject({{"plan_id", "p_edit_rel"}, {"operations", Json::array({{{"op", "edit_text_paths"}, {"target", "../outside.py"}, {"replacements", Json::array()}}})}},
+                                 "rejects edit_text_paths target with ..");
+
+            // A01: verify_archive_vs_dir traversal & Zip-Slip rejection
+            bool zip_escape_rejected = false;
+            try {
+                agent_request(p, "verify_archive_vs_dir", {{"zip", "../outside.zip"}, {"target_dir", "extracted_pkg"}});
+            } catch (const std::exception& e) {
+                zip_escape_rejected = std::string(e.what()).find("SAFETY_VIOLATION") != std::string::npos;
+            }
+            check(zip_escape_rejected, "A01 NEGATIVE: verify_archive_vs_dir rejects ../outside.zip");
+
+            create_zip_from_map(root / L"zip_slip.zip", {{"../escaped.bin", "EVIL"}});
+            bool zip_slip_rejected = false;
+            try {
+                agent_request(p, "verify_archive_vs_dir", {{"zip", "zip_slip.zip"}, {"target_dir", "extracted_pkg"}});
+            } catch (const std::exception& e) {
+                zip_slip_rejected = std::string(e.what()).find("SAFETY_VIOLATION") != std::string::npos;
+            }
+            check(zip_slip_rejected, "A01 NEGATIVE: verify_archive_vs_dir rejects Zip-Slip entry ../escaped.bin");
+            remove_tree_ext(root / L"zip_slip.zip");
+
+            // A12 + Aggravating Bug #5: Fail-closed when Git is unavailable or repo has unborn HEAD
+            const auto git = find_git_for_test();
+            if (!git.empty()) {
+                auto unborn = root / L"unborn_repo";
+                write_bytes_ext(unborn / L"staged.cpp", "int staged = 1;\n");
+                int rc = 0;
+                run_cli_capture(git, L"-C " + quote_arg(unborn.wstring()) + L" init -q", "", &rc);
+                run_cli_capture(git, L"-C " + quote_arg(unborn.wstring()) + L" add staged.cpp", "", &rc);
+                agent_request(p, "inventory_sync", {{"full", true}});
+
+                expect_safety_reject({
+                    {"plan_id", "neg_unborn"},
+                    {"operations", Json::array({{{"op", "quarantine_file"}, {"src", "unborn_repo/staged.cpp"}}})}
+                }, "A12: blocks quarantining staged file in unborn-HEAD git repo");
+                remove_tree_ext(unborn);
+            }
+
+            SetEnvironmentVariableW(L"MIGRATOOL_DISABLE_GIT", L"1");
+            {
+                auto topo_nogit = agent_request(p, "inspect_workspace_topology", {{"token_budget", 30000}});
+                for (const auto& rd : topo_nogit["roots"][0]["regenerable_dirs"]) {
+                    if (rd["path"] == "my_repo/build") {
+                        check(rd["git_verified"] == false, "A12: my_repo/build marked git_verified:false when Git fails");
+                        check(rd["safe_to_quarantine"] == false, "A12 AGGRAVATING #5: my_repo/build marked safe_to_quarantine:false (fail-closed) when Git fails");
+                    }
+                }
+                expect_safety_reject({
+                    {"plan_id", "neg_git_down"},
+                    {"operations", Json::array({{{"op", "quarantine_dir"}, {"src", "my_repo/build"}}})}
+                }, "A12: organize_plan fails closed when Git is unavailable");
+            }
+            SetEnvironmentVariableW(L"MIGRATOOL_DISABLE_GIT", nullptr);
+
+            // A02 (WAL intent/commit crash recovery) + A03 (idempotent resumable undo) + A04 (Gate 1 size & moved SHA-256 check)
+            write_bytes_ext(root / L"wal_a.bin", "WAL_PAYLOAD_ALPHA_111");
+            write_bytes_ext(root / L"wal_b.bin", "WAL_PAYLOAD_BETA_2222");
+            write_bytes_ext(root / L"wal_move.bin", "WAL_PAYLOAD_MOVED_333");
+            agent_request(p, "inventory_sync", {{"full", true}});
+
+            auto wal_plan = agent_request(p, "organize_plan", {
+                {"plan_id", "wal_crash_plan"},
+                {"quarantine_dir", path_text(base / L"q_wal")},
+                {"hash_baseline", true},
+                {"operations", Json::array({
+                    {{"op", "quarantine_file"}, {"category", "W1"}, {"src", "wal_a.bin"}},
+                    {{"op", "quarantine_file"}, {"category", "W1"}, {"src", "wal_b.bin"}},
+                    {{"op", "move_file"}, {"category", "W2"}, {"src", "wal_move.bin"}, {"dst", "moved_dir/wal_move.bin"}}
+                })}
+            });
+            check(wal_plan["safety_checks_passed"] == true, "A02: wal_crash_plan created");
+
+            // Simulate crash right after MoveFileExW on seq 1 (before manifest flush and committed record!)
+            bool crashed_seq1 = false;
+            try {
+                agent_request(p, "organize_apply", {
+                    {"plan_id", "wal_crash_plan"}, {"execute", true}, {"simulate_crash_after_move_seq", 1}
+                });
+            } catch (const std::exception& e) {
+                crashed_seq1 = std::string(e.what()).find("SIMULATED_CRASH_AFTER_MOVE") != std::string::npos;
+            }
+            check(crashed_seq1, "A02: simulated crash right after MoveFileExW on seq 1");
+            check(!fs::exists(native_path(root / L"wal_a.bin")), "A02: wal_a.bin already moved on disk before crash");
+
+            // Resume apply -> MUST reconcile seq 1 from intent WAL entry, populate manifest, and finish seq 2 & 3!
+            auto wal_resumed = agent_request(p, "organize_apply", {
+                {"plan_id", "wal_crash_plan"}, {"execute", true}, {"resume", true}
+            });
+            check(wal_resumed["quarantined_files"].get<int64_t>() == 2, "A02: resume reconciled seq 1 + completed seq 2 (2 quarantined)");
+            check(fs::exists(native_path(root / L"moved_dir" / L"wal_move.bin")), "A02: seq 3 move_file completed");
+
+            auto wal_ver_ok = agent_request(p, "organize_verify", {{"plan_id", "wal_crash_plan"}});
+            check(wal_ver_ok["all_passed"] == true, "A02/A04: organize_verify passes after crash-reconciled resume");
+            check(wal_ver_ok["gates"]["integrity"]["moved_sha256_verified"].get<int64_t>() == 1, "A04: moved file SHA-256 verified");
+
+            // A04 + Aggravating Bug #1: Truncating or altering an untouched file in root MUST fail organize_verify!
+            write_bytes_ext(root / L"root_a.txt", "TAMPERED_LONGER_BYTES");
+            auto wal_ver_tamper = agent_request(p, "organize_verify", {{"plan_id", "wal_crash_plan"}});
+            check(wal_ver_tamper["all_passed"] == false, "A04 NEGATIVE: size/content tamper on root_a.txt fails organize_verify");
+            check(wal_ver_tamper["gates"]["conservation"]["size_mismatch_files"].get<int64_t>() >= 1,
+                  "A04 AGGRAVATING #1: Gate 1 detects size_mismatch_files on untouched root file");
+            write_bytes_ext(root / L"root_a.txt", "AAA");
+
+            // A03: Simulate interruption mid-undo after step 1, then resume undo, then call undo again (idempotent!)
+            bool undo_interrupted = false;
+            try {
+                agent_request(p, "organize_undo", {
+                    {"plan_id", "wal_crash_plan"}, {"execute", true}, {"simulate_undo_cancel_after", 1}
+                });
+            } catch (const std::exception& e) {
+                undo_interrupted = std::string(e.what()).find("CANCELLED") != std::string::npos;
+            }
+            check(undo_interrupted, "A03: simulated cancellation mid-undo after 1 entry");
+
+            auto undo_resumed = agent_request(p, "organize_undo", {{"plan_id", "wal_crash_plan"}, {"execute", true}});
+            check(undo_resumed["undone"] == true, "A03: resumed organize_undo succeeded without crashing on already-reverted entry");
+            check(undo_resumed["skipped_already_undone"].get<int64_t>() >= 1, "A03: undo_journal skipped already-undone entry");
+            check(fs::exists(native_path(root / L"wal_a.bin")) && fs::exists(native_path(root / L"wal_b.bin")) &&
+                  fs::exists(native_path(root / L"wal_move.bin")), "A03: all 3 files restored to original locations");
+
+            auto undo_idempotent = agent_request(p, "organize_undo", {{"plan_id", "wal_crash_plan"}, {"execute", true}});
+            check(undo_idempotent["undone"] == true && undo_idempotent["moves_undone"].get<int64_t>() == 0,
+                  "A03: calling organize_undo a second time after completion is 100% idempotent");
+
+            // A05: Cancellation during multi-threaded find_duplicates MUST throw clean CANCELLED, NEVER std::terminate()!
+            {
+                Cancel pre_cancel;
+                pre_cancel.requested = true;
+                bool clean_cancel = false;
+                try {
+                    Database cdb(p);
+                    tool_find_duplicates(p, cdb, {{"min_bytes", 100}, {"threads", 4}, {"refresh_hashes", true}}, &pre_cancel);
+                } catch (const std::exception& e) {
+                    clean_cancel = std::string(e.what()).find("CANCELLED") != std::string::npos;
+                }
+                check(clean_cancel, "A05: cancelled multi-threaded find_duplicates throws clean exception without std::terminate");
+            }
+
+            // A15 + Aggravating Bug #6: Modifying duplicate file on disk WITHOUT running inventory_sync MUST invalidate stale fs_hashes!
+            {
+                Sleep(20);
+                write_bytes_ext(root / L"dup_c" / L"shared_copy2.dll", std::string(80000, 'Y'));
+                auto d_live = agent_request(p, "find_duplicates", {{"min_bytes", 70000}, {"token_budget", 20000}});
+                check(d_live["items"].size() == 1 && d_live["items"][0]["count"].get<int64_t>() == 2,
+                      "A15 AGGRAVATING #6: live disk stat invalidated stale cache for modified shared_copy2.dll even before inventory_sync");
+            }
+
+            // Aggravating Bug #7: Deleting a directory removes child file hashes from fs_hashes
+            {
+                Database hdb(p);
+                const int64_t before_hashes = hdb.integer("SELECT COUNT(*) FROM fs_hashes");
+                check(before_hashes >= 2, "A15 #7: fs_hashes has cached entries before directory delete");
+                remove_tree_ext(root / L"dup_a");
+                remove_tree_ext(root / L"dup_b");
+                remove_tree_ext(root / L"dup_c");
+                agent_request(p, "inventory_sync", {{"full", false}});
+                const int64_t orphan_hashes = hdb.integer(
+                    "SELECT COUNT(*) FROM fs_hashes h WHERE NOT EXISTS(SELECT 1 FROM fs_nodes n WHERE n.root_id=h.root_id AND n.frn=h.frn AND (n.flags & 1)=0)");
+                check(orphan_hashes == 0, "A15 AGGRAVATING #7: directory delete cleans child file FRNs from fs_hashes (orphan_hashes=" + std::to_string(orphan_hashes) + ")");
             }
         }
 

@@ -592,16 +592,42 @@ Json normalize_locations(const Json& lsp_result) {
     return out;
 }
 
-size_t line_col_to_offset(const std::string& text, int line_0, int col_0) {
+// Convert 0-based (line, UTF-16 code unit column) per LSP 3.17 specification to UTF-8 byte offset
+size_t line_col_to_offset(const std::string& text, int line_0, int utf16_col_0) {
     int cur_line = 0;
     size_t pos = 0;
     while (cur_line < line_0 && pos < text.size()) {
         if (text[pos] == '\n') ++cur_line;
         ++pos;
     }
-    size_t col_off = 0;
-    while (static_cast<int>(col_off) < col_0 && pos + col_off < text.size() && text[pos + col_off] != '\n') ++col_off;
-    return pos + col_off;
+    size_t byte_off = 0;
+    int u16_col = 0;
+    while (u16_col < utf16_col_0 && pos + byte_off < text.size()) {
+        const char ch = text[pos + byte_off];
+        if (ch == '\n' || ch == '\r') break;
+        const unsigned char c = static_cast<unsigned char>(ch);
+        size_t seq_len = 1;
+        int u16_step = 1;
+        if (c < 0x80) {
+            seq_len = 1;
+            u16_step = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            seq_len = 2;
+            u16_step = 1;
+        } else if ((c & 0xF0) == 0xE0) {
+            seq_len = 3;
+            u16_step = 1;
+        } else if ((c & 0xF8) == 0xF0) {
+            seq_len = 4;
+            u16_step = 2; // Astral code point -> UTF-16 surrogate pair (2 code units)
+        }
+        if (pos + byte_off + seq_len > text.size()) {
+            seq_len = text.size() - (pos + byte_off);
+        }
+        byte_off += seq_len;
+        u16_col += u16_step;
+    }
+    return pos + byte_off;
 }
 
 } // namespace
@@ -836,31 +862,43 @@ Json tool_lsp_rename_symbol(const Project& p, Database& db, const Json& args) {
         return {{"ok", true}, {"dry_run", true}, {"backend", "lsp:" + sess->server_name()}, {"files", std::move(files)}};
     }
 
-    // Atomic transactional write with full rollback on failure
+    // Unified atomic transactional write + SQLite sync/commit with full disk & DB rollback on failure
+    const bool inject_db_failure = args.value("inject_db_failure", false);
     size_t written = 0;
+    bool tx_active = false;
+    int64_t rev = 0;
+    Json files = Json::array();
     try {
         for (size_t i = 0; i < plan.size(); ++i) {
             write_text(plan[i].path, plan[i].updated);
             written = i + 1;
         }
-    } catch (...) {
-        for (size_t i = 0; i < written; ++i) {
-            try { write_text(plan[i].path, plan[i].original); } catch (...) {}
-        }
-        throw;
-    }
-
-    int64_t rev = 0;
-    Json files = Json::array();
-    db.begin();
-    try {
+        db.begin();
+        tx_active = true;
         for (const auto& pl : plan) {
             fs_sync_single_path(p, db, pl.path, true);
             files.push_back({{"path", path_text(pl.path)}, {"edits", pl.edit_count}, {"sha256", sha256(pl.updated)}});
         }
+        if (inject_db_failure) {
+            throw std::runtime_error("INJECTED_DB_FAILURE_FOR_LSP_ROLLBACK_TEST");
+        }
         rev = db.change(actor, "lsp_rename_symbol", {{"new_name", new_name}, {"files", plan.size()}}, new_name);
         db.commit();
-    } catch (...) { db.rollback(); throw; }
+        tx_active = false;
+    } catch (const std::exception& e) {
+        if (tx_active) {
+            try { db.rollback(); } catch (...) {}
+        }
+        std::string rb_errors;
+        for (size_t i = 0; i < written; ++i) {
+            try {
+                write_text(plan[i].path, plan[i].original);
+            } catch (const std::exception& re) {
+                rb_errors += " [ROLLBACK_ERROR " + path_text(plan[i].path) + ": " + re.what() + "]";
+            }
+        }
+        throw std::runtime_error(std::string(e.what()) + rb_errors);
+    }
 
     return {
         {"ok", true},

@@ -152,10 +152,13 @@ struct ScaleView::Impl {
         int x=0,y=0;
         const int btn_pad=ui::text_percent>=150?px(10):px(24);
         const int btn_min=ui::text_percent>=150?px(64):px(90);
+        HDC measure_dc=GetDC(hwnd);
+        HGDIOBJ prev_font=measure_dc?SelectObject(measure_dc,font):nullptr;
         for(auto item:{refresh_button,filter_button,copy,details_button,pause,resume,cancel,retry,rescan,up})if(GetWindowLongPtrW(item,GWL_STYLE)&WS_VISIBLE){
-            auto text=control_text(item);HDC dc=GetDC(item);auto old=SelectObject(dc,font);SIZE size{};GetTextExtentPoint32W(dc,text.c_str(),static_cast<int>(text.size()),&size);SelectObject(dc,old);ReleaseDC(item,dc);
+            auto text=control_text(item);SIZE size{};if(measure_dc)GetTextExtentPoint32W(measure_dc,text.c_str(),static_cast<int>(text.size()),&size);
             const int button_width=std::min(width,std::max(btn_min,static_cast<int>(size.cx)+btn_pad));if(x&&x+button_width>width){x=0;y+=control+gap;}ui::move_if(item,x,y,button_width,control);x+=button_width+gap;
         }
+        if(measure_dc){SelectObject(measure_dc,prev_font);ReleaseDC(hwnd,measure_dc);}
         if(page!=0)y+=control+gap;
         if(show_pending_filter||show_root_filter||mod_view||dev_view||(compare&&filters_visible)){
             std::vector<std::pair<HWND,std::pair<int,int>>> vis_filters;
@@ -483,6 +486,7 @@ struct ScaleView::Impl {
         return false;
     }
     void accept_rows(const Payload& data){
+        if(hwnd)SendMessageW(hwnd,WM_SETREDRAW,FALSE,0);
         const auto selected_origin=selected_id(list,rows),selected_target=selected_id(targets,target_rows);
         replacing_rows=true;
         ListView_SetItemState(list,-1,0,LVIS_SELECTED|LVIS_FOCUSED);
@@ -492,18 +496,19 @@ struct ScaleView::Impl {
         const auto cursor_of=[](const Json& page){if(!page.is_object())return std::string();const auto value=page.value("next_cursor",Json());return value.is_string()?value.get<std::string>():std::string();};
         next_cursor=cursor_of(data.left);next_target_cursor=cursor_of(data.right);
         settled_sequence=data.sequence;
-        reading=false;KillTimer(hwnd,2);ShowWindow(progress,SW_HIDE);
-        setup_columns(list,rows,columns);setup_columns(targets,target_rows,target_columns);
+        reading=false;KillTimer(hwnd,2);ui::show_if(progress,false);
         auto caption_value=wide(data.caption);
         if(!cursors.empty()||!next_cursor.empty())caption_value=L"Página "+std::to_wstring(cursors.size()+1)+L" · "+caption_value;
         SetWindowTextW(caption,caption_value.c_str());
-        NotifyWinEvent(EVENT_OBJECT_NAMECHANGE,caption,OBJID_CLIENT,CHILDID_SELF);
         EnableWindow(next,!next_cursor.empty());EnableWindow(previous,!cursors.empty());
+        empty_state();layout();
+        setup_columns(list,rows,columns);setup_columns(targets,target_rows,target_columns);
         restore_selection(list,rows,selected_origin);
         const bool restored_target=restore_selection(targets,target_rows,selected_target);
         target_selected=target_selected&&restored_target;
         replacing_rows=false;
-        selected_detail();empty_state();layout();
+        selected_detail();
+        if(hwnd){SendMessageW(hwnd,WM_SETREDRAW,TRUE,0);InvalidateRect(hwnd,nullptr,FALSE);}
     }
     void copy_paths(){int index=ListView_GetNextItem(target_selected?targets:list,-1,LVNI_SELECTED);const auto& data=target_selected?target_rows:rows;if(index<0||static_cast<size_t>(index)>=data.size())return;const auto& item=data[index];std::wstring text;for(const auto* key:{"source_path","absolute_path","output_path"})if(item.contains(key)&&item[key].is_string()){auto path=wide(item[key]);if(!path.empty()&&text.find(path)==std::wstring::npos)text+=path+L"\r\n";}if(item.contains("target_paths"))for(const auto& path:item["target_paths"])text+=wide(path)+L"\r\n";if(text.empty())text=control_text(detail);
         if(OpenClipboard(hwnd)){EmptyClipboard();auto memory=GlobalAlloc(GMEM_MOVEABLE,(text.size()+1)*sizeof(wchar_t));if(memory){auto bytes=GlobalLock(memory);memcpy(bytes,text.c_str(),(text.size()+1)*sizeof(wchar_t));GlobalUnlock(memory);if(!SetClipboardData(CF_UNICODETEXT,memory))GlobalFree(memory);}CloseClipboard();}}

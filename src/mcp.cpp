@@ -19,8 +19,7 @@ namespace {
 bool is_read_only_mcp_tool(const std::string& name, const Json& args) {
     static const std::set<std::string> ro_tools = {
         "explore_tree", "find_files", "changes_feed", "search_pattern", "read_file",
-        "find_duplicates", "verify_archive_vs_dir", "inspect_workspace_topology",
-        "organize_plan", "organize_verify",
+        "verify_archive_vs_dir", "inspect_workspace_topology", "organize_verify",
         "query", "session_bootstrap", "migration_status", "project_context",
         "project_diagnostics", "next_tasks", "evidence_report", "history",
         "changes_since", "statistics", "connections", "get_task_context",
@@ -28,6 +27,10 @@ bool is_read_only_mcp_tool(const std::string& name, const Json& args) {
         "get_diagnostics", "find_implementations", "find_declaration"
     };
     if (ro_tools.contains(name)) return true;
+    if (name == "find_duplicates") {
+        // Read-only only when persist_cache is disabled; default writes to fs_hashes
+        return !args.value("persist_cache", true);
+    }
     if (name == "list_workspaces") {
         return args.value("action", "list") != "prune" || args.value("dry_run", false);
     }
@@ -55,6 +58,7 @@ int mcp_server(const std::optional<Project>& initial_project) {
     // MCP stdio: negociación explícita + modo projectless opcional + pool concurrente de lecturas WAL (hasta 4 simultáneas).
     const std::set<std::string> supported = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"};
     std::mutex output_mutex, state_mutex;
+    std::condition_variable state_cv;
     bool initialized = false, ready = false;
     std::string client = "unknown", protocol = "2025-11-25", connection = unique_id();
     fs::path active_project_file = initial_project ? initial_project->file : fs::path{};
@@ -64,6 +68,12 @@ int mcp_server(const std::optional<Project>& initial_project) {
         std::shared_ptr<Cancel> cancel;
         bool is_write = false;
         std::thread worker;
+        ~ActiveOp() {
+            if (worker.joinable()) {
+                if (worker.get_id() == std::this_thread::get_id()) worker.detach();
+                else worker.join();
+            }
+        }
     };
     std::map<std::string, std::shared_ptr<ActiveOp>> in_flight;
     int active_reads = 0;
@@ -175,14 +185,41 @@ int mcp_server(const std::optional<Project>& initial_project) {
             fs::path default_project_snapshot;
 
             {
-                std::lock_guard lock(state_mutex);
-                if (!is_ro && active_write) {
-                    error(id, -32000, "Otra operación de escritura está en curso; espere o cancele su requestId");
+                std::unique_lock lock(state_mutex);
+                if (in_flight.contains(key)) {
+                    error(id, -32600, "DUPLICATE_REQUEST_ID: ya existe una operación activa con ese id");
                     continue;
                 }
-                if (is_ro && active_reads >= 4) {
-                    error(id, -32000, "Máximo de 4 consultas de lectura concurrentes alcanzado; reintente");
-                    continue;
+                if (!is_ro) {
+                    if (active_write || active_reads > 0) {
+                        state_cv.wait_for(lock, std::chrono::milliseconds(200),
+                                          [&]() { return !active_write && active_reads == 0 && !in_flight.contains(key); });
+                    }
+                    if (in_flight.contains(key)) {
+                        error(id, -32600, "DUPLICATE_REQUEST_ID: ya existe una operación activa con ese id");
+                        continue;
+                    }
+                    if (active_write || active_reads > 0) {
+                        error(id, -32000, "Otra operación de lectura o escritura está en curso; espere o cancele su requestId");
+                        continue;
+                    }
+                } else {
+                    if (active_write || active_reads >= 4) {
+                        state_cv.wait_for(lock, std::chrono::milliseconds(200),
+                                          [&]() { return !active_write && active_reads < 4 && !in_flight.contains(key); });
+                    }
+                    if (in_flight.contains(key)) {
+                        error(id, -32600, "DUPLICATE_REQUEST_ID: ya existe una operación activa con ese id");
+                        continue;
+                    }
+                    if (active_write) {
+                        error(id, -32000, "Operación de escritura en curso; espere o cancele su requestId");
+                        continue;
+                    }
+                    if (active_reads >= 4) {
+                        error(id, -32000, "Máximo de 4 consultas de lectura concurrentes alcanzado; reintente");
+                        continue;
+                    }
                 }
                 if (is_ro) ++active_reads;
                 else active_write = true;
@@ -247,10 +284,13 @@ int mcp_server(const std::optional<Project>& initial_project) {
                 std::lock_guard lock(state_mutex);
                 if (is_ro) --active_reads;
                 else active_write = false;
-                if (auto it = in_flight.find(key); it != in_flight.end()) {
-                    finished_threads.push_back(std::move(it->second->worker));
+                if (op->worker.joinable()) {
+                    finished_threads.push_back(std::move(op->worker));
+                }
+                if (auto it = in_flight.find(key); it != in_flight.end() && it->second == op) {
                     in_flight.erase(it);
                 }
+                state_cv.notify_all();
             });
         } catch (const std::exception& e) {
             if (!notification) error(id, -32602, e.what());

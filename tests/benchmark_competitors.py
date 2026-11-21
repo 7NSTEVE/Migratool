@@ -1016,6 +1016,13 @@ def main():
     bl_tokens = bl_res["total_tokens_o200k_base"]
 
     comparison = {
+        "schema": "migratool.competitor-benchmark/2.1",
+        "corpus_type": "synthetic_controlled_multi_language_plus_optional_external_repo",
+        "methodology_notes": (
+            "Tasks T1-T5 run on a deterministic multi-language corpus (C#, C++, Rust, Python) to test AST "
+            "call-vs-definition disambiguation, symbol body slicing, and migration context assembly reproducibly. "
+            "Set MIGRATOOL_BENCH_REPO to also benchmark against an external real-world repository copy."
+        ),
         "tokenizer_models": ["o200k_base", "cl100k_base"],
         "tools_compared": [mt_res, se_res, sg_res, bl_res],
         "head_to_head_ratios_o200k_base": {

@@ -1,9 +1,28 @@
 param(
-    [string]$BuildBinDir = (Join-Path (Split-Path -Parent $PSScriptRoot) "build\v2\bin"),
+    [string]$BuildBinDir = "",
     [string]$StableDir   = (Join-Path (Split-Path -Parent $PSScriptRoot) "release\stable\bin")
 )
 
 $ErrorActionPreference = "Stop"
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+
+if ([string]::IsNullOrWhiteSpace($BuildBinDir)) {
+    $candDelivery = Join-Path $RepoRoot "build\delivery\bin"
+    $candV2       = Join-Path $RepoRoot "build\v2\bin"
+    $exeDel = Join-Path $candDelivery "migratool-cli-0.3.exe"
+    $exeV2  = Join-Path $candV2 "migratool-cli-0.3.exe"
+    if ((Test-Path $exeDel) -and (Test-Path $exeV2)) {
+        if ((Get-Item $exeDel).LastWriteTimeUtc -ge (Get-Item $exeV2).LastWriteTimeUtc) {
+            $BuildBinDir = $candDelivery
+        } else {
+            $BuildBinDir = $candV2
+        }
+    } elseif (Test-Path $exeDel) {
+        $BuildBinDir = $candDelivery
+    } else {
+        $BuildBinDir = $candV2
+    }
+}
 
 $requiredFiles = @(
     "migratool-cli-0.3.exe",
@@ -28,6 +47,12 @@ Copy-Item (Join-Path $BuildBinDir "migratool-cli-0.3.exe") (Join-Path $stagingDi
 Copy-Item (Join-Path $BuildBinDir "Migratool-0.3.exe")     (Join-Path $stagingDir "Migratool-0.3.exe") -Force
 Copy-Item (Join-Path $BuildBinDir "Migratool-0.3.exe")     (Join-Path $stagingDir "Migratool.exe") -Force
 Copy-Item (Join-Path $BuildBinDir "sqlite3.dll")           (Join-Path $stagingDir "sqlite3.dll") -Force
+foreach ($optDll in @("libclang.dll", "libzip.dll", "zip.dll")) {
+    $optSrc = Join-Path $BuildBinDir $optDll
+    if (Test-Path $optSrc) {
+        Copy-Item $optSrc (Join-Path $stagingDir $optDll) -Force
+    }
+}
 Copy-Item (Join-Path $BuildBinDir "adapters\roslyn\*")     (Join-Path $stagingDir "adapters\roslyn") -Recurse -Force
 
 $artifacts = @()

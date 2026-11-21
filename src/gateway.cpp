@@ -3643,6 +3643,7 @@ Json agent_tools(){
         } else if (name == "find_duplicates") {
             props["root"] = s_str; props["path_prefix"] = s_str; props["min_bytes"] = s_int; props["limit"] = s_int;
             props["exclude_dirs"] = s_str_arr; props["skip_cloud_only"] = s_bool; props["threads"] = s_int;
+            props["refresh_hashes"] = s_bool; props["verify_strict"] = s_bool; props["persist_cache"] = s_bool;
             props["format"] = {{"type","string"},{"enum",{"json","columnar"}}};
         } else if (name == "verify_archive_vs_dir") {
             props["zip"] = s_str; props["target_dir"] = s_str; props["ignore_suffixes"] = s_str_arr; props["sample_limit"] = s_int;
@@ -3706,9 +3707,11 @@ Json agent_tools(){
             name=="job_control"||name=="project_settings"||name=="acquire_task"||name=="import_existing_work"||name=="export_inventory"||
             name=="backup_catalog"||name=="activate_workspace"||name=="onboard_workspace"||name=="create_file"||name=="edit_file"||
             name=="lsp_rename_symbol"||name=="restart_language_server"||name=="memory"||name=="housekeep"||
-            name=="organize_apply"||name=="organize_undo";
+            name=="find_duplicates"||name=="organize_plan"||name=="organize_apply"||name=="organize_undo"||name=="list_workspaces";
+        const bool destructive = name=="edit_file"||name=="edit_symbol"||name=="lsp_rename_symbol"||name=="complete_task"||
+            name=="batch_update"||name=="organize_apply"||name=="organize_undo"||name=="housekeep"||name=="memory"||name=="list_workspaces";
         tools.push_back({{"name",name},{"description",description},{"inputSchema",schema_for(name)},
-            {"annotations",{{"readOnlyHint",!mutating},{"destructiveHint",false},{"idempotentHint",name!="batch_update"&&name!="edit_symbol"&&name!="complete_task"&&name!="export_inventory"&&name!="organize_apply"&&name!="organize_undo"},{"openWorldHint",name=="verify"||name=="complete_task"}}}});
+            {"annotations",{{"readOnlyHint",!mutating},{"destructiveHint",destructive},{"idempotentHint",name!="batch_update"&&name!="edit_symbol"&&name!="complete_task"&&name!="export_inventory"&&name!="organize_apply"&&name!="organize_undo"},{"openWorldHint",name=="verify"||name=="complete_task"}}}});
     }
     return tools;
 }

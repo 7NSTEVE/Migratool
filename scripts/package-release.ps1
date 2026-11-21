@@ -11,8 +11,8 @@ if (-not (Test-Path $OutDir)) {
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 }
 
-$srcZipPath = Join-Path $OutDir "Migratool-1.0-src-clean.zip"
-$evidZipPath = Join-Path $OutDir "Migratool-1.0-evidence.zip"
+$srcZipPath = Join-Path $OutDir "Migratool-2.1-src-clean.zip"
+$evidZipPath = Join-Path $OutDir "Migratool-2.1-evidence.zip"
 
 if (Test-Path $srcZipPath) { Remove-Item $srcZipPath -Force }
 if (Test-Path $evidZipPath) { Remove-Item $evidZipPath -Force }
@@ -75,6 +75,7 @@ $evidEntries = 0
 try {
     $evidenceFiles = @(
         @{ Path = (Join-Path $RepoRoot "build\migratool-1.0-benchmark.json"); Entry = "benchmarks/migratool-1.0-benchmark.json" },
+        @{ Path = (Join-Path $RepoRoot "build\migratool-2.0-competitor-benchmark.json"); Entry = "benchmarks/migratool-2.0-competitor-benchmark.json" },
         @{ Path = (Join-Path $RepoRoot "build\migratool-1.0-competitor-benchmark.json"); Entry = "benchmarks/migratool-1.0-competitor-benchmark.json" },
         @{ Path = (Join-Path $RepoRoot "build\delivery\Testing\Temporary\LastTest.log"); Entry = "ctest/LastTest.log" },
         @{ Path = (Join-Path $RepoRoot "release\stable\bin\stable-manifest.json"); Entry = "release/stable-manifest.json" },

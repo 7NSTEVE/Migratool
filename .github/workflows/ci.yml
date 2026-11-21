@@ -1,0 +1,45 @@
+name: Windows CI (MSVC C++23 + .NET Roslyn + CTest)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK (Roslyn Adapter)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install vcpkg dependencies (nlohmann-json, sqlite3, libzip)
+        shell: pwsh
+        run: |
+          vcpkg install nlohmann-json:x64-windows sqlite3:x64-windows libzip:x64-windows
+
+      - name: Configure CMake (release preset)
+        shell: pwsh
+        run: |
+          cmake --preset release -DVCPKG_ROOT="$env:VCPKG_INSTALLATION_ROOT"
+
+      - name: Build Migratool CLI, GUI, RoslynAdapter & 18 Test Targets
+        shell: pwsh
+        run: |
+          cmake --build --preset release
+
+      - name: Run CTest Suite (18 suites)
+        shell: pwsh
+        run: |
+          ctest --preset release --output-on-failure

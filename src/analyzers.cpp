@@ -235,7 +235,22 @@ struct Clang {
     MT_CLANG_FUNCS(FIELD)
 #undef FIELD
     Clang() {
-        dll = LoadLibraryExW(MIGRATOOL_CLANG_DLL, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        std::vector<fs::path> candidates;
+        try {
+            const auto exe_dir = executable_dir();
+            if (!exe_dir.empty()) {
+                candidates.push_back((exe_dir / L"libclang.dll").make_preferred());
+            }
+        } catch (...) {}
+        candidates.push_back(fs::path(MIGRATOOL_CLANG_DLL).make_preferred());
+        for (const auto& cand : candidates) {
+            std::error_code ec;
+            if (!cand.empty() && fs::exists(cand, ec)) {
+                dll = LoadLibraryExW(cand.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+                if (dll) break;
+            }
+        }
+        if (!dll) dll = LoadLibraryW(L"libclang.dll");
         if (!dll) throw std::runtime_error("libclang no disponible en su ruta configurada");
 #define LOAD(fn) fn##_p = reinterpret_cast<decltype(fn##_p)>(GetProcAddress(dll,#fn)); if (!fn##_p) throw std::runtime_error("libclang sin " #fn);
         MT_CLANG_FUNCS(LOAD)

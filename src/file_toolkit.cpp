@@ -204,19 +204,45 @@ Json tool_create_file(const Project& p, Database& db, const Json& args) {
     std::string rkey, rel;
     fs::path abs_path = resolve_authorized_path(p, raw_path, req_root, false, &rkey, &rel);
     std::error_code ec;
+    const bool existed_before = fs::is_regular_file(native_path(abs_path), ec);
     if (!overwrite && fs::exists(native_path(abs_path), ec)) {
         throw std::runtime_error("FILE_ALREADY_EXISTS (use overwrite:true): " + path_text(abs_path));
+    }
+    std::string prev_content;
+    if (existed_before) {
+        prev_content = read_text(abs_path, 32 * 1024 * 1024);
     }
 
     write_text(abs_path, content);
     const std::string digest = sha256(content);
-    fs_sync_single_path(p, db, abs_path, true);
     int64_t rev = 0;
-    db.begin();
+    bool tx_active = false;
     try {
+        db.begin();
+        tx_active = true;
+        fs_sync_single_path(p, db, abs_path, true);
+        if (args.value("inject_db_failure", false)) {
+            throw std::runtime_error("INJECTED_DB_FAILURE_FOR_ROLLBACK_TEST");
+        }
         rev = db.change(actor, "create_file", {{"root", rkey}, {"path", rel}, {"bytes", content.size()}, {"sha256", digest}}, rel);
         db.commit();
-    } catch (...) { db.rollback(); throw; }
+        tx_active = false;
+    } catch (const std::exception& e) {
+        if (tx_active) {
+            try { db.rollback(); } catch (...) {}
+        }
+        std::string rb_err;
+        try {
+            if (existed_before) {
+                write_text(abs_path, prev_content);
+            } else {
+                DeleteFileW(native_path(abs_path).c_str());
+            }
+        } catch (const std::exception& re) {
+            rb_err = std::string(" [ROLLBACK_ERROR: ") + re.what() + "]";
+        }
+        throw std::runtime_error(std::string(e.what()) + rb_err);
+    }
 
     return {
         {"ok", true},
@@ -337,10 +363,17 @@ Json tool_edit_file(const Project& p, Database& db, const Json& args) {
             resolve_authorized_path(p, path_text(abs_p), "", true, &rkey, &rel);
             std::string orig = read_text(abs_p, 16 * 1024 * 1024);
             if (is_likely_binary(orig)) continue;
+            const std::string old_sha = sha256(orig);
+            if (args.contains("expected_sha256_map") && args["expected_sha256_map"].is_object()) {
+                const auto& smap = args["expected_sha256_map"];
+                if (smap.contains(rel) && smap[rel].is_string() && smap[rel].get<std::string>() != old_sha) {
+                    throw std::runtime_error("SHA256_MISMATCH for " + rel + ": expected=" + smap[rel].get<std::string>() + " actual=" + old_sha);
+                }
+            }
             size_t reps = 0;
             std::string upd = apply_single_transform(orig, args, reps);
             if (reps > 0 && upd != orig) {
-                plans.push_back(FileEditPlan{rkey, rel, abs_p, orig, upd, sha256(orig), sha256(upd), reps});
+                plans.push_back(FileEditPlan{rkey, rel, abs_p, orig, upd, old_sha, sha256(upd), reps});
             }
         }
     } else {
@@ -366,8 +399,12 @@ Json tool_edit_file(const Project& p, Database& db, const Json& args) {
         return {{"ok", true}, {"dry_run", true}, {"mode", mode}, {"files_matched", preview.size()}, {"files", std::move(preview)}};
     }
 
-    // Transactional multi-file write with atomic rollback on ANY error!
+    // Unified transactional multi-file write + SQLite sync/commit with full disk & DB rollback on ANY error!
+    const bool inject_db_failure = args.value("inject_db_failure", false);
     size_t written_count = 0;
+    bool tx_active = false;
+    int64_t rev = 0;
+    Json applied = Json::array();
     try {
         for (size_t i = 0; i < plans.size(); ++i) {
             write_text(plans[i].abs_path, plans[i].updated);
@@ -376,30 +413,34 @@ Json tool_edit_file(const Project& p, Database& db, const Json& args) {
                 throw std::runtime_error("INJECTED_FAILURE_FOR_ROLLBACK_TEST");
             }
         }
-    } catch (...) {
-        // Atomic rollback of all previously written files
-        for (size_t i = 0; i < written_count; ++i) {
-            try { write_text(plans[i].abs_path, plans[i].original); } catch (...) {}
-        }
-        throw;
-    }
 
-    // Sync touched files into fs_nodes immediately + record change in history
-    int64_t rev = 0;
-    Json applied = Json::array();
-    db.begin();
-    try {
+        db.begin();
+        tx_active = true;
         for (const auto& pl : plans) {
             fs_sync_single_path(p, db, pl.abs_path, true);
             applied.push_back({{"root", pl.root_key}, {"path", pl.rel_path}, {"replacements", pl.replacements},
                                {"old_sha256", pl.old_sha}, {"new_sha256", pl.new_sha}});
         }
+        if (inject_db_failure) {
+            throw std::runtime_error("INJECTED_DB_FAILURE_FOR_ROLLBACK_TEST");
+        }
         rev = db.change(actor, "edit_file", {{"mode", mode}, {"files_modified", plans.size()}},
                         plans.size() == 1 ? plans[0].rel_path : "multi");
         db.commit();
-    } catch (...) {
-        db.rollback();
-        throw;
+        tx_active = false;
+    } catch (const std::exception& e) {
+        if (tx_active) {
+            try { db.rollback(); } catch (...) {}
+        }
+        std::string rb_errors;
+        for (size_t i = 0; i < written_count; ++i) {
+            try {
+                write_text(plans[i].abs_path, plans[i].original);
+            } catch (const std::exception& re) {
+                rb_errors += " [ROLLBACK_ERROR " + plans[i].rel_path + ": " + re.what() + "]";
+            }
+        }
+        throw std::runtime_error(std::string(e.what()) + rb_errors);
     }
 
     return {
