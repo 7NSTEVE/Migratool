@@ -120,18 +120,18 @@ void ComparisonView::layout() {
     const int bottom = rect.bottom;
     const int gap = px(12),control=ui::control_height(dpi_),line=ui::type_size(18,dpi_)+px(8);
     const bool stacked=width<ui::type_size(18,dpi_)*42;const int half=(width-gap)/2;
-    int x=0,y=0;for(const auto item:{state_filter_,linked_only_,open_origin_,open_target_}){const int item_width=std::min(width,item==linked_only_?ui::type_size(18,dpi_)*17:item==state_filter_?ui::type_size(18,dpi_)*15:ui::type_size(18,dpi_)*9);if(x&&x+item_width>width){x=0;y+=control+gap;}MoveWindow(item,x,y,item_width,item==state_filter_?control+px(260):control,TRUE);x+=item_width+gap;}
+    int x=0,y=0;for(const auto item:{state_filter_,linked_only_,open_origin_,open_target_}){const int item_width=std::min(width,item==linked_only_?ui::type_size(18,dpi_)*17:item==state_filter_?ui::type_size(18,dpi_)*15:ui::type_size(18,dpi_)*9);if(x&&x+item_width>width){x=0;y+=control+gap;}ui::move_if(item,x,y,item_width,item==state_filter_?control+px(260):control);x+=item_width+gap;}
     y+=control+gap;const int detail_height=std::min(std::max(line*2,px(65)),std::max(px(30),(bottom-y)/3));
     const int available=std::max(px(30),bottom-y-detail_height-gap);
     const int table_height=std::max(px(20),stacked?(available-line*2-gap)/2:available-line);
-    MoveWindow(origin_label_,0,y,stacked?width:half,line,TRUE);MoveWindow(origins_,0,y+line,stacked?width:half,table_height,TRUE);
+    ui::move_if(origin_label_,0,y,stacked?width:half,line);ui::move_if(origins_,0,y+line,stacked?width:half,table_height);
     const int target_y=stacked?y+line+table_height+gap:y;
-    MoveWindow(target_label_,stacked?0:half+gap,target_y,stacked?width:half,line,TRUE);MoveWindow(targets_,stacked?0:half+gap,target_y+line,stacked?width:half,table_height,TRUE);
-    MoveWindow(detail_,0,bottom-detail_height,width,detail_height,TRUE);
+    ui::move_if(target_label_,stacked?0:half+gap,target_y,stacked?width:half,line);ui::move_if(targets_,stacked?0:half+gap,target_y+line,stacked?width:half,table_height);
+    ui::move_if(detail_,0,bottom-detail_height,width,detail_height);
 }
 void ComparisonView::appearance(HFONT font,int dpi){
     const int prev_dpi = dpi_ > 0 ? dpi_ : 96;
-    font_=font;dpi_=dpi;ui::font_tree(window_,font);
+    font_=font;dpi_=dpi;
     colors_=ui::system_palette();
     if(background_)DeleteObject(background_);
     if(surface_)DeleteObject(surface_);
@@ -143,8 +143,8 @@ void ComparisonView::appearance(HFONT font,int dpi){
             for(int c=0;c<cols;++c)ListView_SetColumnWidth(table,c,MulDiv(ListView_GetColumnWidth(table,c),dpi,prev_dpi));
         }
     }
-    ui::list_colors(origins_,colors_);ui::list_colors(targets_,colors_);layout();
-    if(window_)InvalidateRect(window_,nullptr,TRUE);
+    ui::list_colors(origins_,colors_);ui::list_colors(targets_,colors_);
+    if(window_&&IsWindowVisible(window_)){layout();InvalidateRect(window_,nullptr,FALSE);}
 }
 
 void ComparisonView::update(const Json& snapshot, const Json& status, const std::string& filter) {

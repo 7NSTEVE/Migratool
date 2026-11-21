@@ -1,4 +1,5 @@
 #include "migratool/fs_index.hpp"
+#include "migratool/path_lineage.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -977,6 +978,11 @@ Json fs_usn_replay_root(const Project& p, Database& db, const Json& root_cfg, Ca
     }
     if (saved_jid == 0 || saved_jid != cur.journal_id ||
         cursor_usn < std::max(cur.first_usn, cur.lowest_valid_usn) || cursor_usn > cur.next_usn) {
+        if (saved_jid != 0) {
+            try {
+                record_usn_journal_gap(db, root_id, saved_jid, cur.journal_id, cursor_usn, cur.next_usn, "USN_CHECKPOINT_EXPIRED");
+            } catch (...) {}
+        }
         return {{"used", false}, {"reason", "USN_CHECKPOINT_EXPIRED"}, {"needs_reconcile", true}};
     }
     if (cursor_usn == cur.next_usn) {
@@ -1623,14 +1629,19 @@ Json fs_sync(const Project& p, Database& db, const Json& args, Log log, Cancel* 
         const int64_t root_id = fs_ensure_root(p, db, rcfg);
 
         const bool has_baseline = db.integer("SELECT complete FROM fs_roots WHERE root_id=?", {root_id}) != 0;
+        const std::string started_iso = now();
+        bool usn_gap = false;
+        std::string scan_kind = "full";
         Json rres;
         if (!force_full && has_baseline) {
+            scan_kind = "incremental";
             // Try Tier A USN Journal delta replay first (< 50 ms!)
             auto usn_res = fs_usn_replay_root(p, db, rcfg, cancel);
             if (usn_res.value("used", false)) {
                 rres = std::move(usn_res);
                 rres["engine"] = "usn_delta_replay";
             } else {
+                usn_gap = (usn_res.value("reason", "") == "USN_CHECKPOINT_EXPIRED" || usn_res.value("reason", "") == "USN_READ_FAILED");
                 // Fallback to Tier B incremental dir_mtime + FRN reconciler (zero Admin needed!)
                 rres = fs_reconcile_incremental(p, db, rcfg, log, cancel);
             }
@@ -1647,6 +1658,17 @@ Json fs_sync(const Project& p, Database& db, const Json& args, Log log, Cancel* 
                 rres = crawl_root_streaming(p, db, root_id, base, threads, include_ignored, build_trigram_fts, log, cancel);
             }
         }
+        try {
+            auto rtot = db.query("SELECT total_files, total_dirs, total_bytes FROM fs_roots WHERE root_id=?", {root_id});
+            const int64_t tf = rtot.empty() ? 0 : rtot[0]["total_files"].get<int64_t>();
+            const int64_t td = rtot.empty() ? 0 : rtot[0]["total_dirs"].get<int64_t>();
+            const int64_t tb = rtot.empty() ? 0 : rtot[0]["total_bytes"].get<int64_t>();
+            record_scan_telemetry(db, root_id, scan_kind, rres.value("engine", "streaming"), started_iso,
+                                  rres.value("elapsed_ms", int64_t{0}), tf, td, tb,
+                                  rres.value("created", int64_t{0}), rres.value("modified", int64_t{0}),
+                                  rres.value("moved_or_renamed", rres.value("moves", int64_t{0})),
+                                  rres.value("deleted", int64_t{0}), usn_gap, args.value("actor", "system"));
+        } catch (...) {}
         rres["root"] = rkey;
         results.push_back(std::move(rres));
     }

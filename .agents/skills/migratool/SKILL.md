@@ -1,24 +1,30 @@
 ---
 name: migratool
 description: >
-  Flujo de trabajo óptimo para agentes de IA usando las 49 herramientas MCP y CLI de
-  Migratool v2.1.0: Motor Ultra-Escala para 6M+ archivos/carpetas con auto-seguimiento NTFS FRN,
-  Deduplicación Universal + Reorganización Transaccional Reversible (`fs_organize`),
-  Autoaseo automático y bajo demanda (`housekeep`), Modo Workspace General sin proyecto fijo +
-  Federación Multi-Proyecto, Memorias Persistentes FTS5, Toolkit Quirúrgico con Rollback,
-  AST Estructural (0 falsos positivos), Puente LSP Híbrido (30+ lenguajes) y Migraciones Verificadas
-  con mínimo consumo de comandos, tokens y contexto.
+  Flujo de trabajo óptimo para agentes de IA usando las 62 herramientas MCP y CLI de
+  Migratool v3.0.0 (AI Agent Project OS): Arranque y orientación en 1 llamada (`agent_wake` con
+  verificación en vivo disco/Git), Continuidad de Sesiones a prueba de cortes/cuota (`workstream`
+  con protocolo durable de 7 etapas `PREPARED..COMMITTED` y snapshots anclados P4), Libro Mayor
+  de Conocimiento con proveniencia epistemológica (`knowledge`), Docs Hub con TOC H1-H4 y deriva
+  (`docs_hub`), Linaje de Rutas por FRN (`path_history`), Inventario Global de Toolchains del Host
+  (`env_tools` sobre `D:\DevTools` + PATH shadows), `repo_map` PageRank, `read_bundle`, `batch_edit`,
+  `run_verified` (selector de tests + destilador de errores), Motor Ultra-Escala 6M+ archivos y
+  Organización/Deduplicación Transaccional (`fs_organize`).
 ---
 
-# Migratool v2.1 — Guía de Eficiencia Extrema para Agentes de IA
+# Migratool v3.0 — AI Agent Project OS (Guía de Superpoderes para Agentes)
 
-## Regla de Oro: Política Zero-Shell
+## Regla de Oro: Arranque en 1 Llamada (`agent_wake`) y Política Zero-Shell
 
-Cuando el servidor MCP `migratool` esté activo (incluso sin `--project` fijo):
-- **NO ejecutes** `run_command` con PowerShell (`Get-ChildItem`, `Select-String`, `Get-Content`), Python (`os.walk`, `hashlib`, `zipfile`, `sqlite3`) ni `grep` para explorar árboles gigantes, buscar duplicados, auditar repos/worktrees, reorganizar carpetas, leer código o refactorizar.
-- **USA directamente** las 49 herramientas MCP de `migratool` (o `migratool-cli-0.3.exe agent <subcomando>` solo si MCP no está disponible).
-- **Lecturas concurrentes activas:** hasta 4 consultas de solo lectura corren en paralelo sobre SQLite WAL sin bloquearse mutuamente.
-- **Nota crítica para PowerShell 5.1 (si usas CLI):** Windows PowerShell 5.1 elimina comillas dobles internas en `--json '{...}'`. Usa siempre **flags directos** (`--path`, `--depth`, `--query`, `--flat`, `--format`), **`--json-stdin`** (JSON por tubería) o **`--input archivo.json`**.
+Cuando el servidor MCP `migratool` esté activo (`--profile agent-os` con 22 super-herramientas en `<= 9 KB` de esquema, o `--profile full` con las 62 herramientas en `<= 22 KB`):
+1. **Despertar o retomar cualquier proyecto en 1 sola llamada (`agent_wake`)**:
+   - Reconcilia workstreams interrumpidos por cortes de energía, cierres o límites de cuota (`INTERRUPTED_RECOVERABLE`) y operaciones de 7 etapas (`PREPARED..RECOVERY`).
+   - Verifica en vivo (`< 3 ms`) el `SHA-256` en disco y `.git/HEAD` (`CONFIRMED`, `STALE`, `MODIFIED_EXTERNALLY`).
+   - Devuelve cuándo se leyó por última vez el árbol completo (`tree_freshness`), alertas proactivas de `knowledge` (`pitfalls`, `method_tried(failed)`), la cola DAG `ready_tasks` y las 7 métricas `BM1..BM7`.
+2. **Ciclo de desarrollo en 4 llamadas (`BM3`)**:
+   - `agent_wake` $\rightarrow$ `read_bundle` (hasta 25 archivos con skip por `known_sha256`, `FILE_MOVED_HINT` y `knowledge_warnings`) $\rightarrow$ `batch_edit` (7 etapas durables + `idempotency_key`) $\rightarrow$ `run_verified` (`auto_select_tests: true` + destilador de errores `< 500 B`).
+3. **Consultar qué lenguajes, compiladores o SDKs están instalados sin escanear discos (`env_tools`)**:
+   - Funciona **con o sin proyecto activo**: `env_tools({"action": "summary"})`, `env_tools({"action": "query", "query": "cmake"})`, `env_tools({"action": "doctor"})` (detecta `PATH_SHADOWED` como `java` Zulu 11 vs. JDK 21 en `D:\DevTools`).
 
 ---
 

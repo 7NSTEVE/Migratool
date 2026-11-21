@@ -45,11 +45,11 @@ void save_evidence(const Project&, const std::string& kind, Json value,
                    const std::function<void(Database&, Json&)>& prepare = {});
 void index_record_event(const Project&,const std::string&,const Json&,const std::string&);
 Json agent_request(const Project&,const std::string& tool,const Json& args=Json::object(),Log={},Cancel* =nullptr);
-Json agent_tools();
+Json agent_tools(const std::string& profile="full");
 Json agent_batch(const Project&,const Json&);
 Json query_page(const Project&,Database&,const Json&);
 int mcp_server(const Project&);
-int mcp_server(const std::optional<Project>& initial_project);
+int mcp_server(const std::optional<Project>& initial_project, const std::string& profile="full");
 class IndexWatcher {
     struct Impl;
     std::unique_ptr<Impl> impl_;

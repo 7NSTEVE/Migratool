@@ -233,6 +233,8 @@ Json tool_activate_workspace(const Json& args, fs::path* out_project_file, Log l
 Json tool_list_workspaces(const Json& args) {
     const std::string action = lower_ws(args.value("action", "list"));
     const bool available_only = args.value("available_only", false);
+    const std::string kind_filter = lower_ws(args.value("workspace_kind", ""));
+    const bool exclude_fixtures = args.value("exclude_test_fixtures", false);
     Json prune_report = nullptr;
     if (action == "prune") {
         const bool dry_run = args.value("dry_run", false);
@@ -248,6 +250,9 @@ Json tool_list_workspaces(const Json& args) {
             ++unavailable_skipped;
             continue;
         }
+        const std::string wkind = lower_ws(proj.value("workspace_kind", "production"));
+        if (!kind_filter.empty() && wkind != kind_filter) continue;
+        if (exclude_fixtures && wkind == "test_fixture") continue;
         Json item = proj;
         if (avail) {
             try {
@@ -305,12 +310,25 @@ Json tool_query_workspace(const Json& args, Log log, Cancel* cancel) {
         "query", "session_bootstrap", "migration_status", "project_context",
         "project_diagnostics", "next_tasks", "evidence_report", "history",
         "changes_since", "statistics", "get_task_context", "get_diagnostics",
-        "find_implementations", "find_declaration"
+        "find_implementations", "find_declaration",
+        "delta_since", "repo_map", "read_bundle", "impact_analysis", "path_history", "git_intel"
     };
     bool ok_tool = allowed_ro.contains(target_tool);
     if (target_tool == "memory") {
         const std::string act = target_args.value("action", target_args.value("op", "list"));
         ok_tool = (act == "list" || act == "read" || act == "search");
+    } else if (target_tool == "knowledge") {
+        const std::string act = target_args.value("action", target_args.value("op", "list"));
+        ok_tool = (act == "list" || act == "search" || act == "get" || act == "for_files");
+    } else if (target_tool == "docs_hub") {
+        const std::string act = target_args.value("action", target_args.value("op", "list"));
+        ok_tool = (act == "list" || act == "outline" || act == "read_section" || act == "drift_report" || act == "audit" || act == "search");
+    } else if (target_tool == "workstream") {
+        const std::string act = target_args.value("action", target_args.value("op", "status"));
+        ok_tool = (act == "list" || act == "inbox" || act == "snapshot_diff");
+    } else if (target_tool == "env_tools") {
+        const std::string act = target_args.value("action", target_args.value("op", "summary"));
+        ok_tool = (act == "summary" || act == "query" || act == "doctor" || act == "export_md");
     }
     if (!ok_tool) {
         throw std::runtime_error("QUERY_WORKSPACE_READONLY: herramienta no permitida en consulta federada: " + target_tool);

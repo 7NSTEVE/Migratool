@@ -1,4 +1,5 @@
 #include "migratool/fs_index.hpp"
+#include "migratool/path_lineage.hpp"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -141,6 +142,17 @@ void log_fs_change(Database& db, int64_t root_id, uint64_t frn, const std::strin
                    int kind, const std::string& old_path, const std::string& new_path, int64_t size_bytes) {
     db.exec("INSERT INTO fs_change_log(at_ns,root_id,frn,op,kind,old_path,new_path,size_bytes) VALUES(?,?,?,?,?,?,?,?)",
             {now_ns(), root_id, static_cast<int64_t>(frn), op, kind, old_path, new_path, size_bytes});
+    if (op == "moved" || op == "renamed" || op == "deleted" || op == "created") {
+        std::string pop = op;
+        if (op == "moved") pop = "move";
+        else if (op == "renamed") pop = "rename";
+        else if (op == "deleted") pop = "delete";
+        else if (op == "created") pop = "create";
+        try {
+            record_path_event(db, root_id, frn, kind_to_string(kind), pop, old_path, new_path,
+                              size_bytes, "external_unattributed", "fs_sync", "usn_exact");
+        } catch (...) {}
+    }
     prune_change_log_if_needed(db);
 }
 

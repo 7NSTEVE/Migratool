@@ -176,16 +176,21 @@ inline bool classify_status_cell(std::wstring_view text,const Palette& p,COLORRE
     for(wchar_t ch:text)low.push_back(static_cast<wchar_t>(std::towlower(ch)));
     const auto has=[&](std::wstring_view needle){return low.find(needle)!=std::wstring::npos;};
     if(low==L"pass"||low==L"completed"||low==L"verified"||low==L"done"||low==L"succeeded"||low==L"vigente"||
-       low==L"finalizado"||low==L"completada"||low==L"verificado"||has(L"verificado en")||has(L"100,0 %")||has(L"100.0 %")){
+       low==L"finalizado"||low==L"completada"||low==L"verificado"||low==L"verified_fact"||low==L"confirmed"||
+       low==L"listo"||low==L"ok"||low==L"exact_transactional"||low==L"usn_exact"||
+       has(L"verificado en")||has(L"100,0 %")||has(L"100.0 %")){
         fg=p.success_text;bg=p.success_bg;return true;
     }
     if(low==L"error"||low==L"failed"||low==L"different"||low==L"blocked"||low==L"fallo"||
-       low==L"bloqueado"||low==L"sin destino"||has(L"error:")||has(L"ilegible")){
+       low==L"bloqueado"||low==L"sin destino"||low==L"broken_junction"||low==L"journal_gap"||
+       has(L"error:")||has(L"ilegible")){
         fg=p.danger_text;bg=p.danger_bg;return true;
     }
     if(low==L"stale"||low==L"half_done"||low==L"in_progress"||low==L"unreviewed"||low==L"running"||low==L"queued"||
        low==L"obsoleto"||low==L"a medias"||low==L"avance parcial"||low==L"en curso"||low==L"sin revisar"||
-       low==L"reclamado"||low==L"portado"||has(L"declarado completo")){
+       low==L"reclamado"||low==L"portado"||low==L"deriva detectada"||low==L"path_shadowed"||
+       low==L"duplicate_version"||low==L"interrupted_recoverable"||low==L"recuperable"||
+       low==L"agent_hypothesis"||low==L"reconciled_inferred"||has(L"declarado completo")){
         fg=p.warning_text;bg=p.warning_bg;return true;
     }
     return false;
@@ -224,7 +229,7 @@ inline LRESULT handle_listview_customdraw(LPARAM lparam,const Palette& p){
 inline void tab_order(std::span<const HWND> controls){
     HWND previous=HWND_TOP;
     for(auto control:controls)if(control){
-        SetWindowPos(control,previous,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        SetWindowPos(control,previous,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_NOOWNERZORDER);
         previous=control;
     }
 }
@@ -255,7 +260,10 @@ inline HBRUSH color_control(HDC dc,HWND child,const Palette& p,HBRUSH background
 inline void show_if(HWND h,bool vis){
     if(!h)return;
     const bool cur=(GetWindowLongPtrW(h,GWL_STYLE)&WS_VISIBLE)!=0;
-    if(cur!=vis)ShowWindow(h,vis?SW_SHOW:SW_HIDE);
+    if(cur!=vis){
+        SetWindowPos(h,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW|(vis?SWP_SHOWWINDOW:SWP_HIDEWINDOW));
+        if(vis)InvalidateRect(h,nullptr,TRUE);
+    }
 }
 inline void move_if(HWND h,int x,int y,int w,int ht){
     if(!h)return;
@@ -264,7 +272,6 @@ inline void move_if(HWND h,int x,int y,int w,int ht){
         MapWindowPoints(HWND_DESKTOP,GetParent(h),reinterpret_cast<LPPOINT>(&r),2);
         if(r.left==x&&r.top==y&&(r.right-r.left)==w&&(r.bottom-r.top)==ht)return;
     }
-    MoveWindow(h,x,y,w,ht,FALSE);
-    InvalidateRect(h,nullptr,FALSE);
+    SetWindowPos(h,nullptr,x,y,w,ht,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW);
 }
 }

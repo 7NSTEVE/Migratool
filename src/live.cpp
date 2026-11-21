@@ -80,6 +80,15 @@ COMMIT;
                 if (sqlite3_exec(handle_, schema, nullptr, nullptr, nullptr) != SQLITE_OK)
                     throw std::runtime_error(sqlite3_errmsg(handle_));
             }
+            // Additive v3.0 column workspace_kind ('production' | 'scratch' | 'test_fixture') without breaking v1 readers
+            bool has_ws_kind = false;
+            for (const auto& col : query("PRAGMA table_info(projects)")) {
+                if (col.value("name", "") == "workspace_kind") { has_ws_kind = true; break; }
+            }
+            if (!has_ws_kind) {
+                sqlite3_exec(handle_, "ALTER TABLE projects ADD COLUMN workspace_kind TEXT NOT NULL DEFAULT 'production';",
+                             nullptr, nullptr, nullptr);
+            }
             // Conservar sesiones de la primera edición que guardaba las barras del argumento original.
             const auto legacy = query("SELECT project_key,path,name,last_opened FROM projects WHERE instr(project_key,'/')>0");
             if (!legacy.empty()) {
@@ -182,7 +191,7 @@ fs::path project_registry_path() {
 
 Json registered_projects() {
     Registry registry;
-    auto projects = registry.query("SELECT project_key,path,name,last_opened FROM projects ORDER BY last_opened DESC,path");
+    auto projects = registry.query("SELECT project_key,path,name,last_opened,COALESCE(workspace_kind,'production') AS workspace_kind FROM projects ORDER BY last_opened DESC,path");
     auto sessions = registry.query("SELECT s.*,p.path AS project_path,p.name AS project_name FROM sessions s JOIN projects p USING(project_key) WHERE s.finished IS NULL OR s.id IN(SELECT id FROM sessions ORDER BY started DESC LIMIT 500) ORDER BY s.started DESC");
     for (auto& session : sessions) {
         const bool live = session["finished"].is_null() && session_alive(session);
@@ -347,8 +356,19 @@ LiveSession::LiveSession(const Project& project, const std::string& interface_na
     Registry registry;
     registry.begin();
     const auto at = now();
-    registry.query("INSERT INTO projects(project_key,path,name,last_opened)VALUES(?,?,?,?) ON CONFLICT(project_key)DO UPDATE SET path=excluded.path,name=excluded.name,last_opened=excluded.last_opened",
-                   {impl_->key, path_text(fs::weakly_canonical(project.file)), project.config.at("name"), at});
+    const std::string canon_str = path_text(fs::weakly_canonical(project.file));
+    std::string ws_kind = project.config.value("workspace_kind", "");
+    if (ws_kind.empty()) {
+        std::string low_p = canon_str;
+        for (char& c : low_p) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (low_p.find("/appdata/local/temp/") != std::string::npos || low_p.find("\\appdata\\local\\temp\\") != std::string::npos) {
+            ws_kind = "test_fixture";
+        } else {
+            ws_kind = "production";
+        }
+    }
+    registry.query("INSERT INTO projects(project_key,path,name,last_opened,workspace_kind)VALUES(?,?,?,?,?) ON CONFLICT(project_key)DO UPDATE SET path=excluded.path,name=excluded.name,last_opened=excluded.last_opened,workspace_kind=excluded.workspace_kind",
+                   {impl_->key, canon_str, project.config.at("name"), at, ws_kind});
     registry.query("INSERT INTO sessions(id,project_key,pid,process_created,interface,actor,operation,state,started,updated,message)VALUES(?,?,?,?,?,?,?,'RUNNING',?,?,?)",
                    {impl_->id, impl_->key, GetCurrentProcessId(), process_created(GetCurrentProcess()),
                     interface_name, impl_->author, operation, at, at, "Operación iniciada"});

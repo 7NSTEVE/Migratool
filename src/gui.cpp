@@ -17,6 +17,8 @@
 #include <dwmapi.h>
 #include <wincodec.h>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <memory>
 #include <fstream>
@@ -24,6 +26,7 @@
 #include <iomanip>
 #include <functional>
 #include <set>
+#include <chrono>
 
 namespace {
 using namespace mt;
@@ -37,7 +40,7 @@ mt::ui::Palette palette=mt::ui::system_palette();
 #define MUTED palette.secondary
 #define BLUE palette.accent
 #define NAV palette.sidebar
-const wchar_t* pages[]={L"Estado del proyecto",L"Origen y destino",L"Símbolos del código",L"Correspondencias registradas",L"Pruebas de comportamiento",L"Cobertura de pruebas",L"Historial de cambios",L"Todos los archivos",L"Archivos pendientes",L"Git y compilación",L"Buscar en el proyecto",L"Dependencias del código",L"Integración con agentes",L"Agentes en vivo",L"Proyectos recientes",L"Código duplicado",L"Trabajos del proyecto",L"Cobertura por carpeta",L"Trabajo existente",L"Diagnóstico local",L"Carpetas y configuración",L"Archivos dentro de ZIP",L"Problemas del escaneo",L"Matriz de módulos",L"Fases, tareas y documentos"};
+const wchar_t* pages[]={L"Estado del proyecto",L"Origen y destino",L"Símbolos del código",L"Correspondencias registradas",L"Pruebas de comportamiento",L"Cobertura de pruebas",L"Historial de cambios",L"Todos los archivos",L"Archivos pendientes",L"Git y compilación",L"Buscar en el proyecto",L"Dependencias del código",L"Integración con agentes",L"Agentes en vivo",L"Proyectos recientes",L"Código duplicado",L"Trabajos del proyecto",L"Cobertura por carpeta",L"Trabajo existente",L"Diagnóstico local",L"Carpetas y configuración",L"Archivos dentro de ZIP",L"Problemas del escaneo",L"Matriz de módulos",L"Fases, tareas y documentos",L"Sesiones y Handoffs",L"Linaje de rutas y árbol",L"Conocimiento y métodos probados",L"Documentos del proyecto",L"Lenguajes y herramientas del host"};
 constexpr int ID_SECTION_VIEW=31,ID_SECTION_COMPACT=32,ID_PROJECT_MENU=16,ID_LOG_TOGGLE=17,ID_NEXT_STEP=19;
 constexpr int ID_HELP=50,ID_EXIT=51,ID_ZOOM_IN=52,ID_ZOOM_OUT=53,ID_ZOOM_RESET=54,ID_FOCUS_SEARCH=55,ID_RELOAD_VIEW=56;
 constexpr int ID_SIDEBAR=57,ID_CODE_SETTINGS=58,ID_RESOURCES=59;
@@ -370,13 +373,13 @@ Json form_roots(const Form& form,const Project* previous){
     }
     return roots;
 }
-struct OpenProjectResult {std::optional<Project> project;Json scan,summary;bool durable=false;std::string error;std::unique_ptr<LiveSession> session;};
+struct OpenProjectResult {std::optional<Project> project;Json scan,summary;int64_t revision=-1;bool durable=false;std::string error;std::unique_ptr<LiveSession> session;};
 struct ProjectPoll {
     uint64_t epoch=0;
     Json registry,activity,scan,summary,export_jobs=Json::array();
     std::optional<Project> updated_project;
     int64_t revision=-1;
-    std::string jobs_signature;
+    std::string jobs_signature,projects_signature,registry_signature;
     bool durable=false,update_catalog=false,active_jobs=false;
     std::string error;
 };
@@ -476,12 +479,12 @@ struct App {
     HBRUSH background_brush{},surface_brush{};
     int hovered=-1,content_left=252,content_width=900,title_y=24,title_width=600,title_height=40,cards_y=145,cards_height=88,cards_columns=4;
     std::optional<Project> project;Json scan_data,summary;std::vector<std::string> selected_ids;
-    std::jthread worker,poll_worker;std::unique_ptr<IndexWatcher> watcher;Cancel cancel;bool busy=false,closing=false;int page=0,dpi=96;
+    std::jthread worker,poll_worker;std::mutex poll_mutex;std::condition_variable_any poll_cv;std::optional<std::function<void()>> poll_pending;std::unique_ptr<IndexWatcher> watcher;Cancel cancel;bool busy=false,closing=false;int page=0,dpi=96;
     ComparisonView comparison;
     ScaleView scalable_view;
     bool durable=false;
     Json registry={{"projects",Json::array()},{"sessions",Json::array()}};
-    std::string registry_signature;
+    std::string registry_signature,projects_signature;
     bool loading=false,refreshing=false,polling=false;
     uint64_t project_epoch=0;
     std::vector<fs::path> project_paths;
@@ -512,6 +515,7 @@ struct App {
     void save_preferences(){prefs_dirty=true;if(window)SetTimer(window,4,250,nullptr);else flush_preferences_sync();}
     void apply_appearance(bool relayout=true){
         if(window)SendMessageW(window,WM_SETREDRAW,FALSE,0);
+        if(scalable_view.window())SendMessageW(scalable_view.window(),WM_SETREDRAW,FALSE,0);
         palette=ui::system_palette();if(background_brush)DeleteObject(background_brush);if(surface_brush)DeleteObject(surface_brush);background_brush=CreateSolidBrush(BG);surface_brush=CreateSolidBrush(palette.surface);
         auto make=[&](int size,int weight){return CreateFontW(-type_px(size),0,0,0,weight,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");};
         const std::array<HFONT,4> old={body,heading,small_font,cardfont};body=make(18,FW_NORMAL);heading=make(28,FW_SEMIBOLD);small_font=make(14,FW_NORMAL);cardfont=make(30,FW_SEMIBOLD);
@@ -522,8 +526,20 @@ struct App {
         if(list)ui::list_colors(list,palette);if(scalable_view.window())scalable_view.appearance(body,dpi);if(comparison.window())comparison.appearance(body,dpi);
         if(project_selector)SendMessageW(project_selector,CB_SETDROPPEDWIDTH,px(900),0);
         for(auto previous:old)if(previous)DeleteObject(previous);
-        if(relayout)layout();
-        if(window&&relayout){SendMessageW(window,WM_SETREDRAW,TRUE,0);RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN|RDW_ERASE);}
+        if(relayout){
+            RECT before_sv{};
+            if(scalable_view.window())GetWindowRect(scalable_view.window(),&before_sv);
+            layout();
+            if(scalable_view.window()&&IsWindowVisible(scalable_view.window())){
+                RECT after_sv{};GetWindowRect(scalable_view.window(),&after_sv);
+                if(EqualRect(&before_sv,&after_sv)){
+                    RECT cr{};GetClientRect(scalable_view.window(),&cr);
+                    SendMessageW(scalable_view.window(),WM_SIZE,SIZE_RESTORED,MAKELPARAM(cr.right,cr.bottom));
+                }
+            }
+        }
+        if(scalable_view.window())SendMessageW(scalable_view.window(),WM_SETREDRAW,TRUE,0);
+        if(window&&relayout){SendMessageW(window,WM_SETREDRAW,TRUE,0);InvalidateRect(window,nullptr,FALSE);if(scalable_view.window()&&IsWindowVisible(scalable_view.window()))InvalidateRect(scalable_view.window(),nullptr,FALSE);}
     }
     void zoom(int change){const auto next=change==0?100:std::clamp(ui::text_percent+change,100,200);if(next==ui::text_percent)return;ui::text_percent=next;apply_appearance();save_preferences();}
     void menus(){
@@ -610,7 +626,7 @@ struct App {
         const auto hwnd=window;worker=std::jthread([this,path,discovered,hwnd](){
             auto result=std::make_unique<OpenProjectResult>();
             try{auto p=Project::load(path);result->session=std::make_unique<LiveSession>(p,"GUI","Proyecto abierto","GUI");
-                if(fs::exists(p.state_dir()/L"catalog.sqlite")){Database db(p);result->durable=scale_enabled(p,db);if(!result->durable){result->scan=index_snapshot(p,false);result->summary=mt::status(p,false);}}
+                if(fs::exists(p.state_dir()/L"catalog.sqlite")){Database db(p);result->revision=db.revision();result->durable=scale_enabled(p,db);if(!result->durable){result->scan=index_snapshot(p,false);result->summary=mt::status(p,false);}}
                 if(cancel.requested)throw std::runtime_error("Apertura cancelada");result->project=std::move(p);
             }catch(const std::exception& e){result->error=e.what();}
             if(PostMessageW(hwnd,WM_OPEN_PROJECT,discovered?1:0,reinterpret_cast<LPARAM>(result.get())))result.release();
@@ -619,7 +635,7 @@ struct App {
     void finish_open(OpenProjectResult& result,bool discovered){
         loading=false;set_busy(false);if(closing){if(!polling)DestroyWindow(window);return;}
         if(!result.error.empty()){log("No se pudo abrir el proyecto: "+result.error);return;}
-        project=std::move(result.project);scan_data=std::move(result.scan);summary=std::move(result.summary);durable=result.durable;gui_session=std::move(result.session);last_activity_id=0;
+        project=std::move(result.project);scan_data=std::move(result.scan);summary=std::move(result.summary);durable=result.durable;displayed_revision=result.revision;gui_session=std::move(result.session);last_activity_id=0;
         if(!same_path(navigation_project,project->file))last_views={0,1,16,4,20};navigation_project=project->file;
         page=requested_page>=0?requested_page:discovered?1:0;requested_page=-1;if(capture_active&&!capture_pages.empty())page=capture_pages[capture_index];if(!capture_active)watcher=std::make_unique<IndexWatcher>(*project,900000,Log{},true);
         log("Proyecto abierto: "+project->config.value("name",""));refresh_view();layout();InvalidateRect(window,nullptr,TRUE);poll_live();
@@ -634,35 +650,50 @@ struct App {
         const bool jobs_visible=page==16||page==17;
         const auto after=last_activity_id;
         const bool read_catalog=!busy;
-        poll_worker=std::jthread([target,current_project,epoch,previous_revision,after,read_catalog,jobs_visible]{
-            auto result=std::make_unique<ProjectPoll>();result->epoch=epoch;
-            try{
-                result->registry=registered_projects();
-                if(current_project){
-                    result->activity=project_activity_delta(current_project->file,after);
-                    if(read_catalog){
-                        auto current=Project::load(current_project->file);
-                        Database db(current);
-                        result->revision=db.revision();
-                        const bool config_changed=current.revision!=current_project->revision;
-                        result->update_catalog=config_changed||result->revision!=previous_revision;
-                        result->active_jobs=jobs_visible&&db.integer("SELECT EXISTS(SELECT 1 FROM inventory_jobs WHERE state IN('queued','running'))")!=0;
-                        if(jobs_visible){
-                            for(const auto& j:db.query("SELECT id,state,phase,processed,files,dirs,failed FROM inventory_jobs ORDER BY created DESC LIMIT 15")){
-                                result->jobs_signature+=j["id"].get<std::string>()+":"+j["state"].get<std::string>()+":"+j["phase"].get<std::string>()+":"+j["processed"].dump()+":"+j["files"].dump()+":"+j["dirs"].dump()+":"+j["failed"].dump()+";";
-                            }
-                        }
-                        result->export_jobs=db.query("SELECT id,state,phase,files,error,scope FROM inventory_jobs WHERE generation=0 AND json_extract(scope,'$.kind')='export_inventory' ORDER BY created DESC LIMIT 10");
-                        if(result->update_catalog){
-                            result->durable=scale_enabled(current,db);
-                            if(!result->durable){result->scan=index_snapshot(current,false);result->summary=mt::status(current,false);}
-                        }
-                        if(config_changed)result->updated_project=std::move(current);
-                    }
+        if(!poll_worker.joinable()){
+            poll_worker=std::jthread([this](std::stop_token stop){
+                while(!stop.stop_requested()){
+                    std::function<void()> fn;
+                    {std::unique_lock lk(poll_mutex);poll_cv.wait(lk,stop,[&]{return poll_pending.has_value();});if(stop.stop_requested())break;fn=std::move(*poll_pending);poll_pending.reset();}
+                    if(fn)fn();
                 }
-            }catch(const std::exception& e){result->error=e.what();}
-            if(PostMessageW(target,WM_PROJECT_POLL,0,reinterpret_cast<LPARAM>(result.get())))result.release();
-        });
+            });
+        }
+        {
+            std::lock_guard lk(poll_mutex);
+            poll_pending=[target,current_project,epoch,previous_revision,after,read_catalog,jobs_visible]{
+                auto result=std::make_unique<ProjectPoll>();result->epoch=epoch;
+                try{
+                    result->registry=registered_projects();
+                    result->registry_signature=result->registry.dump();
+                    result->projects_signature=result->registry.value("projects",Json::array()).dump();
+                    if(current_project){
+                        result->activity=project_activity_delta(current_project->file,after);
+                        if(read_catalog){
+                            auto current=Project::load(current_project->file);
+                            Database db(current);
+                            result->revision=db.revision();
+                            const bool config_changed=current.revision!=current_project->revision;
+                            result->update_catalog=config_changed||result->revision!=previous_revision;
+                            result->active_jobs=jobs_visible&&db.integer("SELECT EXISTS(SELECT 1 FROM inventory_jobs WHERE state IN('queued','running'))")!=0;
+                            if(jobs_visible){
+                                for(const auto& j:db.query("SELECT id,state,phase,processed,files,dirs,failed FROM inventory_jobs ORDER BY created DESC LIMIT 15")){
+                                    result->jobs_signature+=j["id"].get<std::string>()+":"+j["state"].get<std::string>()+":"+j["phase"].get<std::string>()+":"+j["processed"].dump()+":"+j["files"].dump()+":"+j["dirs"].dump()+":"+j["failed"].dump()+";";
+                                }
+                            }
+                            result->export_jobs=db.query("SELECT id,state,phase,files,error,scope FROM inventory_jobs WHERE generation=0 AND json_extract(scope,'$.kind')='export_inventory' ORDER BY created DESC LIMIT 10");
+                            if(result->update_catalog){
+                                result->durable=scale_enabled(current,db);
+                                if(!result->durable){result->scan=index_snapshot(current,false);result->summary=mt::status(current,false);}
+                            }
+                            if(config_changed)result->updated_project=std::move(current);
+                        }
+                    }
+                }catch(const std::exception& e){result->error=e.what();}
+                if(PostMessageW(target,WM_PROJECT_POLL,0,reinterpret_cast<LPARAM>(result.get())))result.release();
+            };
+        }
+        poll_cv.notify_one();
     }
     void finish_poll(ProjectPoll& update){
         polling=false;
@@ -670,10 +701,11 @@ struct App {
         if(update.epoch!=project_epoch||loading)return;
         if(!update.error.empty())log("No se pudo actualizar la vista. Se reintentará: "+update.error);
         if(!update.registry.is_object())return;
-        const auto signature=update.registry.dump();
-        const bool changed=signature!=registry_signature;
+        const bool changed=update.registry_signature!=registry_signature;
+        const bool projects_changed=update.projects_signature!=projects_signature;
         registry=std::move(update.registry);
-        if(changed&&SendMessageW(project_selector,CB_GETDROPPEDSTATE,0,0)==FALSE){
+        registry_signature=std::move(update.registry_signature);
+        if(projects_changed&&SendMessageW(project_selector,CB_GETDROPPEDSTATE,0,0)==FALSE){
             SendMessageW(project_selector,CB_RESETCONTENT,0,0);project_paths.clear();
             for(const auto& item:registry["projects"]){
                 const auto label=wide(item["name"].get<std::string>());
@@ -682,19 +714,22 @@ struct App {
                 if(project&&same_path(project->file,project_paths.back()))
                     SendMessageW(project_selector,CB_SETCURSEL,project_paths.size()-1,0);
             }
-            registry_signature=signature;
+            projects_signature=std::move(update.projects_signature);
         }
         if(!project){
             for(const auto& item:registry["projects"])if(item["available"]==true){load(fs::path(wide(item["path"])),true);break;}
         }
-        if(project&&update.activity.is_array()){
+        if(project&&update.activity.is_array()&&!update.activity.empty()){
+            std::string batch;
             for(const auto& item:update.activity){
                 const auto id=item["id"].get<int64_t>();
                 if(id<=last_activity_id)continue;
-                log(item["at"].get<std::string>()+" · "+item["actor"].get<std::string>()+" · "+
-                    item["operation"].get<std::string>()+" · "+item["state"].get<std::string>()+" · "+item["message"].get<std::string>());
+                if(!batch.empty())batch+="\r\n";
+                batch+=item["at"].get<std::string>()+" · "+item["actor"].get<std::string>()+" · "+
+                    item["operation"].get<std::string>()+" · "+item["state"].get<std::string>()+" · "+item["message"].get<std::string>();
                 last_activity_id=id;
             }
+            if(!batch.empty())log(batch);
         }
         const bool refresh_jobs=update.active_jobs||jobs_were_active||(!update.jobs_signature.empty()&&update.jobs_signature!=displayed_jobs_signature);
         if(page==16||page==17)displayed_jobs_signature=update.jobs_signature;
@@ -1008,7 +1043,7 @@ struct App {
         if(id==ID_SECTION_VIEW){const auto index=SendMessageW(section_selector,CB_GETCURSEL,0,0);if(index>=0&&static_cast<size_t>(index)<section_pages.size()){page=section_pages[index];if(GetWindowTextLengthW(filter)>0)SetWindowTextW(filter,L"");refresh_view();layout();}return;}
         if(id==ID_PROJECT_MENU){auto menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,ID_NEW,L"Crear proyecto…");AppendMenuW(menu,MF_STRING,ID_OPEN,L"Abrir proyecto…");AppendMenuW(menu,MF_STRING,1014,L"Proyectos recientes");if(project){AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,2004,L"Carpetas y configuración");AppendMenuW(menu,MF_STRING,ID_REPORT,L"Generar informe…");}RECT bounds{};GetWindowRect(project_menu,&bounds);auto command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTALIGN,bounds.right,bounds.bottom,0,window,nullptr);DestroyMenu(menu);if(command)action(command);return;}
         if(id==ID_NEXT_STEP){page=8;if(GetWindowTextLengthW(filter)>0)SetWindowTextW(filter,L"");refresh_view();layout();return;}
-        if(id>=1000&&id<1000+static_cast<int>(std::size(pages))){SendMessageW(window,WM_SETREDRAW,FALSE,0);if(scalable_view.window())SendMessageW(scalable_view.window(),WM_SETREDRAW,FALSE,0);if(id==1006)history_entity=selected();page=id-1000;if(loading)requested_page=page;if(GetWindowTextLengthW(filter)>0)SetWindowTextW(filter,L"");refresh_view();layout();if(scalable_view.window())SendMessageW(scalable_view.window(),WM_SETREDRAW,TRUE,0);SendMessageW(window,WM_SETREDRAW,TRUE,0);RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE|RDW_NOERASE|RDW_ALLCHILDREN);return;}
+        if(id>=1000&&id<1000+static_cast<int>(std::size(pages))){SendMessageW(window,WM_SETREDRAW,FALSE,0);if(scalable_view.window())SendMessageW(scalable_view.window(),WM_SETREDRAW,FALSE,0);if(id==1006)history_entity=selected();page=id-1000;if(loading)requested_page=page;if(GetWindowTextLengthW(filter)>0)SetWindowTextW(filter,L"");refresh_view();layout();if(scalable_view.window())SendMessageW(scalable_view.window(),WM_SETREDRAW,TRUE,0);SendMessageW(window,WM_SETREDRAW,TRUE,0);InvalidateRect(window,nullptr,FALSE);if(scalable_view.window()&&IsWindowVisible(scalable_view.window()))InvalidateRect(scalable_view.window(),nullptr,FALSE);return;}
         if(busy){if(id==ID_CANCEL){cancel.requested=true;log("Cancelación solicitada; esperando cierre de procesos propios.");}return;}
         if(id==ID_PROJECT){const auto index=SendMessageW(project_selector,CB_GETCURSEL,0,0);if(index>=0&&static_cast<size_t>(index)<project_paths.size()&&(!project||!same_path(project_paths[index],project->file))){load(project_paths[index]);layout();}return;}
         if(id==ID_OPEN){auto path=open_file(window,L"Abrir proyecto Migratool (.json)");if(path)load(*path);return;}
@@ -1566,7 +1601,6 @@ LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             a->dpi=GetDpiForWindow(w);
             a->read_preferences();auto makefont=[&](int size,int weight){return CreateFontW(-a->type_px(size),0,0,0,weight,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");};
             body=makefont(18,FW_NORMAL);heading=makefont(28,FW_SEMIBOLD);small_font=makefont(14,FW_NORMAL);cardfont=makefont(30,FW_SEMIBOLD);
-            for(int i=0;i<static_cast<int>(std::size(pages));++i)a->nav.push_back(control(w,L"BUTTON",pages[i],BS_OWNERDRAW,1000+i,body));
             for(int i=0;i<5;++i){auto button=control(w,L"BUTTON",navigation_groups()[i].title,WS_TABSTOP|BS_OWNERDRAW,2000+i,body);SetWindowSubclass(button,section_proc,1,0);a->section_nav.push_back(button);}
             a->section_selector=control(w,WC_COMBOBOXW,L"Vista de la sección",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,ID_SECTION_VIEW,body);a->project_menu=control(w,L"BUTTON",L"Proyecto ▾",WS_TABSTOP,ID_PROJECT_MENU,body);a->log_toggle=control(w,L"BUTTON",L"Detalles técnicos",WS_TABSTOP,ID_LOG_TOGGLE,small_font);a->buttons.push_back(control(w,L"BUTTON",L"Ver pendientes",WS_TABSTOP,ID_NEXT_STEP,body));
             a->section_compact=control(w,WC_COMBOBOXW,L"Sección principal",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,ID_SECTION_COMPACT,body);for(const auto& group:navigation_groups())SendMessageW(a->section_compact,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(group.title));SendMessageW(a->section_compact,CB_SETCURSEL,0,0);
@@ -1596,7 +1630,7 @@ LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
           case WM_GETMINMAXINFO:reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize={a->px(860),a->px(620)};return 0;
           case WM_PAINT:a->paint();return 0;
           case WM_ERASEBKGND:return 1;
-          case WM_DPICHANGED:{a->dpi=HIWORD(wp);a->apply_appearance(false);auto r=reinterpret_cast<RECT*>(lp);RECT cur{};GetWindowRect(w,&cur);const bool same_size=(cur.right-cur.left)==(r->right-r->left)&&(cur.bottom-cur.top)==(r->bottom-r->top);SetWindowPos(w,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW);if(same_size)a->layout();SendMessageW(w,WM_SETREDRAW,TRUE,0);RedrawWindow(w,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN|RDW_ERASE);return 0;}
+          case WM_DPICHANGED:{a->dpi=HIWORD(wp);a->apply_appearance(false);auto r=reinterpret_cast<RECT*>(lp);RECT cur{};GetWindowRect(w,&cur);const bool same_size=(cur.right-cur.left)==(r->right-r->left)&&(cur.bottom-cur.top)==(r->bottom-r->top);SetWindowPos(w,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW);if(same_size)a->layout();SendMessageW(w,WM_SETREDRAW,TRUE,0);InvalidateRect(w,nullptr,FALSE);if(a->scalable_view.window()&&IsWindowVisible(a->scalable_view.window()))InvalidateRect(a->scalable_view.window(),nullptr,FALSE);return 0;}
           case WM_SETTINGCHANGE:case WM_THEMECHANGED:case WM_SYSCOLORCHANGE:a->apply_appearance();return 0;
           case WM_CTLCOLORSTATIC:case WM_CTLCOLOREDIT:case WM_CTLCOLORBTN:{auto child=reinterpret_cast<HWND>(lp);auto dc=reinterpret_cast<HDC>(wp);for(auto item:a->card_values)if(item==child){SetTextColor(dc,BLUE);SetBkColor(dc,palette.surface);return reinterpret_cast<LRESULT>(a->surface_brush);}for(auto item:a->card_labels)if(item==child){SetTextColor(dc,MUTED);SetBkColor(dc,palette.surface);return reinterpret_cast<LRESULT>(a->surface_brush);}return reinterpret_cast<LRESULT>(ui::color_control(dc,child,palette,a->background_brush,a->surface_brush));}
           case WM_DRAWITEM:{auto d=reinterpret_cast<DRAWITEMSTRUCT*>(lp);if(d->CtlID>=2000&&d->CtlID<2005){const int group=static_cast<int>(d->CtlID)-2000;const bool active=navigation_group(a->page)==group;auto background=CreateSolidBrush(NAV);FillRect(d->hDC,&d->rcItem,background);DeleteObject(background);
@@ -1658,7 +1692,7 @@ LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
           }return 0;
           case WM_NOTIFY:{auto n=reinterpret_cast<NMHDR*>(lp);if(n->hwndFrom==a->list&&n->code==NM_CUSTOMDRAW)return ui::handle_listview_customdraw(lp,palette);if(n->hwndFrom==a->list&&n->code==NM_DBLCLK){auto id=a->selected();if(a->page==14&&!id.empty()){a->load(fs::path(wide(id)));a->layout();return 0;}if(!id.empty()){Form f;f.parent=w;f.title=L"Identificador exacto · copiar para CLI o configuración";f.labels={L"Unidad seleccionada"};f.values={wide(id)};f.height=300;show_form(f);}return 0;}break;}
           case WM_CLOSE:if(a->busy||a->polling){a->closing=true;a->cancel.requested=true;a->log("Cerrando la ventana. Guardando el estado de la operación…");return 0;}DestroyWindow(w);return 0;
-          case WM_DESTROY:KillTimer(w,1);KillTimer(w,3);KillTimer(w,4);KillTimer(w,5);a->cancel.requested=true;if(a->worker.joinable())a->worker.join();if(a->prefs_worker.joinable())a->prefs_worker.join();if(a->prefs_dirty){a->prefs_dirty=false;a->flush_preferences_sync();}if(a->poll_worker.joinable())a->poll_worker.join();a->watcher.reset();if(a->gui_session){a->gui_session->finish(0);a->gui_session.reset();}PostQuitMessage(0);return 0;
+          case WM_DESTROY:KillTimer(w,1);KillTimer(w,3);KillTimer(w,4);KillTimer(w,5);a->cancel.requested=true;a->poll_worker.request_stop();a->poll_cv.notify_all();if(a->worker.joinable())a->worker.join();if(a->prefs_worker.joinable())a->prefs_worker.join();if(a->prefs_dirty){a->prefs_dirty=false;a->flush_preferences_sync();}if(a->poll_worker.joinable())a->poll_worker.join();a->watcher.reset();if(a->gui_session){a->gui_session->finish(0);a->gui_session.reset();}PostQuitMessage(0);return 0;
         }
     }catch(const std::exception& e){if(msg==WM_TIMER){SetWindowTextW(a->statusbar,wide("No se pudo actualizar el índice; se reintentará: "+std::string(e.what())).c_str());return 0;}a->log("Error: "+std::string(e.what()));MessageBoxW(w,wide(e.what()).c_str(),L"Migratool",MB_OK|MB_ICONERROR);return 0;}
     return DefWindowProcW(w,msg,wp,lp);

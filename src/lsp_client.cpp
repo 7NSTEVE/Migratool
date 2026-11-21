@@ -1,4 +1,5 @@
 #include "migratool/lsp_client.hpp"
+#include "migratool/env_registry.hpp"
 #include "migratool/fs_index.hpp"
 #include <algorithm>
 #include <atomic>
@@ -132,10 +133,24 @@ std::vector<std::string> resolve_server_command(const Project& p, const std::str
         if (!suffix.empty()) val += suffix;
         return {fs::path(val)};
     };
+    auto env_reg_exe = [](const std::string& cmd) -> std::string {
+        try {
+            auto r = env_lookup_tool(cmd, true);
+            if (r.value("found", false) && r.contains("preferred") && r["preferred"].is_object() &&
+                r["preferred"].value("exists_live", false)) {
+                return r["preferred"].value("exe_path", "");
+            }
+        } catch (...) {}
+        return {};
+    };
     if (lang == "cpp") {
         auto hints = env_dir(L"LLVM_DIR", L"\\bin");
         if (auto pf = env_dir(L"ProgramFiles", L"\\LLVM\\bin"); !pf.empty()) hints.push_back(pf[0]);
+        hints.push_back(fs::path(L"D:\\DevTools\\msys64\\ucrt64\\bin"));
         if (auto exe = search_exe_on_path(L"clangd.exe", hints); !exe.empty()) {
+            return {exe, "--background-index=false", "--log=error"};
+        }
+        if (auto exe = env_reg_exe("clangd"); !exe.empty()) {
             return {exe, "--background-index=false", "--log=error"};
         }
     } else if (lang == "python") {
@@ -144,24 +159,36 @@ std::vector<std::string> resolve_server_command(const Project& p, const std::str
         if (auto exe = search_exe_on_path(L"pyright-langserver.cmd"); !exe.empty()) return {exe, "--stdio"};
         if (auto exe = search_exe_on_path(L"pyright-langserver.exe"); !exe.empty()) return {exe, "--stdio"};
         if (auto exe = search_exe_on_path(L"pylsp.exe"); !exe.empty()) return {exe};
+        if (auto exe = env_reg_exe("basedpyright-langserver"); !exe.empty()) return {exe, "--stdio"};
+        if (auto exe = env_reg_exe("pyright-langserver"); !exe.empty()) return {exe, "--stdio"};
     } else if (lang == "typescript" || lang == "javascript") {
         if (auto exe = search_exe_on_path(L"typescript-language-server.cmd"); !exe.empty()) return {exe, "--stdio"};
         if (auto exe = search_exe_on_path(L"typescript-language-server.exe"); !exe.empty()) return {exe, "--stdio"};
+        if (auto exe = env_reg_exe("typescript-language-server"); !exe.empty()) return {exe, "--stdio"};
     } else if (lang == "rust") {
         auto hints = env_dir(L"CARGO_HOME", L"\\bin");
         if (auto up = env_dir(L"USERPROFILE", L"\\.cargo\\bin"); !up.empty()) hints.push_back(up[0]);
+        hints.push_back(fs::path(L"D:\\DevTools\\Rust\\.cargo\\bin"));
         if (auto exe = search_exe_on_path(L"rust-analyzer.exe", hints); !exe.empty()) return {exe};
+        if (auto exe = env_reg_exe("rust-analyzer"); !exe.empty()) return {exe};
     } else if (lang == "go") {
         auto hints = env_dir(L"GOPATH", L"\\bin");
         if (auto up = env_dir(L"USERPROFILE", L"\\go\\bin"); !up.empty()) hints.push_back(up[0]);
+        hints.push_back(fs::path(L"D:\\DevTools\\Go\\bin"));
         if (auto exe = search_exe_on_path(L"gopls.exe", hints); !exe.empty()) return {exe};
+        if (auto exe = env_reg_exe("gopls"); !exe.empty()) return {exe};
     } else if (lang == "dart") {
         auto hints = env_dir(L"FLUTTER_ROOT", L"\\bin\\cache\\dart-sdk\\bin");
+        hints.push_back(fs::path(L"D:\\DevTools\\flutter\\bin\\cache\\dart-sdk\\bin"));
         if (auto exe = search_exe_on_path(L"dart.exe", hints); !exe.empty()) {
+            return {exe, "language-server", "--protocol=lsp"};
+        }
+        if (auto exe = env_reg_exe("dart"); !exe.empty()) {
             return {exe, "language-server", "--protocol=lsp"};
         }
     } else if (lang == "csharp") {
         if (auto exe = search_exe_on_path(L"csharp-ls.exe"); !exe.empty()) return {exe};
+        if (auto exe = env_reg_exe("csharp-ls"); !exe.empty()) return {exe};
     }
     return {};
 }

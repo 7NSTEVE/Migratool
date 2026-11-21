@@ -10,6 +10,13 @@
 #include "migratool/housekeep.hpp"
 #include "migratool/duplicates.hpp"
 #include "migratool/ast_engine.hpp"
+#include "migratool/agent_supertools.hpp"
+#include "migratool/docs_hub.hpp"
+#include "migratool/env_registry.hpp"
+#include "migratool/git_intel.hpp"
+#include "migratool/knowledge.hpp"
+#include "migratool/path_lineage.hpp"
+#include "migratool/workstream.hpp"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -3258,7 +3265,12 @@ Json agent_request(const Project& p,const std::string& tool,const Json& raw_args
             }
         }else if(!args.value("wait",true))result=scale_start(p,args);
         else if(scale_enabled(p,db)||args.value("defer_analysis",false))result=scale_run(p,args,log,cancel);
-        else result=index_sync(p,args.value("full",false),log,cancel,args.value("scope",Json::object()));
+        else{
+            result=index_sync(p,args.value("full",false),log,cancel,args.value("scope",Json::object()));
+            if(args.value("sync_fs",true)){
+                try{Database fs_db(p);result["fs_sync"]=fs_sync(p,fs_db,args,log,cancel);}catch(...){}
+            }
+        }
     }
     else if(tool=="explore_tree")result=fs_explore_tree(p,db,args);
     else if(tool=="find_files")result=fs_find_files(p,db,args);
@@ -3285,6 +3297,19 @@ Json agent_request(const Project& p,const std::string& tool,const Json& raw_args
     else if(tool=="lsp_rename_symbol")result=tool_lsp_rename_symbol(p,db,args);
     else if(tool=="restart_language_server")result=tool_restart_language_server(p,args);
     else if(tool=="housekeep")result=tool_housekeep(p,db,args,log);
+    else if(tool=="agent_wake")result=tool_agent_wake(p,db,args);
+    else if(tool=="delta_since")result=tool_delta_since(p,db,args);
+    else if(tool=="repo_map")result=tool_repo_map(p,db,args);
+    else if(tool=="read_bundle")result=tool_read_bundle(p,db,args);
+    else if(tool=="batch_edit")result=tool_batch_edit(p,db,args,log,cancel);
+    else if(tool=="run_verified")result=tool_run_verified(p,db,args,log,cancel);
+    else if(tool=="impact_analysis")result=tool_impact_analysis(p,db,args);
+    else if(tool=="workstream")result=tool_workstream(p,db,args);
+    else if(tool=="knowledge")result=tool_knowledge(p,db,args);
+    else if(tool=="docs_hub")result=tool_docs_hub(p,db,args);
+    else if(tool=="path_history")result=tool_path_history(p,db,args);
+    else if(tool=="git_intel")result=tool_git_intel(p,db,args);
+    else if(tool=="env_tools")result=tool_env_tools(std::optional<Project>(p),args);
     else if(tool=="session_bootstrap")result=build_session_bootstrap(p,db,args);
     else if(tool=="complete_task")result=run_complete_task(p,args,log,cancel);
     else if(tool=="job_status")result=scale_jobs(p,args);
@@ -3542,10 +3567,14 @@ Json agent_request(const Project& p,const std::string& tool,const Json& raw_args
        (tool=="inventory_sync"||tool=="session_bootstrap"||tool=="complete_task"||tool=="job_status"||tool=="job_control"||tool=="project_settings"||tool=="acquire_task"||tool=="import_existing_work"||tool=="project_diagnostics"||
         tool=="query"||tool=="explore_tree"||tool=="find_files"||tool=="changes_feed"||tool=="search_pattern"||tool=="read_file"||tool=="list_workspaces"||tool=="query_workspace"||tool=="onboard_workspace"||tool=="memory"||tool=="get_diagnostics"||tool=="find_implementations"||tool=="find_declaration"||tool=="housekeep"||
         tool=="find_duplicates"||tool=="verify_archive_vs_dir"||tool=="inspect_workspace_topology"||tool=="organize_plan"||tool=="organize_apply"||tool=="organize_undo"||tool=="organize_verify"||
+        tool=="agent_wake"||tool=="delta_since"||tool=="repo_map"||tool=="read_bundle"||tool=="batch_edit"||tool=="run_verified"||tool=="impact_analysis"||tool=="workstream"||tool=="knowledge"||tool=="docs_hub"||tool=="path_history"||tool=="git_intel"||tool=="env_tools"||
         tool=="next_tasks"||tool=="evidence_report"||tool=="changes_since"||tool=="history"||paginated_status)){
         const bool wide_tool = (tool=="read_file"||tool=="memory"||tool=="explore_tree"||tool=="find_duplicates"||
                                 tool=="inspect_workspace_topology"||tool=="organize_plan"||tool=="organize_apply"||
-                                tool=="organize_verify"||tool=="verify_archive_vs_dir");
+                                tool=="organize_verify"||tool=="verify_archive_vs_dir"||
+                                tool=="agent_wake"||tool=="read_bundle"||tool=="batch_edit"||tool=="run_verified"||
+                                tool=="impact_analysis"||tool=="workstream"||tool=="knowledge"||tool=="docs_hub"||
+                                tool=="path_history"||tool=="git_intel"||tool=="env_tools"||tool=="repo_map");
         response_options["token_budget"] = wide_tool ? 16000 : 4000;
     }
     result=bound(result,response_options);
@@ -3555,163 +3584,146 @@ Json agent_request(const Project& p,const std::string& tool,const Json& raw_args
     }
     return result;
 }
-Json agent_tools(){
+Json agent_tools(const std::string& profile){
+    const std::string prof = low_str(profile.empty() ? "full" : profile);
     const std::vector<std::pair<std::string,std::string>> definitions={
-        {"session_bootstrap","Arranque de sesión en 1 llamada: devuelve revisión actual, estado global, diagnóstico de bloqueos del denominador (denominator_blockers), raíces, módulos pendientes prioritarios, reclamos activos y siguientes tareas."},
-        {"activate_workspace","Activa o inicializa en 1 llamada cualquier directorio (modo workspace, archive para 6M+ archivos o migration) guardando el catálogo fuera de raíces protegidas (ej. %LOCALAPPDATA%\\Migratool\\workspaces\\)."},
-        {"list_workspaces","Lista workspaces y proyectos registrados (admite available_only:true y action:'prune' con dry_run para limpiar registros obsoletos)."},
-        {"query_workspace","Consulta federada de solo lectura contra otro workspace registrado (por nombre, JSON o carpeta) sin cambiar el workspace activo."},
-        {"onboard_workspace","Orientación automática del workspace: detecta estructura, lenguajes, marcadores de compilación y crea la memoria persistente _onboarding."},
-        {"explore_tree","Exploración jerárquica ultra-escala (<10ms sobre 6M+ archivos): devuelve conteos exactos de archivos/carpetas/bytes, top extensiones y muestras por carpeta. Soporta flat:true o format:'columnar'."},
-        {"find_files","Búsqueda instantánea (<25ms sobre 6M+ archivos) por subcadena trigrama FTS5, glob, prefijo de ruta, extensión, tamaño y mtime sin escaneos completos."},
-        {"changes_feed","Flujo auditable acotado de cambios detectados automáticamente por identidad NTFS FRN (created, modified, deleted, renamed, moved)."},
-        {"find_duplicates","Deduplicación universal de contenido sobre cualquier tipo de archivo (ZIP, DLL, ROM, PNG, PDF, código) en 3 etapas (tamaño -> 64KiB -> SHA-256 cacheado en fs_hashes) + matriz tree_overlap; omite placeholders cloud-only de OneDrive por defecto."},
-        {"verify_archive_vs_dir","Compara cada entrada de un archivo .zip contra una carpeta en disco por tamaño y CRC32 (vía libzip), ignorando sufijos configurables (ej. .git/index)."},
-        {"inspect_workspace_topology","Mapa de seguridad completo antes de reorganizar: repos Git y worktrees válidos/rotos, junctions/symlinks NTFS, archivos cloud-only OneDrive, carpetas de build regenerables anotadas con git tracked/ignored, y referencias a rutas absolutas."},
-        {"organize_plan","Planificador dry-run de reorganización: valida invariantes de seguridad (cero archivos rastreados en Git en cuarentena, cero junctions, cero colisiones), guarda snapshot base y escribe plan.jsonl."},
-        {"organize_apply","Ejecutor transaccional de organize_plan (requiere execute:true): mueve con MoveFileExW (\\\\?\\, sin sobrescritura), genera manifiesto SHA-256 antes de cuarentenar, respalda pre-edición y registra journal.jsonl con soporte resume:true."},
-        {"organize_undo","Reversión completa de organize_apply (requiere execute:true): reproduce journal.jsonl en reverso, restaura respaldos verificando SHA-256 y devuelve el árbol a su estado exacto."},
-        {"organize_verify","Auditoría independiente post-reorganización: conservación 1-a-1 raíz+cuarentena vs línea base, 100% SHA-256 del manifiesto de cuarentena e integridad HEAD/status/worktrees de todos los repos Git."},
-        {"memory","Memorias persistentes de proyecto con SQLite FTS5, espejo Markdown y rastreo FRN de archivos enlazados: action = write | read | edit | list | search | rename | delete."},
-        {"read_file","Lectura quirúrgica por rango de líneas o ventana de símbolo con sha256, detección de binarios y presupuesto de tokens."},
-        {"create_file","Crea un archivo dentro de raíces autorizadas y actualiza fs_nodes inmediatamente."},
-        {"edit_file","Edición transaccional con rollback atómico: mode = replace_content | replace_lines | insert_at_line | delete_lines | replace_in_files (literal o regex, dry_run, expected_sha256)."},
-        {"search_pattern","Buscador nativo C++23 multi-hilo (literal o regex) sobre archivos indexados con líneas de contexto, globs, descarte automático de binarios y format:'columnar'."},
-        {"get_diagnostics","Diagnósticos semánticos en tiempo real vía puente LSP híbrido (30+ lenguajes) con fallback transparente al índice nativo Roslyn/libclang."},
-        {"find_implementations","Localiza implementaciones de una interfaz/método/símbolo vía puente LSP o índice nativo."},
-        {"find_declaration","Localiza la declaración/definición exacta de un símbolo o posición (path, line, column) vía puente LSP o índice nativo."},
-        {"lsp_rename_symbol","Renombrado semántico tipado vía LSP WorkspaceEdit ejecutado a través del motor transaccional con rollback atómico de Migratool."},
-        {"restart_language_server","Reinicia limpiamente el servidor LSP de un lenguaje (o todos los del workspace) sin dejar procesos huérfanos."},
-        {"housekeep","Autoaseo y salud del catálogo: action = status (solo lectura) | run (poda telemetría/logs/claims expirados/sesiones muertas, fusiona FTS5, recicla temporales obsoletos, incremental_vacuum y wal_checkpoint) | vacuum (compactación completa y migración a auto_vacuum=INCREMENTAL). Soporta dry_run y deep."},
-        {"complete_task","Flujo completo One-Shot en 1 llamada atómica: escribe archivos en raíces target (write_files) o aplica ediciones simbólicas/AST (edits), auto-sincroniza hashes/símbolos en SQLite sin INDEX_STALE, registra mapeos (mappings o source+targets con auto_map_symbols opcional), libera claims del actor, transiciona project_tasks y opcionalmente ejecuta verify_cases."},
-        {"job_status","Estado y contadores de trabajos persistentes; id o job_id opcional."},
-        {"job_control","Pausa, resume, cancela o reintenta un trabajo propio mediante id, action y actor."},
-        {"project_settings","Consulta ajustes o modifica settings con action:set, actor y expected_config_revision."},
-        {"acquire_task","Selecciona y reclama atómicamente un pendiente; devuelve contexto y lease."},
-        {"import_existing_work","Importa por páginas evidencia externa abierta en solo lectura. external_path detecta el formato, registry_path y catalog_path lo fijan explícitamente. action:revalidate comprueba de nuevo los hashes registrados para ids de candidatos, sin importar otras filas."},
-        {"project_diagnostics","Identidad exacta de compilación, catálogo, coordinador, salud del denominador, raíces y capacidades locales."},
-        {"export_inventory","Escribe el catálogo de archivos en out con formato jsonl o json. wait:false devuelve job_id para consultar, pausar, reanudar o cancelar."},
-        {"backup_catalog","Crea una copia de seguridad consistente del catálogo SQLite en out (opcional)."},
-        {"project_context","Contexto compacto, revisión, porcentajes, development_control y próximos identificadores; no lee fuentes."},
-        {"get_task_context","Contexto quirúrgico en una llamada (admite task_id único o lote task_ids de hasta 50 unidades y outline_only:true): metadatos, esqueleto de símbolos, cuerpo exacto [offset..end_offset], callees/callers semánticos, candidatos destino y evidencia."},
-        {"inventory_sync","Sincroniza raíces autorizadas. scope.root y scope.subdirectory acotan una raíz, conservando los registros exteriores."},
-        {"query","Consulta files, symbols, symbol_body, symbols_overview, definition, diagnostics, range, references, callers, callees, implementations, type_hierarchy, impact_analysis, hybrid_search, census_directories, census_entries, directories, folder_coverage, reuse_candidates, mappings, relations, dependencies, notes, history, search, archive_members, scan_errors, code_duplicates, code_duplicate_errors, language_capabilities, claims, export_bundle, phases, project_tasks, doc_audits y module_matrix. Soporta format:'columnar' y preset:'minimal'|'agent' para ahorrar hasta 75% de tokens."},
-        {"edit_symbol","Edición simbólica transaccional con dry_run, diff, backup y rollback: replace_symbol_body, insert_before_symbol, insert_after_symbol, rename_symbol, safe_delete_symbol, ast_rewrite y apply_structural_patch."},
-        {"migration_status","Progreso declarado, verificación en casos y control de desarrollo por level: project, files, symbols, modules, phases, tasks o docs; soporta format:'columnar' y preset:'minimal'|'agent'."},
-        {"next_tasks","Lote de pendientes con rutas, dependencias, candidatos, notas y evidencia faltante."},
-        {"changes_since","Deltas desde since_revision; cursor de página ligado a la revisión actual."},
-        {"batch_update","Transacción atómica con expected_revision, reconciliación por entidad/dominio y auto_sync_touched opcional: map/mark, classify, classify_pattern, map_pattern, auto_map_symbols, note, claim_task, renew_claim, release_task, reconcile_bundle, upsert_phase, upsert_task, transition_task, delete_task, audit_doc, ast_rewrite o edición simbólica."},
-        {"verify","Ejecuta build, test, scan o coverage configurados con execute:true. En test admite case_ids."},
-        {"evidence_report","Resultados de pruebas, compilaciones, cobertura y correspondencias con estados."},
-        {"history","Historial inmutable filtrable por entity, actor, action y since_revision."},
-        {"connections","Conexiones MCP de este proyecto y estado vivo del proceso."},
-        {"statistics","Invocaciones, bytes de entrada/salida y duración medida por herramienta."}};
+        {"agent_wake","Arranque AI Agent OS (<25ms): workstreams, verificación en vivo disco/Git, frescura del árbol, alertas de knowledge, DAG ready_tasks y BM1..BM7."},
+        {"delta_since","Delta compacto entre turnos: path_lineage, checkpoints, knowledge, verified_runs y Git HEAD."},
+        {"repo_map","Mapa del repositorio con Personalized PageRank sobre símbolos y dependencias ajustado a token_budget."},
+        {"read_bundle","Lectura en lote (hasta 25 archivos/rangos) con known_sha256, FILE_MOVED_HINT y pitfalls/métodos fallidos."},
+        {"batch_edit","Edición multi-archivo durable en 7 etapas (PREPARED..COMMITTED) con snapshot SHA-256, locks, idempotency_key y run_verified."},
+        {"run_verified","Ejecutor con toolchain (env_tools), selector de tests afectados (select_tests) y destilador de errores."},
+        {"impact_analysis","Grafo de impacto (AST/dependencias, docs_hub, tests, path_lineage y pitfalls) con nivel de certeza."},
+        {"workstream","Sesiones durables: start|checkpoint|pause|handoff|resume|takeover|status|list|close|rollback|snapshot_create|snapshot_diff|snapshot_restore|message|inbox."},
+        {"knowledge","Libro mayor con verification_status (verified_fact|test_result|agent_hypothesis|unverified|stale) e invalidación FRN/SHA-256."},
+        {"docs_hub","Documentos del proyecto: index|list|outline (TOC H1-H4)|read_section|audit|link|drift_report|search."},
+        {"path_history","Linaje de rutas por FRN y escaneos: trace|timeline|moved_since|resolve|tree_scans|gaps."},
+        {"git_intel","Inteligencia Git cacheada (<5ms): summary|log|diff|status|blame|repos."},
+        {"env_tools","Inventario de toolchains del host (D:\\DevTools + PATH): summary|query|scan|doctor|bind_project|register_root|pin_tool|export_md."},
+        {"activate_workspace","Activa o inicializa en 1 llamada un directorio (workspace, archive o migration)."},
+        {"list_workspaces","Lista o poda workspaces registrados (list|prune)."},
+        {"query_workspace","Consulta de solo lectura contra otro workspace registrado."},
+        {"onboard_workspace","Orientación automática del workspace y memoria _onboarding."},
+        {"explore_tree","Exploración jerárquica (<10ms sobre 6M+ archivos): conteos, bytes y extensiones."},
+        {"find_files","Búsqueda (<25ms) por FTS5 trigrama, glob, prefijo, extensión, tamaño y mtime."},
+        {"changes_feed","Flujo de cambios detectados por identidad NTFS FRN."},
+        {"find_duplicates","Deduplicación en 3 etapas (tamaño -> 64KiB -> SHA-256) + tree_overlap."},
+        {"verify_archive_vs_dir","Compara .zip contra carpeta en disco por tamaño y CRC32."},
+        {"inspect_workspace_topology","Mapa pre-organización: Git, junctions, cloud-only y rutas."},
+        {"organize_plan","Planificador dry-run de reorganización y cuarentena con validación Git."},
+        {"organize_apply","Ejecutor WAL 2 fases de organize_plan (execute:true, cross-volume SHA-256)."},
+        {"organize_undo","Reversión idempotente de organize_apply (execute:true)."},
+        {"organize_verify","Auditoría post-organización: conservación, SHA-256 y Git."},
+        {"memory","Memorias FTS5 Markdown: write|read|edit|list|search|rename|delete."},
+        {"read_file","Lectura quirúrgica por líneas o símbolo con sha256 y FILE_MOVED_HINT."},
+        {"create_file","Crea archivo en raíz autorizada con rollback y linaje."},
+        {"edit_file","Edición transaccional: replace_content|replace_lines|insert_at_line|delete_lines|replace_in_files."},
+        {"search_pattern","Buscador C++23 multi-hilo (literal/regex) con contexto y globs."},
+        {"get_diagnostics","Diagnósticos semánticos vía LSP o índice nativo."},
+        {"find_implementations","Localiza implementaciones vía LSP o índice nativo."},
+        {"find_declaration","Localiza declaración/definición vía LSP o índice nativo."},
+        {"lsp_rename_symbol","Renombrado semántico LSP UTF-16 con validación y rollback."},
+        {"restart_language_server","Reinicia servidor LSP del workspace."},
+        {"housekeep","Autoaseo: status|run|vacuum (retención P4 de snapshots y GC de blobs)."},
+        {"session_bootstrap","Arranque de sesión de migración en 1 llamada."},
+        {"complete_task","Completa tarea de migración: edita, sincroniza, mapea y verifica."},
+        {"job_status","Estado de trabajos persistentes."},
+        {"job_control","Pausa, reanuda, cancela o reintenta un trabajo."},
+        {"project_settings","Consulta o modifica ajustes del proyecto."},
+        {"acquire_task","Reclama atómicamente una tarea pendiente con lease."},
+        {"import_existing_work","Importa evidencia externa en solo lectura."},
+        {"project_diagnostics","Diagnóstico de compilación, catálogo, raíces y LSP."},
+        {"export_inventory","Exporta catálogo en jsonl o json."},
+        {"backup_catalog","Copia consistente de catalog.sqlite."},
+        {"project_context","Contexto compacto de progreso y tareas."},
+        {"get_task_context","Contexto quirúrgico de tarea/símbolo."},
+        {"inventory_sync","Sincroniza raíces autorizadas (USN Journal + reconciliador)."},
+        {"query","Consulta indexada: files, symbols, references, mappings, phases, project_tasks, module_matrix."},
+        {"edit_symbol","Edición simbólica AST/LSP con backup y rollback."},
+        {"migration_status","Progreso por level: project|files|symbols|modules|phases|tasks|docs."},
+        {"next_tasks","Tareas pendientes con dependencias y evidencia faltante."},
+        {"changes_since","Deltas del historial desde since_revision."},
+        {"batch_update","Transacción atómica de mapeos, clasificación, claims, fases y tareas."},
+        {"verify","Ejecuta build, test, scan o coverage (execute:true)."},
+        {"evidence_report","Informe paginado de pruebas, builds, cobertura y mapeos."},
+        {"history","Historial inmutable filtrable por entity, actor, action."},
+        {"connections","Conexiones MCP y estado vivo de procesos."},
+        {"statistics","Métricas de invocaciones, bytes y latencia."}};
+
+    static const std::set<std::string> agent_os_set = {
+        "activate_workspace", "list_workspaces", "agent_wake", "delta_since", "repo_map",
+        "explore_tree", "find_files", "search_pattern", "read_bundle", "batch_edit",
+        "run_verified", "impact_analysis", "workstream", "knowledge", "docs_hub",
+        "path_history", "git_intel", "env_tools", "inspect_workspace_topology",
+        "find_duplicates", "organize_plan", "organize_apply"
+    };
 
     const Json s_str = {{"type","string"}};
     const Json s_int = {{"type","integer"}};
     const Json s_bool = {{"type","boolean"}};
-    const Json s_str_arr = {{"type","array"},{"items",{{"type","string"}}}};
-    const Json s_obj_arr = {{"type","array"},{"items",{{"type","object"}}}};
+    const Json s_obj = {{"type","object"}};
+    const Json s_arr = {{"type","array"}};
 
     auto schema_for = [&](const std::string& name) -> Json {
-        Json props = {
-            {"project",{{"type","string"},{"description","Ruta absoluta opcional al JSON del proyecto; por defecto el workspace activo."}}},
-            {"token_budget",{{"type","integer"},{"minimum",256},{"maximum",100000}}}
-        };
-        if (name == "activate_workspace") {
-            props["path"] = s_str; props["name"] = s_str; props["mode"] = {{"type","string"},{"enum",{"workspace","archive","migration"}}};
-            props["index_tier"] = {{"type","string"},{"enum",{"metadata","code","full"}}}; props["sync"] = s_bool;
-            props["full"] = s_bool; props["threads"] = s_int; props["switch_active"] = s_bool;
-        } else if (name == "list_workspaces") {
-            props["available_only"] = s_bool; props["action"] = {{"type","string"},{"enum",{"list","prune"}}};
-            props["dry_run"] = s_bool; props["prune_temp"] = s_bool;
-        } else if (name == "query_workspace") {
-            props["workspace"] = s_str; props["tool"] = s_str; props["arguments"] = {{"type","object"}};
-        } else if (name == "explore_tree") {
-            props["root"] = s_str; props["path"] = s_str; props["depth"] = {{"type","integer"},{"minimum",1},{"maximum",4}};
-            props["limit"] = {{"type","integer"},{"minimum",1},{"maximum",500}}; props["sort"] = {{"type","string"},{"enum",{"bytes","files","dirs","name","mtime"}}};
-            props["include_samples"] = s_bool; props["sample_limit"] = s_int; props["flat"] = s_bool;
-            props["extensions_limit"] = s_int; props["format"] = {{"type","string"},{"enum",{"json","columnar"}}};
-        } else if (name == "find_files") {
-            props["query"] = s_str; props["glob"] = s_str; props["ext"] = s_str; props["path_prefix"] = s_str;
-            props["root"] = s_str; props["kind"] = {{"type","string"},{"enum",{"all","file","dir","link"}}};
-            props["min_bytes"] = s_int; props["max_bytes"] = s_int; props["limit"] = s_int; props["cursor"] = s_str;
-            props["format"] = {{"type","string"},{"enum",{"json","columnar"}}};
-        } else if (name == "changes_feed") {
-            props["since_seq"] = s_int; props["since_ns"] = s_int; props["root"] = s_str; props["path_prefix"] = s_str;
-            props["ops"] = s_str_arr; props["order"] = {{"type","string"},{"enum",{"asc","desc"}}}; props["limit"] = s_int;
-        } else if (name == "find_duplicates") {
-            props["root"] = s_str; props["path_prefix"] = s_str; props["min_bytes"] = s_int; props["limit"] = s_int;
-            props["exclude_dirs"] = s_str_arr; props["skip_cloud_only"] = s_bool; props["threads"] = s_int;
-            props["refresh_hashes"] = s_bool; props["verify_strict"] = s_bool; props["persist_cache"] = s_bool;
-            props["format"] = {{"type","string"},{"enum",{"json","columnar"}}};
-        } else if (name == "verify_archive_vs_dir") {
-            props["zip"] = s_str; props["target_dir"] = s_str; props["ignore_suffixes"] = s_str_arr; props["sample_limit"] = s_int;
-        } else if (name == "inspect_workspace_topology") {
-            props["root"] = s_str; props["inspect_git"] = s_bool; props["scan_path_refs"] = s_bool;
-        } else if (name == "organize_plan") {
-            props["plan_id"] = s_str; props["root"] = s_str; props["quarantine_dir"] = s_str;
-            props["operations"] = s_obj_arr; props["protected_paths"] = s_str_arr; props["allow_git_tracked"] = s_bool;
-        } else if (name == "organize_apply") {
-            props["plan_id"] = s_str; props["execute"] = s_bool; props["resume"] = s_bool; props["sync_after"] = s_bool;
-        } else if (name == "organize_undo") {
-            props["plan_id"] = s_str; props["execute"] = s_bool; props["sync_after"] = s_bool;
-        } else if (name == "organize_verify") {
-            props["plan_id"] = s_str;
-        } else if (name == "memory") {
-            props["action"] = {{"type","string"},{"enum",{"write","read","edit","list","search","rename","delete"}}};
-            props["name"] = s_str; props["content"] = s_str; props["query"] = s_str; props["new_name"] = s_str;
-            props["tags"] = s_str_arr; props["linked_paths"] = s_str_arr; props["actor"] = s_str;
-        } else if (name == "read_file" || name == "create_file" || name == "edit_file") {
-            props["path"] = s_str; props["start_line"] = s_int; props["end_line"] = s_int; props["symbol"] = s_str;
-            props["content"] = s_str; props["mode"] = s_str; props["target"] = s_str; props["replacement"] = s_str;
-            props["expected_sha256"] = s_str; props["dry_run"] = s_bool; props["actor"] = s_str;
-        } else if (name == "search_pattern") {
-            props["pattern"] = s_str; props["is_regex"] = s_bool; props["path_prefix"] = s_str;
-            props["include_glob"] = s_str; props["exclude_glob"] = s_str; props["context_lines"] = s_int;
-            props["limit"] = s_int; props["format"] = {{"type","string"},{"enum",{"json","columnar"}}};
-        } else if (name == "get_diagnostics" || name == "find_implementations" || name == "find_declaration" || name == "lsp_rename_symbol" || name == "restart_language_server") {
-            props["path"] = s_str; props["symbol"] = s_str; props["line"] = s_int; props["column"] = s_int;
-            props["new_name"] = s_str; props["language"] = s_str; props["dry_run"] = s_bool;
-        } else if (name == "housekeep") {
-            props["action"] = {{"type","string"},{"enum",{"status","run","vacuum"}}}; props["dry_run"] = s_bool; props["deep"] = s_bool;
-        } else if (name == "inventory_sync") {
-            props["full"] = s_bool; props["wait"] = s_bool; props["root"] = s_str; props["threads"] = s_int;
-            props["scope"] = {{"type","object"}}; props["tier"] = s_str;
-        } else if (name == "export_inventory" || name == "backup_catalog") {
-            props["out"] = {{"type","string"},{"minLength",1}};
-            if (name == "export_inventory") { props["format"] = {{"type","string"},{"enum",{"jsonl","json"}}}; props["wait"] = s_bool; }
-            else props["destination"] = {{"type","string"},{"minLength",1}};
-        } else if (name == "import_existing_work") {
-            props["ids"] = {{"type","array"},{"items",{{"type","integer"},{"minimum",1}}},{"minItems",1},{"maxItems",1000}};
-            for (const auto* f : {"external_path","registry_path","catalog_path","base_directory","prefix","action"}) props[f] = s_str;
-            for (const auto* f : {"verify","verify_inputs","verify_outputs"}) props[f] = s_bool;
-            props["offset"] = {{"type","integer"},{"minimum",0}}; props["limit"] = s_int;
-        } else if (name == "verify") {
-            props["action"] = s_str; props["execute"] = s_bool; props["case_ids"] = {{"type","array"},{"items",{{"type","string"},{"minLength",1}}}};
-        } else {
-            // Code/migration tools: compact shared subset (additionalProperties:true keeps full compatibility)
-            for (const auto* f : {"kind","text","id","task_id","symbol","file","root","role","language","category","detail","actor","action","entity","cursor","format","level","op","new_body","new_name","path_prefix","extension","disposition","stage","ast_pattern"}) props[f] = s_str;
-            for (const auto* f : {"limit","since_revision","expected_revision","depth"}) props[f] = s_int;
-            for (const auto* f : {"full","execute","dry_run","include_body","outline_only","auto_sync_touched","auto_map_symbols","wait"}) props[f] = s_bool;
-            for (const auto* f : {"fields","task_ids","ids","targets","verify_cases"}) props[f] = s_str_arr;
-            for (const auto* f : {"operations","queries","mappings","write_files","edits"}) props[f] = s_obj_arr;
-            props["preset"] = {{"type","string"},{"enum",{"minimal","agent","full"}}};
-        }
-        return {{"type","object"},{"properties",std::move(props)},{"additionalProperties",true}};
+        Json p = {{"project",s_str}};
+        if (name == "agent_wake") { p["actor"]=s_str; p["upsert_tasks"]=s_arr; }
+        else if (name == "delta_since") { p["since_iso"]=s_str; p["since_lineage_id"]=s_int; }
+        else if (name == "repo_map") { p["focus_files"]=s_arr; p["token_budget"]=s_int; }
+        else if (name == "read_bundle") { p["items"]=s_arr; p["paths"]=s_arr; p["outline_only"]=s_bool; }
+        else if (name == "batch_edit") { p["edits"]=s_arr; p["workstream_id"]=s_str; p["idempotency_key"]=s_str; p["run_verified"]=s_bool; }
+        else if (name == "run_verified") { p["action"]=s_str; p["command"]=s_arr; p["recipe"]=s_str; p["auto_select_tests"]=s_bool; p["touched_paths"]=s_arr; }
+        else if (name == "impact_analysis") { p["path"]=s_str; p["symbol"]=s_str; }
+        else if (name == "workstream") { p["action"]=s_str; p["workstream_id"]=s_str; p["title"]=s_str; p["goal"]=s_str; p["planned_files"]=s_arr; p["resolution"]=s_str; p["idempotency_key"]=s_str; }
+        else if (name == "knowledge") { p["action"]=s_str; p["id"]=s_str; p["kind"]=s_str; p["title"]=s_str; p["summary"]=s_str; p["outcome"]=s_str; p["verification_status"]=s_str; p["files"]=s_arr; p["query"]=s_str; }
+        else if (name == "docs_hub") { p["action"]=s_str; p["path"]=s_str; p["anchor"]=s_str; p["query"]=s_str; p["code_paths"]=s_arr; }
+        else if (name == "path_history") { p["action"]=s_str; p["path"]=s_str; p["frn"]=s_int; p["limit"]=s_int; }
+        else if (name == "git_intel") { p["action"]=s_str; p["path"]=s_str; p["limit"]=s_int; p["staged"]=s_bool; }
+        else if (name == "env_tools") { p["action"]=s_str; p["query"]=s_str; p["tool_key"]=s_str; p["root_path"]=s_str; p["recipe"]=s_str; }
+        else if (name == "activate_workspace") { p["path"]=s_str; p["mode"]=s_str; p["sync"]=s_bool; }
+        else if (name == "list_workspaces") { p["available_only"]=s_bool; p["action"]=s_str; }
+        else if (name == "query_workspace") { p["workspace"]=s_str; p["tool"]=s_str; p["arguments"]=s_obj; }
+        else if (name == "explore_tree") { p["root"]=s_str; p["path"]=s_str; p["depth"]=s_int; p["limit"]=s_int; }
+        else if (name == "find_files") { p["query"]=s_str; p["glob"]=s_str; p["ext"]=s_str; p["limit"]=s_int; }
+        else if (name == "changes_feed") { p["since_seq"]=s_int; p["limit"]=s_int; }
+        else if (name == "find_duplicates") { p["root"]=s_str; p["min_bytes"]=s_int; p["limit"]=s_int; }
+        else if (name == "verify_archive_vs_dir") { p["zip"]=s_str; p["target_dir"]=s_str; }
+        else if (name == "inspect_workspace_topology") { p["root"]=s_str; p["inspect_git"]=s_bool; }
+        else if (name == "organize_plan") { p["plan_id"]=s_str; p["root"]=s_str; p["operations"]=s_arr; }
+        else if (name == "organize_apply" || name == "organize_undo" || name == "organize_verify") { p["plan_id"]=s_str; p["execute"]=s_bool; }
+        else if (name == "memory") { p["action"]=s_str; p["name"]=s_str; p["content"]=s_str; p["query"]=s_str; }
+        else if (name == "read_file" || name == "create_file" || name == "edit_file") { p["path"]=s_str; p["start_line"]=s_int; p["end_line"]=s_int; p["content"]=s_str; p["mode"]=s_str; p["needle"]=s_str; p["replacement"]=s_str; }
+        else if (name == "search_pattern") { p["pattern"]=s_str; p["is_regex"]=s_bool; p["path_prefix"]=s_str; p["limit"]=s_int; }
+        else if (name == "get_diagnostics" || name == "find_implementations" || name == "find_declaration" || name == "lsp_rename_symbol") { p["path"]=s_str; p["symbol"]=s_str; p["line"]=s_int; p["new_name"]=s_str; }
+        else if (name == "housekeep") { p["action"]=s_str; p["dry_run"]=s_bool; }
+        else if (name == "inventory_sync") { p["full"]=s_bool; p["wait"]=s_bool; }
+        else if (name == "verify") { p["action"]=s_str; p["execute"]=s_bool; p["case_ids"]=s_arr; }
+        else if (name == "query") { p["kind"]=s_str; p["text"]=s_str; p["id"]=s_str; p["limit"]=s_int; p["cursor"]=s_str; }
+        else if (name == "migration_status" || name == "next_tasks" || name == "evidence_report") { p["level"]=s_str; p["limit"]=s_int; p["cursor"]=s_str; }
+        else if (name == "get_task_context") { p["task_id"]=s_str; p["task_ids"]=s_arr; p["outline_only"]=s_bool; }
+        else if (name == "complete_task" || name == "batch_update") { p["actor"]=s_str; p["expected_revision"]=s_int; p["operations"]=s_arr; }
+        else if (name == "edit_symbol") { p["action"]=s_str; p["id"]=s_str; p["new_body"]=s_str; }
+        else if (name == "changes_since" || name == "history") { p["since_revision"]=s_int; p["entity"]=s_str; p["limit"]=s_int; }
+        else if (name == "job_status" || name == "job_control") { p["id"]=s_str; p["action"]=s_str; }
+        else if (name == "import_existing_work") { p["action"]=s_str; p["external_path"]=s_str; p["registry_path"]=s_str; p["catalog_path"]=s_str; p["ids"]={{"type","array"},{"items",s_int}}; }
+        return {{"type","object"},{"properties",std::move(p)}};
     };
 
     Json tools=Json::array();
     for(const auto& [name,description]:definitions){
-        const bool mutating = name=="inventory_sync"||name=="batch_update"||name=="edit_symbol"||name=="complete_task"||name=="verify"||
+        if (prof == "agent-os" && !agent_os_set.contains(name)) continue;
+        const bool mutating =
+            name=="inventory_sync"||name=="batch_update"||name=="edit_symbol"||name=="complete_task"||name=="verify"||
             name=="job_control"||name=="project_settings"||name=="acquire_task"||name=="import_existing_work"||name=="export_inventory"||
             name=="backup_catalog"||name=="activate_workspace"||name=="onboard_workspace"||name=="create_file"||name=="edit_file"||
             name=="lsp_rename_symbol"||name=="restart_language_server"||name=="memory"||name=="housekeep"||
-            name=="find_duplicates"||name=="organize_plan"||name=="organize_apply"||name=="organize_undo"||name=="list_workspaces";
-        const bool destructive = name=="edit_file"||name=="edit_symbol"||name=="lsp_rename_symbol"||name=="complete_task"||
-            name=="batch_update"||name=="organize_apply"||name=="organize_undo"||name=="housekeep"||name=="memory"||name=="list_workspaces";
+            name=="find_duplicates"||name=="organize_plan"||name=="organize_apply"||name=="organize_undo"||name=="list_workspaces"||
+            name=="batch_edit"||name=="run_verified"||name=="workstream"||name=="knowledge"||name=="docs_hub"||name=="env_tools";
+        const bool destructive =
+            name=="edit_file"||name=="edit_symbol"||name=="lsp_rename_symbol"||name=="complete_task"||
+            name=="batch_update"||name=="organize_apply"||name=="organize_undo"||name=="housekeep"||name=="memory"||
+            name=="list_workspaces"||name=="batch_edit"||name=="workstream";
         tools.push_back({{"name",name},{"description",description},{"inputSchema",schema_for(name)},
-            {"annotations",{{"readOnlyHint",!mutating},{"destructiveHint",destructive},{"idempotentHint",name!="batch_update"&&name!="edit_symbol"&&name!="complete_task"&&name!="export_inventory"&&name!="organize_apply"&&name!="organize_undo"},{"openWorldHint",name=="verify"||name=="complete_task"}}}});
+            {"annotations",{{"readOnlyHint",!mutating},{"destructiveHint",destructive}}}});
     }
     return tools;
 }

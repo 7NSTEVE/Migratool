@@ -3,6 +3,7 @@
 #include "migratool/live.hpp"
 #include "migratool/workspace_registry.hpp"
 #include "migratool/lsp_client.hpp"
+#include "migratool/env_registry.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <iostream>
@@ -24,9 +25,29 @@ bool is_read_only_mcp_tool(const std::string& name, const Json& args) {
         "project_diagnostics", "next_tasks", "evidence_report", "history",
         "changes_since", "statistics", "connections", "get_task_context",
         "query_workspace", "job_status",
-        "get_diagnostics", "find_implementations", "find_declaration"
+        "get_diagnostics", "find_implementations", "find_declaration",
+        "delta_since", "repo_map", "read_bundle", "impact_analysis", "path_history", "git_intel"
     };
     if (ro_tools.contains(name)) return true;
+    if (name == "env_tools") {
+        std::string act = args.value("action", args.value("op", "summary"));
+        return act == "summary" || act == "query" || act == "doctor" || act == "export_md";
+    }
+    if (name == "docs_hub") {
+        std::string act = args.value("action", args.value("op", "list"));
+        return act != "index" && act != "link";
+    }
+    if (name == "knowledge") {
+        std::string act = args.value("action", args.value("op", "list"));
+        return act == "list" || act == "search" || act == "get" || act == "for_files" || act == "warnings";
+    }
+    if (name == "workstream") {
+        std::string act = args.value("action", args.value("op", "status"));
+        return act == "list" || act == "inbox" || act == "snapshot_diff";
+    }
+    if (name == "run_verified") {
+        return args.value("action", "run") == "select_tests";
+    }
     if (name == "find_duplicates") {
         // Read-only only when persist_cache is disabled; default writes to fs_hashes
         return !args.value("persist_cache", true);
@@ -51,10 +72,10 @@ bool is_read_only_mcp_tool(const std::string& name, const Json& args) {
 } // namespace
 
 int mcp_server(const Project& initial_project) {
-    return mcp_server(std::optional<Project>(initial_project));
+    return mcp_server(std::optional<Project>(initial_project), "full");
 }
 
-int mcp_server(const std::optional<Project>& initial_project) {
+int mcp_server(const std::optional<Project>& initial_project, const std::string& profile) {
     // MCP stdio: negociación explícita + modo projectless opcional + pool concurrente de lecturas WAL (hasta 4 simultáneas).
     const std::set<std::string> supported = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"};
     std::mutex output_mutex, state_mutex;
@@ -156,23 +177,22 @@ int mcp_server(const std::optional<Project>& initial_project) {
                     {"capabilities", {{"tools", {{"listChanged", false}}}}},
                     {"serverInfo", {{"name", "migratool"}, {"version", build_identity()["version"]}}},
                     {"instructions",
-                     "Migratool v2.1 (Ultra-Escala 6M+ archivos + Organización/Deduplicación Transaccional + Workspace/LSP + Migraciones). "
-                     "Para explorar millones de archivos: activate_workspace (modo archive/workspace sin ensuciar la raíz), explore_tree (flat/columnar), find_files y changes_feed. "
-                     "Para ordenar y deduplicar directorios masivos: inspect_workspace_topology, find_duplicates, verify_archive_vs_dir, organize_plan, organize_apply (execute:true, SHA-256 + journal), organize_verify y organize_undo. "
-                     "Para código y migraciones: onboard_workspace, memory, read_file, edit_file, search_pattern, LSP, session_bootstrap, get_task_context y complete_task. "
-                     "Lecturas concurrentes habilitadas (hasta 4 en paralelo sobre SQLite WAL)."}
+                     "Migratool v3.0 — AI Agent Project OS (Continuidad de Sesiones 7 etapas + Libro Mayor Epistémico + Docs Hub + Linaje FRN + Inventario Host D:\\DevTools + Ultra-Escala 6M+ archivos + Organización Transaccional WAL + LSP + Migraciones). "
+                     "Flujo recomendado (3-4 llamadas por tarea): agent_wake (arranque con verificación viva disco/Git, workstreams, alertas knowledge y cola DAG) -> repo_map / read_bundle (hasta 25 archivos con dedup known_sha256 y pitfalls) -> batch_edit (7 etapas PREPARED..COMMITTED con snapshot e idempotency_key) -> run_verified (inyección toolchain env_tools + select_tests + destilador de errores). "
+                     "Perfiles MCP: --profile agent-os (~7.5 KB, -89% tokens esquema/turno) y --profile full (~18.2 KB, -73%). "
+                     "env_tools funciona con o sin proyecto activo. Lecturas concurrentes habilitadas (hasta 4 en paralelo sobre SQLite WAL)."}
                 });
                 continue;
             }
             if (method == "ping") { response(id, Json::object()); continue; }
             if (!initialized) { error(id, -32000, "Initialize requerido"); continue; }
             if (!ready) { error(id, -32000, "Falta notifications/initialized"); continue; }
-            if (method == "tools/list") { response(id, {{"tools", agent_tools()}}); continue; }
+            if (method == "tools/list") { response(id, {{"tools", agent_tools(profile)}}); continue; }
             if (method != "tools/call") { error(id, -32601, "Método no implementado: " + method); continue; }
 
             auto name = params.at("name").get<std::string>();
             bool known = false;
-            for (const auto& tool : agent_tools()) if (tool["name"] == name) { known = true; break; }
+            for (const auto& tool : agent_tools("full")) if (tool["name"] == name) { known = true; break; }
             if (!known) { error(id, -32602, "Herramienta desconocida: " + name); continue; }
 
             auto arguments = params.value("arguments", Json::object());
@@ -249,6 +269,8 @@ int mcp_server(const std::optional<Project>& initial_project) {
                         result = tool_list_workspaces(arguments);
                     } else if (name == "query_workspace") {
                         result = tool_query_workspace(arguments, [](const std::string& m) { std::cerr << m << '\n'; }, token.get());
+                    } else if (name == "env_tools" && default_project_snapshot.empty() && !arguments.contains("project")) {
+                        result = tool_env_tools(std::nullopt, arguments);
                     } else {
                         fs::path selected = default_project_snapshot;
                         if (arguments.contains("project")) {

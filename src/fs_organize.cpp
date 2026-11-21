@@ -1,5 +1,6 @@
 #include "migratool/fs_organize.hpp"
 #include "migratool/fs_index.hpp"
+#include "migratool/path_lineage.hpp"
 #include "digest.hpp"
 
 #include <zip.h>
@@ -1992,6 +1993,11 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
                 {"created_dirs", created}
             }.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
             jfh.flush();
+            try {
+                record_path_event(db, 1, query_path_frn(dst), "file", "quarantine",
+                                  op.value("src_rel", path_text(src)), path_text(dst), sz,
+                                  "organize_apply", "fs_organize", "exact_transactional", "", h, h, plan_id);
+            } catch (...) {}
         } else if (kind == "move_dir" || kind == "move_file") {
             const fs::path src(wide(op.at("src").get<std::string>()));
             const fs::path dst(wide(op.at("dst").get<std::string>()));
@@ -2038,6 +2044,11 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
                 {"created_dirs", created}, {"moved_files", std::move(moved_files)}
             }.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
             jfh.flush();
+            try {
+                record_path_event(db, 1, query_path_frn(dst), (kind == "move_dir") ? "dir" : "file", "move",
+                                  op.value("src_rel", path_text(src)), op.value("dst_rel", path_text(dst)), 0,
+                                  "organize_apply", "fs_organize", "exact_transactional", "", "", "", plan_id);
+            } catch (...) {}
         } else if (kind == "rmdir_empty_tree") {
             const fs::path src(wide(op.at("src").get<std::string>()));
             if (!is_confined_within(src, root_path, false)) {

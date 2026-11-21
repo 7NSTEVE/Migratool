@@ -1,6 +1,12 @@
 #include "migratool/core.hpp"
 #include "migratool/gateway.hpp"
 #include "migratool/scale.hpp"
+#include "migratool/agent_supertools.hpp"
+#include "migratool/docs_hub.hpp"
+#include "migratool/git_intel.hpp"
+#include "migratool/knowledge.hpp"
+#include "migratool/path_lineage.hpp"
+#include "migratool/workstream.hpp"
 #include <sqlite3.h>
 #include <objbase.h>
 #include <xmllite.h>
@@ -822,6 +828,34 @@ void report(const Project& p,const fs::path& output,bool check_fresh) {
         st["project_tasks"]=tk?tk->value("items",Json::array()):Json::array();
         st["doc_audits"]=dc?dc->value("items",Json::array()):Json::array();
         st["module_matrix"]=scale_module_matrix(p,db,{{"limit",1000}}).value("items",Json::array());
+        try {
+            workstream_schema(db);
+            knowledge_schema(db);
+            docs_hub_schema(db);
+            runs_telemetry_schema(db);
+            Json git_s = git_repo_summary_cached(p, db);
+            auto last_scan = db.query("SELECT COALESCE(MAX(last_full_scan_at),'') AS ts FROM fs_roots");
+            const int64_t ws_open = db.integer("SELECT COUNT(*) FROM agent_workstreams WHERE status IN('active','paused','handed_off','interrupted_recoverable')");
+            const int64_t ws_interrupted = db.integer("SELECT COUNT(*) FROM agent_workstreams WHERE status='interrupted_recoverable'");
+            const int64_t kn_total = db.integer("SELECT COUNT(*) FROM knowledge_entries");
+            const int64_t docs_total = db.integer("SELECT COUNT(*) FROM project_docs");
+            const int64_t tok_saved = db.integer("SELECT COALESCE(SUM(tokens_saved_est),0) FROM efficiency_telemetry");
+            const int64_t calls_saved = db.integer("SELECT COALESCE(SUM(native_calls_saved),0) FROM efficiency_telemetry");
+            const int64_t sha_skipped = db.integer("SELECT COALESCE(SUM(files_skipped_by_sha256),0) FROM efficiency_telemetry");
+            st["agent_os"] = {
+                {"git_branch", git_s.value("branch", "")},
+                {"git_head", git_s.value("head_commit", "")},
+                {"git_dirty", git_s.value("dirty", false)},
+                {"last_full_tree_scan_at", last_scan.empty() ? "" : last_scan[0].value("ts", "")},
+                {"workstreams_open", ws_open},
+                {"workstreams_interrupted", ws_interrupted},
+                {"knowledge_entries", kn_total},
+                {"docs_hub_indexed", docs_total},
+                {"BM2_tokens_saved_est", tok_saved},
+                {"BM3_native_calls_saved", calls_saved},
+                {"BM5_files_skipped_sha256", sha_skipped}
+            };
+        } catch (...) {}
     }
     const auto dc_obj=st.value("development_control",Json::object());
     std::ostringstream out;
@@ -856,6 +890,17 @@ void report(const Project& p,const fs::path& output,bool check_fresh) {
     out<<"<div class=card><div class=value>"<<dc_obj.value("phases_completed",int64_t(0))<<" / "<<dc_obj.value("phases_total",int64_t(0))<<"</div>Fases completadas</div>"
        <<"<div class=card><div class=value>"<<dc_obj.value("tasks_completed",int64_t(0))<<" / "<<dc_obj.value("tasks_total",int64_t(0))<<"</div>Tareas completadas<br><small>"<<dc_obj.value("tasks_half_done",int64_t(0))<<" a medias · "<<dc_obj.value("tasks_in_progress",int64_t(0))<<" en curso</small></div>"
        <<"<div class=card><div class=value>"<<dc_obj.value("documentation_reviewed",int64_t(0))<<" / "<<dc_obj.value("documentation_files",int64_t(0))<<"</div>Documentos revisados<br><small>"<<dc_obj.value("documentation_stale",int64_t(0))<<" obsoletos</small></div>";
+    if (st.contains("agent_os") && st["agent_os"].is_object()) {
+        const auto& ao = st["agent_os"];
+        const std::string ghead = ao.value("git_head", "");
+        const std::string gshort = ghead.size() > 10 ? ghead.substr(0, 10) : (ghead.empty() ? "sin repo" : ghead);
+        const std::string gbr = ao.value("git_branch", "");
+        const std::string lscan = ao.value("last_full_tree_scan_at", "");
+        out<<"<div class=card><div class=value>"<<html(gshort)<<"</div>Git ("<<html(gbr.empty()?"-":gbr)<<")<br><small>"<<(ao.value("git_dirty",false)?"Cambios sin commit":"Árbol limpio")<<"</small></div>"
+           <<"<div class=card><div class=value>"<<ao.value("workstreams_open",int64_t(0))<<"</div>Workstreams abiertos<br><small>"<<ao.value("workstreams_interrupted",int64_t(0))<<" interrumpidos recuperables</small></div>"
+           <<"<div class=card><div class=value>"<<ao.value("knowledge_entries",int64_t(0))<<" / "<<ao.value("docs_hub_indexed",int64_t(0))<<"</div>Conocimiento / Docs Hub<br><small>Último escaneo: "<<html(lscan.empty()?"sin registro":lscan)<<"</small></div>"
+           <<"<div class=card><div class=value>"<<ao.value("BM2_tokens_saved_est",int64_t(0))<<"</div>Tokens ahorrados (BM2)<br><small>"<<ao.value("BM3_native_calls_saved",int64_t(0))<<" llamadas evitadas · "<<ao.value("BM5_files_skipped_sha256",int64_t(0))<<" dedup SHA-256</small></div>";
+    }
     out<<"</div><h2>Archivos y pendientes</h2><input id=filter placeholder='Filtrar por ruta, estado, lenguaje o nota' aria-label='Filtrar archivos'><table id=files><thead><tr><th>Origen exacto</th><th>Destino exacto</th><th>% migrado declarado</th><th>Estado / etapa / autor</th><th>Falta / nota</th></tr></thead><tbody>";
     for(const auto& f:st["files"]) {
         const auto stage_s=f.contains("stage")&&f["stage"].is_string()?f["stage"].get<std::string>():std::string();

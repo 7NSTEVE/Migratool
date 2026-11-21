@@ -1,5 +1,8 @@
 #include "migratool/file_toolkit.hpp"
 #include "migratool/fs_index.hpp"
+#include "migratool/knowledge.hpp"
+#include "migratool/path_lineage.hpp"
+#include "migratool/workstream.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -114,7 +117,22 @@ Json tool_read_file(const Project& p, Database& db, const Json& args) {
     const std::string raw_path = args.value("path", args.value("file", ""));
     const std::string req_root = args.value("root", "");
     std::string rkey, rel;
-    fs::path abs_path = resolve_authorized_path(p, raw_path, req_root, true, &rkey, &rel);
+    fs::path abs_path;
+    try {
+        abs_path = resolve_authorized_path(p, raw_path, req_root, true, &rkey, &rel);
+    } catch (const std::exception& e) {
+        const std::string msg = e.what();
+        if (msg.find("FILE_NOT_FOUND") != std::string::npos || msg.find("Archivo no existe") != std::string::npos) {
+            auto hint = resolve_moved_hint(p, db, raw_path);
+            if (hint.is_object() && hint.value("found", false)) {
+                throw std::runtime_error(msg + " [FILE_MOVED_HINT: current_path='" +
+                                         hint.value("current_path", "") + "' frn=" +
+                                         std::to_string(hint.value("frn", uint64_t{0})) +
+                                         " confidence=" + hint.value("confidence", "exact_transactional") + "]");
+            }
+        }
+        throw;
+    }
 
     const size_t max_read = std::clamp<size_t>(args.value("max_bytes", size_t(4 * 1024 * 1024)), 1024, 32 * 1024 * 1024);
     const std::string content = read_text(abs_path, max_read);
@@ -223,6 +241,15 @@ Json tool_create_file(const Project& p, Database& db, const Json& args) {
         fs_sync_single_path(p, db, abs_path, true);
         if (args.value("inject_db_failure", false)) {
             throw std::runtime_error("INJECTED_DB_FAILURE_FOR_ROLLBACK_TEST");
+        }
+        const uint64_t new_frn = query_path_frn(abs_path);
+        const std::string prev_sha = existed_before ? sha256(prev_content) : "";
+        record_path_event(db, 1, new_frn, "file", existed_before ? "modify" : "create", rel, rel,
+                          static_cast<int64_t>(content.size()), actor, "create_file", "exact_transactional",
+                          "", prev_sha, digest);
+        workstream_auto_record_touch(p, db, rel, new_frn, prev_sha, digest, actor);
+        if (existed_before) {
+            knowledge_invalidate_for_path(db, new_frn, rel, digest);
         }
         rev = db.change(actor, "create_file", {{"root", rkey}, {"path", rel}, {"bytes", content.size()}, {"sha256", digest}}, rel);
         db.commit();
@@ -418,6 +445,12 @@ Json tool_edit_file(const Project& p, Database& db, const Json& args) {
         tx_active = true;
         for (const auto& pl : plans) {
             fs_sync_single_path(p, db, pl.abs_path, true);
+            const uint64_t frn = query_path_frn(pl.abs_path);
+            record_path_event(db, 1, frn, "file", "modify", pl.rel_path, pl.rel_path,
+                              static_cast<int64_t>(pl.updated.size()), actor, "edit_file", "exact_transactional",
+                              "", pl.old_sha, pl.new_sha);
+            workstream_auto_record_touch(p, db, pl.rel_path, frn, pl.old_sha, pl.new_sha, actor);
+            knowledge_invalidate_for_path(db, frn, pl.rel_path, pl.new_sha);
             applied.push_back({{"root", pl.root_key}, {"path", pl.rel_path}, {"replacements", pl.replacements},
                                {"old_sha256", pl.old_sha}, {"new_sha256", pl.new_sha}});
         }

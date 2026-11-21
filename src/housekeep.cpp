@@ -1,6 +1,7 @@
 #include "migratool/housekeep.hpp"
 #include "migratool/fs_index.hpp"
 #include "migratool/live.hpp"
+#include "migratool/workstream.hpp"
 #include <shellapi.h>
 #include <algorithm>
 #include <chrono>
@@ -522,6 +523,14 @@ Json housekeep_run(const Project& p, Database& db, const Json& args, bool backgr
     Json reg_res = Json::object();
     try { reg_res = housekeep_registry(args, dry_run); } catch (const std::exception& e) { reg_res["error"] = e.what(); }
 
+    // P4 Workstream snapshot retention (never prunes pinned or active/interrupted workstream snapshots; GC unreferenced blobs to Recycle Bin)
+    Json ws_snap_res = Json::object();
+    try {
+        ws_snap_res = workstream_prune_ephemeral_snapshots(p, db, args.value("keep_ephemeral_snapshots", 20), backup_retention_days, dry_run);
+    } catch (const std::exception& e) {
+        ws_snap_res["error"] = e.what();
+    }
+
     const int64_t db_bytes_after = file_size_safe(db_path);
     const int64_t wal_bytes_after = file_size_safe(wal_path);
     const int64_t freelist_after = db.integer("PRAGMA freelist_count");
@@ -559,6 +568,7 @@ Json housekeep_run(const Project& p, Database& db, const Json& args, bool backgr
         {"pruned", std::move(pruned)},
         {"fts_maintenance", std::move(fts_ops)},
         {"stale_state_files", {{"count", swept_count}, {"bytes", swept_bytes}, {"items", std::move(swept_items)}}},
+        {"workstream_snapshots", std::move(ws_snap_res)},
         {"registry", std::move(reg_res)}
     };
 }

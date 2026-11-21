@@ -99,7 +99,8 @@ uint64_t send_responsive(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, uint64_t max
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     check(ok != 0, "GUI respondió sin colgarse a mensaje " + std::to_string(msg));
     check(ms <= static_cast<long long>(max_ms),
-          "Interacción GUI <= " + std::to_string(max_ms) + " ms (observado=" + std::to_string(ms) + " ms)");
+          "Interacción GUI (msg=" + std::to_string(msg) + ", wp=" + std::to_string(static_cast<unsigned long long>(wp)) +
+          ") <= " + std::to_string(max_ms) + " ms (observado=" + std::to_string(ms) + " ms)");
     return static_cast<uint64_t>(ms);
 }
 
@@ -486,6 +487,22 @@ int wmain(int argc, wchar_t** argv) {
         wait_until([&] { return listview_count(lv) >= 10; }, "Página 0 muestra filas incluyendo development_control");
         Sleep(100);
         save_window_png(main_hwnd, evidence_dir / L"00-estado-proyecto.png");
+
+        // M5: Verify the 5 new AI Agent OS views (25..29) render cleanly within <= 200 ms and capture PNGs
+        const std::vector<std::pair<int, const wchar_t*>> v3_pages = {
+            {1025, L"25-sesiones-workstreams.png"},
+            {1026, L"26-linaje-rutas.png"},
+            {1027, L"27-conocimiento-metodos.png"},
+            {1028, L"28-documentos-proyecto.png"},
+            {1029, L"29-lenguajes-herramientas.png"}
+        };
+        for (const auto& [cmd_id, png_name] : v3_pages) {
+            send_responsive(main_hwnd, WM_COMMAND, static_cast<WPARAM>(cmd_id), 0, 200);
+            wait_until([&] { return listview_count(lv) >= 1; },
+                       "Vista v3.0 " + std::to_string(cmd_id - 1000) + " cargó filas en ListView");
+            Sleep(60);
+            save_window_png(main_hwnd, evidence_dir / png_name);
+        }
 
         // Close GUI cleanly
         PostMessageW(main_hwnd, WM_CLOSE, 0, 0);

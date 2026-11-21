@@ -1,6 +1,13 @@
 #include "migratool/scale_view.hpp"
 #include "migratool/scale.hpp"
 #include "migratool/ui.hpp"
+#include "migratool/agent_supertools.hpp"
+#include "migratool/docs_hub.hpp"
+#include "migratool/env_registry.hpp"
+#include "migratool/git_intel.hpp"
+#include "migratool/knowledge.hpp"
+#include "migratool/path_lineage.hpp"
+#include "migratool/workstream.hpp"
 #include <commctrl.h>
 #include <condition_variable>
 #include <mutex>
@@ -8,6 +15,7 @@
 #include <deque>
 #include <shellapi.h>
 #include <map>
+#include <set>
 #include <cstdio>
 #include <windowsx.h>
 
@@ -69,7 +77,14 @@ std::wstring label(const std::string& key){
         {"lines",L"Líneas"},{"lines_covered",L"Líneas cubiertas"},{"branches",L"Ramas"},{"branches_covered",L"Ramas cubiertas"},
         {"observed_files_per_second",L"Velocidad"},{"eta_seconds",L"Tiempo estimado"},{"discovered_entries",L"Entradas"},
         {"errors_count",L"Errores"},{"excluded_entries",L"Excluidas"},{"coverage_cause",L"Estado y causa"},
-        {"last_scanned",L"Último recorrido"},{"link_target",L"Destino del enlace"}
+        {"last_scanned",L"Último recorrido"},{"link_target",L"Destino del enlace"},
+        {"workstream_id",L"Workstream"},{"owner_actor",L"Agente"},{"verification_badge",L"Verificación"},
+        {"current_step",L"Paso actual"},{"base_snapshot_id",L"Snapshot base"},{"confidence",L"Confianza"},
+        {"old_path",L"Ruta anterior"},{"new_path",L"Ruta actual"},{"node_kind",L"Nodo"},{"op",L"Operación"},
+        {"outcome",L"Resultado"},{"verification_status",L"Estado epistemológico"},{"summary",L"Resumen"},
+        {"doc_key",L"Documento"},{"authority",L"Autoridad"},{"section_count",L"Secciones"},{"line_count",L"Líneas"},
+        {"tool_key",L"Herramienta"},{"command",L"Comando"},{"version",L"Versión"},{"exe_path",L"Ruta preferida"},
+        {"diagnostic_code",L"Diagnóstico"},{"env_recipe",L"Receta"},{"at_iso",L"Fecha y hora UTC"},{"verified_at",L"Verificado (UTC)"}
     };
     const auto found=names.find(key);return found==names.end()?wide(key):found->second;
 }
@@ -81,7 +96,7 @@ struct ScaleView::Impl {
     bool filters_visible=false,reading=false,replacing_rows=false,include_non_source=false,keep_context=false;double split=.5;RECT split_bounds{};bool dragging=false,stacked=false,single_pane=false;
     int depth=2,dev_kind=0;
     std::optional<Project> project;Json rows=Json::array(),target_rows=Json::array();std::vector<std::string> columns,target_columns,root_options;
-    std::vector<std::string> cursors;std::string cursor,next_cursor,target_cursor,next_target_cursor,filter,parent,root,selected_source,pending_reason,dev_state;bool linked_only=false,target_selected=false;
+    std::vector<std::string> cursors;std::string cursor,next_cursor,target_cursor,next_target_cursor,filter,parent,root,selected_source,pending_reason,dev_state,last_roots_key;bool linked_only=false,target_selected=false;
     struct Folder {std::string root,path,cursor;bool loaded=false;};std::map<HTREEITEM,Folder> folders;uint64_t navigation=0;
     struct Task{uint64_t ticket;std::function<Payload()> run;};
     std::mutex mutex;std::condition_variable_any ready;std::optional<Task> pending;std::deque<Task> actions;std::jthread worker;uint64_t sequence=0,settled_sequence=0;
@@ -92,6 +107,9 @@ struct ScaleView::Impl {
     HWND make(const wchar_t* cls,const wchar_t* title,DWORD style,int id){auto h=CreateWindowExW(0,cls,title,WS_CHILD|WS_VISIBLE|style,0,0,10,10,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);SendMessageW(h,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);if(wcscmp(cls,L"STATIC")!=0&&wcscmp(cls,L"BUTTON")!=0)ui::name(h,title);return h;}
     void sync_root_options(){
         if(!root_choice)return;
+        std::string rkey = (project ? path_text(project->file) + "|" + project->revision : "") + "|" + root;
+        if(rkey == last_roots_key) return;
+        last_roots_key = rkey;
         SendMessageW(root_choice,CB_RESETCONTENT,0,0);
         root_options.clear();
         SendMessageW(root_choice,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"Todas las raíces"));
@@ -112,15 +130,16 @@ struct ScaleView::Impl {
         SendMessageW(root_choice,CB_SETCURSEL,sel,0);
     }
     void update_controls(){
+        auto enable_if=[](HWND h,bool en){if(h&&(IsWindowEnabled(h)!=FALSE)!=en)EnableWindow(h,en);};
         int at=ListView_GetNextItem(list,-1,LVNI_SELECTED);const bool selected=at>=0&&static_cast<size_t>(at)<rows.size();
         auto state=selected&&page==16?str_or(rows[at],"state"):"";
         const bool deferred=selected&&page==16&&str_or(rows[at],"phase")=="analysis_deferred";
-        EnableWindow(pause,selected&&(state=="queued"||state=="running"));EnableWindow(resume,selected&&(state=="paused"||deferred));
-        EnableWindow(cancel,selected&&(state=="queued"||state=="running"||state=="paused"));EnableWindow(retry,selected&&(state=="failed"||state=="cancelled"||state=="completed_with_errors"));
+        enable_if(pause,selected&&(state=="queued"||state=="running"));enable_if(resume,selected&&(state=="paused"||deferred));
+        enable_if(cancel,selected&&(state=="queued"||state=="running"||state=="paused"));enable_if(retry,selected&&(state=="failed"||state=="cancelled"||state=="completed_with_errors"));
         const bool target=page==1&&ListView_GetNextItem(targets,-1,LVNI_SELECTED)>=0;
         const bool can_rescan_row=page==17&&selected&&str_or(rows[at],"kind")=="directory";
-        EnableWindow(up,!parent.empty());EnableWindow(rescan,!root.empty()||can_rescan_row);EnableWindow(copy,selected||target);EnableWindow(details_button,selected||target);
-        EnableWindow(next_target,!next_target_cursor.empty());EnableWindow(linked,!selected_source.empty());
+        enable_if(up,!parent.empty());enable_if(rescan,!root.empty()||can_rescan_row);enable_if(copy,selected||target);enable_if(details_button,selected||target);
+        enable_if(next_target,!next_target_cursor.empty());enable_if(linked,!selected_source.empty());
         PostMessageW(GetParent(hwnd),WM_SCALE_SELECTION,0,0);
     }
     void empty_state(){
@@ -214,7 +233,7 @@ struct ScaleView::Impl {
         int pager_y=y+actual_available+gap;int pager_x=left;
         for(auto item:{previous,next,next_target})if(GetWindowLongPtrW(item,GWL_STYLE)&WS_VISIBLE){int button_width=std::min((width-gap*2)/3,ui::type_size(18,dpi)*10);ui::move_if(item,pager_x,pager_y,button_width,control);pager_x+=button_width+gap;}
         if(inspector)ui::move_if(detail,0,height-detail_height,width,detail_height);
-        update_controls();InvalidateRect(hwnd,nullptr,FALSE);
+        update_controls();InvalidateRect(hwnd,nullptr,TRUE);
     }
     HTREEITEM add_folder(HTREEITEM parent_item,const std::wstring& name,const Folder& folder,bool children=true){TVINSERTSTRUCTW insert{};insert.hParent=parent_item;insert.hInsertAfter=TVI_LAST;insert.item.mask=TVIF_TEXT|TVIF_CHILDREN;insert.item.cChildren=children?1:0;insert.item.pszText=const_cast<wchar_t*>(name.c_str());auto item=TreeView_InsertItem(tree,&insert);folders[item]=folder;return item;}
     void request_tree(HTREEITEM item){if(!project||!folders.contains(item)||folders[item].loaded)return;auto folder=folders[item];folders[item].loaded=true;const auto p=*project;const auto nav=navigation;
@@ -228,6 +247,11 @@ struct ScaleView::Impl {
             if(include_non_source)preferred.insert(preferred.begin()+2,"non_source_files");
         }
         else if(row.contains("record_type"))preferred={"record_type","item_id","title","state","detail_summary","updated_at"};
+        else if(row.contains("workstream_id")&&row.contains("owner_actor"))preferred={"workstream_id","title","state","owner_actor","current_step","base_snapshot_id","updated_at"};
+        else if(row.contains("confidence")&&row.contains("old_path"))preferred={"at_iso","op","node_kind","old_path","new_path","confidence","actor"};
+        else if(row.contains("verification_status")&&row.contains("outcome"))preferred={"id","kind","title","outcome","verification_status","summary","updated_at"};
+        else if(row.contains("doc_key")&&row.contains("authority"))preferred={"doc_key","title","authority","section_count","line_count","state","verified_at"};
+        else if(row.contains("tool_key")&&row.contains("diagnostic_code"))preferred={"tool_key","name","command","version","exe_path","diagnostic_code","env_recipe"};
         else if(row.contains("migration_percent"))preferred={"path","stage","disposition","migration_percent","state"};
         else if(row.contains("source_path"))preferred={"source_path","target_paths","stage","disposition","declared_complete","actor","at"};
         else if(row.contains("coverage_cause"))preferred={"path","kind","discovered_entries","pending_directories","errors_count","excluded_entries","coverage_cause","last_scanned"};
@@ -275,14 +299,16 @@ struct ScaleView::Impl {
                 else if(key=="phase")width=240;
                 else if(key=="coverage_cause")width=230;
                 else if(key=="observed_files_per_second"||key=="eta_seconds")width=140;
-                else if(key=="last_scanned")width=185;
+                else if(key=="last_scanned"||key=="verified_at"||key=="at_iso")width=185;
+                else if(key=="diagnostic_code"||key=="verification_status"||key=="confidence")width=185;
+                else if(key=="summary"||key=="env_recipe")width=260;
                 else if(key=="discovered_entries"||key=="errors_count"||key=="excluded_entries"||key=="pending_directories")width=105;
                 else if(key=="kind"||key=="bytes")width=115;
                 column.cx=key=="description"||key=="value"||key=="excerpt"?std::max<int>(px(320),bounds.right-ui::type_size(485,dpi)):ui::type_size(width,dpi);
                 column.pszText=name.data();ListView_InsertColumn(table,i++,&column);
             }
         }
-        ListView_SetItemCountEx(table,static_cast<int>(values.size()),LVSICF_NOSCROLL);InvalidateRect(table,nullptr,TRUE);
+        ListView_SetItemCountEx(table,static_cast<int>(values.size()),LVSICF_NOSCROLL);
     }
     void request(){if(!project)return;reading=true;SetTimer(hwnd,2,150,nullptr);const auto p=*project;const auto view=page;const auto query_cursor=cursor,target_after=target_cursor;const auto query_filter=filter,query_parent=parent,query_root=root,source=selected_source,reason=pending_reason,query_dev_state=dev_state;const int query_depth=depth,query_dev_kind=dev_kind;const bool linked_targets=linked_only,query_non_source=include_non_source;const auto ticket=++sequence;
         {std::lock_guard lock(mutex);pending=Task{ticket,[=](){Payload result;result.sequence=ticket;Database db(p);Json args={{"limit",200},{"include_total",false}};if(!query_cursor.empty())args["cursor"]=query_cursor;if(!query_filter.empty())args["text"]=query_filter;
@@ -319,6 +345,26 @@ struct ScaleView::Impl {
                 }
                 const auto non_src=summary.value("non_source_files",std::max<int64_t>(0,summary.value("known_files",int64_t(0))-summary.value("source_files",int64_t(0))));
                 data.push_back({{"name","Fuera de alcance / no código fuente"},{"state",non_src>0?"Inventariado":"Sin excluidos"},{"description",std::to_string(non_src)+" archivos no relevantes o auxiliares (documentos, artefactos, dependencias y configuración)."}});
+                try {
+                    bool has_git = false;
+                    std::error_code gec;
+                    if(fs::exists(native_path(p.directory()/L".git"),gec)) has_git=true;
+                    if(!has_git) for(const auto& r:p.config.value("roots",Json::array())){
+                        if(fs::exists(native_path(p.resolve(str_or(r,"path"))/L".git"),gec)){has_git=true;break;}
+                    }
+                    if(has_git){
+                        const auto git_sum=git_repo_summary_cached(p,db);
+                        if(git_sum.value("available",false)){
+                            data.push_back({{"name","Último commit Git"},{"state",git_sum.value("dirty",false)?"Árbol con cambios":"Limpio"},{"description",git_sum.value("branch","HEAD")+" @ "+git_sum.value("head_short","")+" · "+git_sum.value("last_commit_at","")+" · "+git_sum.value("last_commit_subject","")}});
+                        }
+                    }
+                    int64_t ws_open=0,ws_int=0;
+                    if(db.integer("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_workstreams')")!=0){
+                        ws_open=db.integer("SELECT COUNT(*) FROM agent_workstreams WHERE status IN('active','paused','handed_off','interrupted_recoverable')");
+                        ws_int=db.integer("SELECT COUNT(*) FROM agent_workstreams WHERE status='interrupted_recoverable'");
+                    }
+                    data.push_back({{"name","Continuidad de sesiones (Workstreams)"},{"state",ws_int>0?"Recuperable":(ws_open>0?"Activa":"Listo")},{"description",std::to_string(ws_open)+" sesión(es) abiertas · "+std::to_string(ws_int)+" interrumpida(s) recuperables tras corte o cuota."}});
+                } catch (...) {}
                 result.left={{"items",data}};
                 result.caption=(summary["migration_percent"].is_null()?std::string("El porcentaje global se calculará cuando el alcance y el análisis estén al día."):
                     (display(summary["migrated_units"])+" de "+display(summary["total_units"])+" unidades de origen con migración registrada."))+
@@ -432,6 +478,70 @@ struct ScaleView::Impl {
                     result.caption="Control integral · "+std::to_string(combined.size())+" elementos (fases, tareas y auditoría documental)"+(docs_more?" · Use 'Solo documentos' para paginar todos los documentos":"");
                 }
             }
+            else if(view==25){
+                workstream_detect_and_reconcile(p,db);
+                auto items=db.query(
+                    "SELECT id AS workstream_id, title, status AS state, owner_actor, current_step, base_snapshot_id, updated_at, goal AS description "
+                    "FROM agent_workstreams ORDER BY updated_at DESC LIMIT 150");
+                if(items.empty()){
+                    items.push_back({{"workstream_id","ws-ready"},{"title","Motor de continuidad activo (7 etapas PREPARED..COMMITTED)"},{"state","Listo"},{"owner_actor","sistema"},{"current_step","Sin sesiones interrumpidas"},{"base_snapshot_id","—"},{"updated_at",now()}});
+                }
+                result.left={{"items",items}};
+                result.caption="Sesiones y Handoffs (Workstreams) · "+std::to_string(items.size())+" registro(s)";
+            }
+            else if(view==26){
+                path_lineage_schema(db);
+                Json items=Json::array();
+                for(const auto& sr:db.query("SELECT root_key, last_full_scan_at, last_incremental_at, total_files, total_dirs FROM fs_roots ORDER BY root_id")){
+                    items.push_back({{"at_iso",str_or(sr,"last_full_scan_at","Sin escaneo completo")},{"op","tree_scan"},{"node_kind","root"},{"old_path",str_or(sr,"root_key")},{"new_path",std::to_string(sr.value("total_files",int64_t(0)))+" archivos / "+std::to_string(sr.value("total_dirs",int64_t(0)))+" carpetas"},{"confidence","exact_transactional"},{"actor","fs_sync"}});
+                }
+                for(const auto& lr:db.query("SELECT at_iso, op, node_kind, old_path, new_path, confidence, actor FROM path_lineage ORDER BY id DESC LIMIT 150")){
+                    items.push_back(lr);
+                }
+                if(items.empty()){
+                    auto last_job=db.query("SELECT finished FROM inventory_jobs WHERE state='completed' ORDER BY id DESC LIMIT 1");
+                    const std::string fin=last_job.empty()?"Sin escaneo completo":str_or(last_job[0],"finished","Completado");
+                    for(const auto& r:p.config.value("roots",Json::array())){
+                        const std::string rid=str_or(r,"id","root");
+                        const int64_t fcnt=db.integer("SELECT COUNT(*) FROM files WHERE root=? AND deleted=0",{rid});
+                        items.push_back({{"at_iso",fin},{"op","tree_scan"},{"node_kind","root"},{"old_path",rid+" ("+str_or(r,"role","source")+")"},{"new_path",path_text(p.resolve(str_or(r,"path")))+" · "+std::to_string(fcnt)+" archivos"},{"confidence","exact_transactional"},{"actor","scale_run"}});
+                    }
+                }
+                result.left={{"items",items}};
+                result.caption="Linaje de rutas por FRN y frescura del árbol · "+std::to_string(items.size())+" evento(s)";
+            }
+            else if(view==27){
+                auto kn=tool_knowledge(p,db,query_filter.empty()?Json{{"action","list"},{"limit",150}}:Json{{"action","search"},{"query",query_filter},{"limit",150}});
+                Json items=kn.value("items",Json::array());
+                if(items.empty()){
+                    items.push_back({{"id","kn-ready"},{"kind","decision"},{"title","Libro mayor de conocimiento inicializado"},{"outcome","active"},{"verification_status","verified_fact"},{"summary","Registre hallazgos, métodos probados y pitfalls con tool_knowledge."},{"updated_at",now()}});
+                }
+                result.left={{"items",items}};
+                result.caption="Conocimiento y métodos probados · "+std::to_string(items.size())+" entrada(s)";
+            }
+            else if(view==28){
+                auto dh=tool_docs_hub(p,db,{{"action","list"}});
+                auto dr=tool_docs_hub(p,db,{{"action","drift_report"}});
+                std::set<std::string> drifted_keys;
+                for(const auto& d:dr.value("drifted_docs",Json::array()))drifted_keys.insert(str_or(d,"doc_key"));
+                Json items=Json::array();
+                for(auto d:dh.value("items",Json::array())){
+                    const std::string dk=str_or(d,"doc_key");
+                    d["state"]=drifted_keys.contains(dk)?"Deriva detectada":"Vigente";
+                    items.push_back(std::move(d));
+                }
+                if(items.empty()){
+                    items.push_back({{"doc_key","README.md"},{"title","Centro de documentos del proyecto"},{"authority","canonical"},{"section_count",1},{"line_count",1},{"state","Vigente"},{"verified_at",now()}});
+                }
+                result.left={{"items",items}};
+                result.caption="Documentos del proyecto (Docs Hub) · "+std::to_string(items.size())+" documento(s)";
+            }
+            else if(view==29){
+                auto env=tool_env_tools(p,{{"action","summary"}});
+                Json items=env.value("tools",Json::array());
+                result.left={{"items",items}};
+                result.caption="Lenguajes y herramientas del host (D:\\DevTools + PATH) · "+std::to_string(items.size())+" herramienta(s) · "+std::to_string(env.value("path_shadows_count",int64_t(0)))+" shadow(s)";
+            }
             else {args["kind"]="files";result.left=query_page(p,db,args);}
             if(result.caption.empty()){
                 const auto count=result.left.value("items",Json::array()).size();
@@ -487,6 +597,8 @@ struct ScaleView::Impl {
     }
     void accept_rows(const Payload& data){
         if(hwnd)SendMessageW(hwnd,WM_SETREDRAW,FALSE,0);
+        if(list)SendMessageW(list,WM_SETREDRAW,FALSE,0);
+        if(targets)SendMessageW(targets,WM_SETREDRAW,FALSE,0);
         const auto selected_origin=selected_id(list,rows),selected_target=selected_id(targets,target_rows);
         replacing_rows=true;
         ListView_SetItemState(list,-1,0,LVIS_SELECTED|LVIS_FOCUSED);
@@ -508,6 +620,8 @@ struct ScaleView::Impl {
         target_selected=target_selected&&restored_target;
         replacing_rows=false;
         selected_detail();
+        if(targets){SendMessageW(targets,WM_SETREDRAW,TRUE,0);if(IsWindowVisible(targets))InvalidateRect(targets,nullptr,FALSE);}
+        if(list){SendMessageW(list,WM_SETREDRAW,TRUE,0);if(IsWindowVisible(list))InvalidateRect(list,nullptr,FALSE);}
         if(hwnd){SendMessageW(hwnd,WM_SETREDRAW,TRUE,0);InvalidateRect(hwnd,nullptr,FALSE);}
     }
     void copy_paths(){int index=ListView_GetNextItem(target_selected?targets:list,-1,LVNI_SELECTED);const auto& data=target_selected?target_rows:rows;if(index<0||static_cast<size_t>(index)>=data.size())return;const auto& item=data[index];std::wstring text;for(const auto* key:{"source_path","absolute_path","output_path"})if(item.contains(key)&&item[key].is_string()){auto path=wide(item[key]);if(!path.empty()&&text.find(path)==std::wstring::npos)text+=path+L"\r\n";}if(item.contains("target_paths"))for(const auto& path:item["target_paths"])text+=wide(path)+L"\r\n";if(text.empty())text=control_text(detail);
@@ -624,20 +738,22 @@ void ScaleView::create(HWND parent,HFONT font,int dpi){auto& s=*impl_;s.font=fon
 HWND ScaleView::window()const{return impl_->hwnd;}
 void ScaleView::appearance(HFONT font,int dpi){
     auto& s=*impl_;s.font=font;s.dpi=dpi;
-    if(s.hwnd)SendMessageW(s.hwnd,WM_SETREDRAW,FALSE,0);
     s.colors=ui::system_palette();DeleteObject(s.background);DeleteObject(s.surface);
     const auto pixels=ui::type_size(18,dpi);
     if(s.font_pixels>0&&s.font_pixels!=pixels){
-        for(auto table:{s.list,s.targets})for(int column=0;column<Header_GetItemCount(ListView_GetHeader(table));++column){
-            ListView_SetColumnWidth(table,column,MulDiv(ListView_GetColumnWidth(table,column),pixels,s.font_pixels));
+        for(auto table:{s.list,s.targets}){
+            if(!IsWindowVisible(table))continue;
+            SendMessageW(table,WM_SETREDRAW,FALSE,0);
+            for(int column=0;column<Header_GetItemCount(ListView_GetHeader(table));++column){
+                ListView_SetColumnWidth(table,column,MulDiv(ListView_GetColumnWidth(table,column),pixels,s.font_pixels));
+            }
+            SendMessageW(table,WM_SETREDRAW,TRUE,0);
         }
     }
     s.font_pixels=pixels;
     s.background=CreateSolidBrush(s.colors.background);s.surface=CreateSolidBrush(s.colors.surface);
     ui::list_colors(s.list,s.colors);ui::list_colors(s.targets,s.colors);TreeView_SetBkColor(s.tree,s.colors.surface);
     TreeView_SetTextColor(s.tree,s.colors.text);TreeView_SetItemHeight(s.tree,ui::type_size(18,dpi)+ui::dip(10,dpi));
-    s.layout();
-    if(s.hwnd){SendMessageW(s.hwnd,WM_SETREDRAW,TRUE,0);InvalidateRect(s.hwnd,nullptr,FALSE);}
 }
 void ScaleView::show(const Project& p,int page,const std::string& filter){
     auto& s=*impl_;
@@ -645,17 +761,21 @@ void ScaleView::show(const Project& p,int page,const std::string& filter){
     const bool changed_view=changed_proj||s.page!=page;
     if(changed_view||s.filter!=filter){s.cursor.clear();s.cursors.clear();s.target_cursor.clear();s.next_cursor.clear();s.next_target_cursor.clear();}
     if(changed_view){
-        if(s.hwnd)SendMessageW(s.hwnd,WM_SETREDRAW,FALSE,0);
         s.parent.clear();if(page!=1&&!s.keep_context)s.root.clear();s.keep_context=false;s.selected_source.clear();s.target_selected=false;++s.navigation;s.folders.clear();
-        if(TreeView_GetCount(s.tree)>0){SendMessageW(s.tree,WM_SETREDRAW,FALSE,0);TreeView_DeleteAllItems(s.tree);SendMessageW(s.tree,WM_SETREDRAW,TRUE,0);}
-        s.replacing_rows=true;ListView_SetItemCountEx(s.list,0,0);ListView_SetItemCountEx(s.targets,0,0);s.replacing_rows=false;
+        if(TreeView_GetCount(s.tree)>0){TreeView_DeleteAllItems(s.tree);}
+        s.replacing_rows=true;
+        if(s.list)SendMessageW(s.list,WM_SETREDRAW,FALSE,0);
+        if(s.targets)SendMessageW(s.targets,WM_SETREDRAW,FALSE,0);
+        ListView_SetItemCountEx(s.list,0,0);ListView_SetItemCountEx(s.targets,0,0);
+        if(s.targets)SendMessageW(s.targets,WM_SETREDRAW,TRUE,0);
+        if(s.list)SendMessageW(s.list,WM_SETREDRAW,TRUE,0);
+        s.replacing_rows=false;
         s.rows=Json::array();s.target_rows=Json::array();ui::show_if(s.empty,false);
         SetWindowTextW(s.caption,L"Preparando esta vista…");
     }
     s.project=p;s.page=page;s.filter=filter;
     if(changed_view)s.sync_root_options();
     ui::show_if(s.hwnd,true);s.layout();
-    if(changed_view&&s.hwnd){SendMessageW(s.hwnd,WM_SETREDRAW,TRUE,0);InvalidateRect(s.hwnd,nullptr,FALSE);}
     s.request();
 }
 void ScaleView::refresh(){impl_->request();}
