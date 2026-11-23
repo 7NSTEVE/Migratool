@@ -416,7 +416,7 @@ bool check_and_refresh_entry_staleness(const Project& p, Database& db, const std
             bool exists = !abs_p.empty() && fs::is_regular_file(native_path(abs_p), ec);
             if (!exists && frn != 0 && has_fs_nodes) {
                 auto fn = db.query(
-                    "SELECT n.name, d.rel_path AS prel, r.path AS rpath, n.flags "
+                    "SELECT n.name, d.rel_path AS prel, r.abs_path AS rpath, n.flags "
                     "FROM fs_nodes n "
                     "JOIN fs_roots r ON r.root_id=n.root_id "
                     "LEFT JOIN fs_dirs d ON d.root_id=n.root_id AND d.frn=n.parent_frn "

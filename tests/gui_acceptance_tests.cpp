@@ -105,7 +105,7 @@ uint64_t send_responsive(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, uint64_t max
 }
 
 void save_window_png(HWND hwnd, const fs::path& out_path) {
-    fs::create_directories(out_path.parent_path());
+    fs::create_directories(native_path(out_path.parent_path()));
     RECT rc{};
     GetWindowRect(hwnd, &rc);
     const int width = std::max<int>(1, rc.right - rc.left);
@@ -136,7 +136,7 @@ void save_window_png(HWND hwnd, const fs::path& out_path) {
           "WIC bitmap creado desde HBITMAP");
     IWICStream* stream{};
     check(SUCCEEDED(factory->CreateStream(&stream)), "WIC stream creado");
-    check(SUCCEEDED(stream->InitializeFromFilename(out_path.wstring().c_str(), GENERIC_WRITE)),
+    check(SUCCEEDED(stream->InitializeFromFilename(native_path(out_path).wstring().c_str(), GENERIC_WRITE)),
           "WIC stream abierto en " + path_text(out_path));
     IWICBitmapEncoder* encoder{};
     check(SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)), "Encoder PNG creado");
@@ -160,7 +160,7 @@ void save_window_png(HWND hwnd, const fs::path& out_path) {
     DeleteObject(bmp);
     DeleteDC(mem_dc);
     ReleaseDC(nullptr, screen_dc);
-    check(fs::exists(out_path) && fs::file_size(out_path) > 1024, "Captura PNG válida: " + path_text(out_path));
+    check(fs::exists(native_path(out_path)) && fs::file_size(native_path(out_path)) > 1024, "Captura PNG válida: " + path_text(out_path));
 }
 
 int listview_count(HWND lv) {
@@ -186,16 +186,16 @@ int wmain(int argc, wchar_t** argv) {
         const auto repo_root = fs::path(argv[1]);
         const auto qa = repo_root / L"build/qa-scale/tests-tmp" / wide("gui_" + unique_id());
         evidence_dir = repo_root / L"build/qa-scale/evidence/gui-acceptance";
-        fs::create_directories(qa / L"source" / L"empty_dir");
-        fs::create_directories(qa / L"source" / L"excluded_dir");
-        fs::create_directories(qa / L"target");
-        fs::create_directories(evidence_dir);
+        fs::create_directories(native_path(qa / L"source" / L"empty_dir"));
+        fs::create_directories(native_path(qa / L"source" / L"excluded_dir"));
+        fs::create_directories(native_path(qa / L"target"));
+        fs::create_directories(native_path(evidence_dir));
 
         // 1. Seed 10,500 files + folder coverage causes
         constexpr int BUCKETS = 105;
         for (int b = 0; b < BUCKETS; ++b) {
             const auto bucket = qa / L"source" / wide("mod_" + std::to_string(b));
-            fs::create_directories(bucket);
+            fs::create_directories(native_path(bucket));
             for (int k = 0; k < 100; ++k) {
                 const int idx = b * 100 + k;
                 write_text(bucket / wide("f_" + std::to_string(idx) + ".py"), "def fn_" + std::to_string(idx) + "():\n    return " + std::to_string(idx) + "\n");
@@ -414,6 +414,12 @@ int wmain(int argc, wchar_t** argv) {
         // Apply 200% zoom directly in GUI via ID_ZOOM_IN (52) x4
         for (int z = 0; z < 4; ++z) send_responsive(main_hwnd, WM_COMMAND, 52, 0, 200);
         Sleep(150);
+        {
+            RECT lv_rc{};
+            GetClientRect(lv, &lv_rc);
+            check(lv_rc.bottom >= 140,
+                  "Tabla principal conserva altura visible suficiente a 200% zoom (>=140 px, actual=" + std::to_string(lv_rc.bottom) + ")");
+        }
         save_window_png(main_hwnd, evidence_dir / L"06-zoom-200.png");
         send_responsive(main_hwnd, WM_COMMAND, 54, 0, 200); // reset 100%
 

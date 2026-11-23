@@ -84,7 +84,10 @@ void write_durable_blob(const Project& p, const std::string& sha, const std::str
     const fs::path bp = blob_path_for_sha(p, sha);
     std::error_code ec;
     if (fs::is_regular_file(native_path(bp), ec) && fs::file_size(native_path(bp), ec) == content.size()) {
-        return;
+        // AUD-018 / MIG-005: Always verify SHA-256 before reusing an existing blob (repair if corrupted!)
+        try {
+            if (hash_file(bp) == sha) return;
+        } catch (...) {}
     }
     fs::create_directories(native_path(bp.parent_path()), ec);
     const fs::path tmp = bp.parent_path() / (wide(sha) + L".tmp-" + wide(unique_id()));
@@ -98,7 +101,7 @@ void write_durable_blob(const Project& p, const std::string& sha, const std::str
         while (rem > 0) {
             DWORD chunk = static_cast<DWORD>(std::min<size_t>(rem, 1024 * 1024));
             DWORD written = 0;
-            if (!WriteFile(h, ptr, chunk, &written, nullptr)) {
+            if (!WriteFile(h, ptr, chunk, &written, nullptr) || written == 0) {
                 CloseHandle(h);
                 fs::remove(native_path(tmp), ec);
                 throw std::runtime_error("Error escribiendo blob durable: " + path_text(bp));
@@ -106,12 +109,16 @@ void write_durable_blob(const Project& p, const std::string& sha, const std::str
             ptr += written;
             rem -= written;
         }
-        FlushFileBuffers(h);
+        if (!FlushFileBuffers(h)) {
+            CloseHandle(h);
+            fs::remove(native_path(tmp), ec);
+            throw std::runtime_error("Error sincronizando blob durable (FlushFileBuffers): " + path_text(bp));
+        }
         CloseHandle(h);
     }
-    if (!MoveFileExW(native_path(tmp).c_str(), native_path(bp).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    if (!MoveFileExW(native_path(tmp).c_str(), native_path(bp).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         fs::remove(native_path(tmp), ec);
-        if (!fs::is_regular_file(native_path(bp), ec)) {
+        if (!fs::is_regular_file(native_path(bp), ec) || hash_file(bp) != sha) {
             throw std::runtime_error("No se pudo activar blob durable: " + path_text(bp));
         }
     }
@@ -131,48 +138,30 @@ bool send_file_to_recycle_bin(const fs::path& p) {
     return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
 }
 
-fs::path resolve_project_file_ws(const Project& p, const std::string& raw_rel) {
-    if (raw_rel.empty()) return {};
+fs::path resolve_project_file_ws(const Project& p, const std::string& raw_rel, const std::string& explicit_root_id = "") {
+    if (raw_rel.empty()) throw std::runtime_error("SAFETY_VIOLATION: ruta vacía en workstream");
     const std::string norm = norm_rel_ws(raw_rel);
-    fs::path fp(wide(norm));
-    if (fp.is_absolute()) return fp;
-    std::error_code ec;
-    if (p.config.contains("roots") && p.config["roots"].is_array() && !p.config["roots"].empty()) {
+    if (!explicit_root_id.empty() && p.config.contains("roots") && p.config["roots"].is_array()) {
         for (const auto& r : p.config["roots"]) {
-            const std::string rpath = r.value("path", "");
-            if (rpath.empty()) continue;
-            const fs::path base = p.resolve(rpath);
-            const fs::path cand = base / fp;
-            if (fs::exists(native_path(cand), ec)) return cand;
-            const fs::path direct = p.resolve(norm);
-            if (within(direct, base) && fs::exists(native_path(direct), ec)) return direct;
-        }
-        const std::string first_rpath = p.config["roots"][0].value("path", "");
-        if (!first_rpath.empty()) {
-            const fs::path base = p.resolve(first_rpath);
-            const fs::path direct = p.resolve(norm);
-            if (within(direct, base)) return direct;
-            return base / fp;
+            if (r.value("id", "") == explicit_root_id && r.contains("path") && r["path"].is_string()) {
+                const fs::path base = p.resolve(r["path"].get<std::string>());
+                fs::path fp(wide(norm));
+                const fs::path cand = fp.is_absolute() ? fp : (base / fp);
+                if (!is_path_within_dir(cand, base, false, true)) {
+                    throw std::runtime_error("SAFETY_VIOLATION: ruta fuera de la raíz '" + explicit_root_id + "': " + raw_rel);
+                }
+                return canonical_win32_path(cand);
+            }
         }
     }
-    return p.resolve(norm);
+    return p.resolve_confined(norm, false, nullptr, nullptr, false, false);
 }
 
-std::string to_relative_project_path(const Project& p, const fs::path& abs_or_rel) {
-    std::error_code ec;
-    const fs::path abs = abs_or_rel.is_absolute() ? abs_or_rel : resolve_project_file_ws(p, path_text(abs_or_rel));
-    for (const auto& r : p.config.value("roots", Json::array())) {
-        const fs::path root_p = p.resolve(r.value("path", ""));
-        if (within(abs, root_p)) {
-            auto rel = fs::relative(abs, root_p, ec);
-            if (!ec && !rel.empty() && rel != ".") return norm_rel_ws(path_text(rel));
-        }
-    }
-    if (within(abs, p.directory())) {
-        auto rel = fs::relative(abs, p.directory(), ec);
-        if (!ec && !rel.empty() && rel != ".") return norm_rel_ws(path_text(rel));
-    }
-    return norm_rel_ws(path_text(abs_or_rel));
+std::string to_relative_project_path(const Project& p, const fs::path& abs_or_rel, std::string* out_root_id = nullptr) {
+    std::string rid, rel;
+    p.resolve_confined(path_text(abs_or_rel), false, &rid, &rel, false, false);
+    if (out_root_id) *out_root_id = rid;
+    return norm_rel_ws(rel);
 }
 
 struct SyncFullGuard {
@@ -366,8 +355,9 @@ std::string create_content_snapshot(const Project& p, Database& db, const std::v
 
     std::vector<std::pair<std::string, int64_t>> blob_refs;
     for (const auto& raw_p : abs_paths) {
-        const fs::path abs = raw_p.is_absolute() ? raw_p : resolve_project_file_ws(p, path_text(raw_p));
-        const std::string rel = to_relative_project_path(p, abs);
+        std::string root_id, rel_confined;
+        const fs::path abs = p.resolve_confined(path_text(raw_p), false, &root_id, &rel_confined, false, false);
+        const std::string rel = norm_rel_ws(rel_confined);
         std::error_code ec;
         const bool exists = fs::is_regular_file(native_path(abs), ec);
         std::string sha;
@@ -383,6 +373,7 @@ std::string create_content_snapshot(const Project& p, Database& db, const std::v
             blob_refs.emplace_back(sha, sz);
         }
         files_arr.push_back({
+            {"root_id", root_id},
             {"path", rel},
             {"existed", exists},
             {"sha256", sha},
@@ -431,9 +422,10 @@ Json restore_content_snapshot(const Project& p, Database& db, const std::string&
     Json conflicts = Json::array();
     for (const auto& f : files) {
         const std::string rel = norm_rel_ws(f.value("path", ""));
+        const std::string root_id = f.value("root_id", "");
         const std::string snap_sha = f.value("sha256", "");
         const bool snap_existed = f.value("existed", true);
-        const fs::path abs = resolve_project_file_ws(p, rel);
+        const fs::path abs = resolve_project_file_ws(p, rel, root_id);
         std::error_code ec;
         const bool disk_exists = fs::is_regular_file(native_path(abs), ec);
         const std::string disk_sha = disk_exists ? hash_file(abs) : "";
@@ -444,15 +436,31 @@ Json restore_content_snapshot(const Project& p, Database& db, const std::string&
         if (it != ws_hashes.end()) {
             const std::string& pre_s = it->second.first;
             const std::string& post_s = it->second.second;
-            if (!disk_sha.empty() && disk_sha != snap_sha && disk_sha != pre_s && disk_sha != post_s) {
+            const bool matches_known = (disk_sha == snap_sha) ||
+                                       (!pre_s.empty() && disk_sha == pre_s) ||
+                                       (!post_s.empty() && disk_sha == post_s);
+            if (!matches_known) {
                 conflicts.push_back({
+                    {"root_id", root_id},
                     {"path", rel},
                     {"snapshot_sha256", snap_sha},
                     {"workstream_post_sha256", post_s},
                     {"current_disk_sha256", disk_sha},
+                    {"disk_exists", disk_exists},
                     {"reason", "EXTERNAL_MODIFICATION_DETECTED"}
                 });
             }
+        } else {
+            // AUD-002 / MIG-001: Fail-closed when file changed since snapshot and no workstream intent proves ownership!
+            conflicts.push_back({
+                {"root_id", root_id},
+                {"path", rel},
+                {"snapshot_sha256", snap_sha},
+                {"workstream_post_sha256", ""},
+                {"current_disk_sha256", disk_sha},
+                {"disk_exists", disk_exists},
+                {"reason", "EXTERNAL_MODIFICATION_WITHOUT_INTENT"}
+            });
         }
     }
 
@@ -464,10 +472,30 @@ Json restore_content_snapshot(const Project& p, Database& db, const std::string&
     std::unordered_set<std::string> conflicted_paths;
     for (const auto& c : conflicts) conflicted_paths.insert(c["path"].get<std::string>());
 
+    // AUD-018 / M-08: Pre-validate ALL required blobs (existence + SHA-256) BEFORE modifying any file on disk!
+    for (const auto& f : files) {
+        const std::string rel = norm_rel_ws(f.value("path", ""));
+        if (conflicted_paths.contains(rel) && conflict_policy == "skip_conflicted") continue;
+        if (!f.value("existed", true)) continue;
+        const std::string sha = f.value("sha256", "");
+        const fs::path bp = blob_path_for_sha(p, sha);
+        std::error_code ec;
+        if (!fs::is_regular_file(native_path(bp), ec)) {
+            throw std::runtime_error("SNAPSHOT_BLOB_MISSING: " + sha + " para " + rel);
+        }
+        const std::string actual_blob_sha = hash_file(bp);
+        if (actual_blob_sha != sha) {
+            throw std::runtime_error("SNAPSHOT_BLOB_CORRUPT: SHA-256 inválido para " + rel +
+                                     " (esperado=" + sha + ", real=" + actual_blob_sha + ")");
+        }
+    }
+
     std::string pre_restore_backup_id;
     if (!dry_run && !conflicts.empty() && conflict_policy == "backup_and_force") {
         std::vector<fs::path> backup_targets;
-        for (const auto& c : conflicts) backup_targets.push_back(resolve_project_file_ws(p, c["path"].get<std::string>()));
+        for (const auto& c : conflicts) {
+            backup_targets.push_back(resolve_project_file_ws(p, c["path"].get<std::string>(), c.value("root_id", "")));
+        }
         pre_restore_backup_id = create_content_snapshot(p, db, backup_targets, ws_id, "pre_force_restore_" + snapshot_id, actor, true);
     }
 
@@ -475,29 +503,33 @@ Json restore_content_snapshot(const Project& p, Database& db, const std::string&
     Json skipped_external = Json::array();
     for (const auto& f : files) {
         const std::string rel = norm_rel_ws(f.value("path", ""));
+        const std::string root_id = f.value("root_id", "");
         if (conflicted_paths.contains(rel) && conflict_policy == "skip_conflicted") {
             skipped_external.push_back(rel);
             continue;
         }
         const bool existed = f.value("existed", true);
         const std::string sha = f.value("sha256", "");
-        const fs::path abs = resolve_project_file_ws(p, rel);
+        const fs::path abs = resolve_project_file_ws(p, rel, root_id);
         std::error_code ec;
         if (!existed) {
             if (!dry_run && fs::exists(native_path(abs), ec)) {
-                send_file_to_recycle_bin(abs);
+                // AUD-023 / MIG-007: Check recycle bin result; never falsely report deletion!
+                if (!send_file_to_recycle_bin(abs)) {
+                    throw std::runtime_error("RECYCLE_BIN_FAILED: no se pudo reciclar archivo creado tras snapshot: " + path_text(abs));
+                }
                 fs_sync_single_path(p, db, abs, true);
                 record_path_event(db, 1, f.value("frn", uint64_t{0}), "file", "restore_delete", rel, "", 0, actor, "workstream_snapshot", "exact_transactional", ws_id);
             }
             restored.push_back({{"path", rel}, {"action", "deleted_created_file"}});
         } else {
             const fs::path bp = blob_path_for_sha(p, sha);
-            if (!fs::is_regular_file(native_path(bp), ec)) {
-                throw std::runtime_error("SNAPSHOT_BLOB_MISSING: " + sha + " para " + rel);
-            }
             if (!dry_run) {
                 const std::string old_sha = fs::is_regular_file(native_path(abs), ec) ? hash_file(abs) : "";
                 const std::string content = read_text(bp);
+                if (sha256(content) != sha) {
+                    throw std::runtime_error("SNAPSHOT_BLOB_CORRUPT: el blob cambió durante lectura para " + rel);
+                }
                 write_text(abs, content);
                 fs_sync_single_path(p, db, abs, true);
                 record_path_event(db, 1, query_path_frn(abs), "file", "restore", rel, rel,
@@ -572,11 +604,14 @@ std::optional<Json> check_idempotency_ledger(Database& db, const std::string& id
                                              const std::string& tool_name, const std::string& args_sha256) {
     if (idempotency_key.empty()) return std::nullopt;
     workstream_schema(db);
-    auto rows = db.query("SELECT tool, args_sha256, response_json FROM idempotency_ledger WHERE idempotency_key=?", {idempotency_key});
+    auto rows = db.query("SELECT tool, args_sha256, status, response_json FROM idempotency_ledger WHERE idempotency_key=?", {idempotency_key});
     if (rows.empty()) return std::nullopt;
     if (rows[0]["tool"].get<std::string>() != tool_name ||
         (!args_sha256.empty() && rows[0]["args_sha256"].get<std::string>() != args_sha256)) {
         throw std::runtime_error("IDEMPOTENCY_CONFLICT: la clave '" + idempotency_key + "' ya fue usada con argumentos distintos");
+    }
+    if (rows[0]["status"].get<std::string>() == "IN_PROGRESS") {
+        throw std::runtime_error("IDEMPOTENCY_IN_PROGRESS: la clave '" + idempotency_key + "' está en ejecución concurrente");
     }
     auto resp = Json::parse(rows[0]["response_json"].get<std::string>(), nullptr, false);
     if (resp.is_object()) {
@@ -711,15 +746,37 @@ Json workstream_detect_and_reconcile(const Project& p, Database& db) {
         std::string resolution = "aborted_pre_apply";
 
         if (stage == "APPLIED" || stage == "INDEXED") {
-            // Disk writes finished; ensure index is synchronized and promote to COMMITTED
+            // AUD-022 / M-09: Verify expected post-hashes on disk before promoting to COMMITTED!
+            bool all_post_verified = true;
             if (files.is_array()) {
                 for (const auto& f : files) {
                     const std::string rel = f.is_string() ? f.get<std::string>() : f.value("path", "");
-                    if (!rel.empty()) fs_sync_single_path(p, db, resolve_project_file_ws(p, rel), true);
+                    const std::string exp_post = f.is_object() ? f.value("expected_post_sha256", "") : "";
+                    if (!rel.empty()) {
+                        const fs::path abs = resolve_project_file_ws(p, rel);
+                        std::error_code ec;
+                        if (!exp_post.empty()) {
+                            if (!fs::is_regular_file(native_path(abs), ec) || hash_file(abs) != exp_post) {
+                                all_post_verified = false;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
-            advance_durable_operation(db, op_id, "COMMITTED");
-            resolution = "completed_post_apply_indexing";
+            if (all_post_verified) {
+                if (files.is_array()) {
+                    for (const auto& f : files) {
+                        const std::string rel = f.is_string() ? f.get<std::string>() : f.value("path", "");
+                        if (!rel.empty()) fs_sync_single_path(p, db, resolve_project_file_ws(p, rel), true);
+                    }
+                }
+                advance_durable_operation(db, op_id, "COMMITTED");
+                resolution = "completed_post_apply_indexing_verified";
+            } else {
+                advance_durable_operation(db, op_id, "RECOVERY", {{"error", "Post-hash mismatch durante recuperación desde " + stage}});
+                resolution = "post_hash_mismatch_marked_recovery";
+            }
         } else {
             advance_durable_operation(db, op_id, "RECOVERY", {{"error", "Interrumpido en etapa " + stage}});
             resolution = "marked_for_workstream_recovery_from_" + stage;
@@ -814,25 +871,36 @@ Json workstream_prune_ephemeral_snapshots(const Project& p, Database& db,
                                           double max_ephemeral_days,
                                           bool dry_run) {
     workstream_schema(db);
-    (void)max_ephemeral_days;
-    // P4 hard guarantee: NEVER prune a snapshot if pinned=1 OR if its workstream is non-terminal
+    // AUD-051 / M-13 / MIG-008: Keep protection metric and candidate filter strictly disjoint & apply max_ephemeral_days!
     auto ProtectedCount = db.integer(
         "SELECT COUNT(*) FROM workstream_snapshots s "
         "LEFT JOIN agent_workstreams w ON w.id = s.workstream_id "
-        "WHERE s.pinned != 0 OR w.status IN('active','paused','handed_off','interrupted_recoverable')");
+        "WHERE s.pinned != 0 OR (s.retention_class != 'ephemeral' AND w.status IN('active','paused','handed_off','interrupted_recoverable'))");
 
     auto eph_rows = db.query(
         "SELECT s.snapshot_id, s.workstream_id, s.at_iso, s.total_bytes "
         "FROM workstream_snapshots s "
         "LEFT JOIN agent_workstreams w ON w.id = s.workstream_id "
         "WHERE s.pinned = 0 AND (s.retention_class = 'ephemeral' OR s.workstream_id = '' OR w.status IN('completed','rolled_back','abandoned') OR w.id IS NULL) "
+        "AND NOT (s.retention_class != 'ephemeral' AND w.status IN('active','paused','handed_off','interrupted_recoverable')) "
         "ORDER BY s.at_iso DESC, s.rowid DESC");
+
+    std::string cutoff_iso;
+    if (max_ephemeral_days > 0.0) {
+        const auto secs = static_cast<int>(std::clamp(max_ephemeral_days * 86400.0, 1.0, 36500.0 * 86400.0));
+        cutoff_iso = iso_after_seconds(-secs);
+    }
 
     Json pruned_snapshots = Json::array();
     Json recycled_blobs = Json::array();
+    Json recycle_failed = Json::array();
     int64_t bytes_freed = 0;
 
-    for (size_t i = static_cast<size_t>(std::max(0, max_ephemeral_keep)); i < eph_rows.size(); ++i) {
+    for (size_t i = 0; i < eph_rows.size(); ++i) {
+        const bool over_count = (i >= static_cast<size_t>(std::max(0, max_ephemeral_keep)));
+        const std::string at_iso = eph_rows[i]["at_iso"].get<std::string>();
+        const bool over_age = (!cutoff_iso.empty() && !at_iso.empty() && at_iso < cutoff_iso);
+        if (!over_count && !over_age) continue;
         const std::string sid = eph_rows[i]["snapshot_id"].get<std::string>();
         pruned_snapshots.push_back(sid);
         if (!dry_run) {
@@ -852,10 +920,17 @@ Json workstream_prune_ephemeral_snapshots(const Project& p, Database& db,
             const int64_t refs = db.integer("SELECT COUNT(*) FROM snapshot_blob_refs WHERE sha256=?", {sha});
             if (refs == 0) {
                 const int64_t sz = static_cast<int64_t>(entry.file_size(ec));
-                recycled_blobs.push_back(sha);
-                bytes_freed += sz;
-                if (!dry_run) {
-                    send_file_to_recycle_bin(entry.path());
+                if (dry_run) {
+                    recycled_blobs.push_back(sha);
+                    bytes_freed += sz;
+                } else {
+                    // AUD-023 / MIG-007: Only count blobs actually recycled!
+                    if (send_file_to_recycle_bin(entry.path())) {
+                        recycled_blobs.push_back(sha);
+                        bytes_freed += sz;
+                    } else {
+                        recycle_failed.push_back(sha);
+                    }
                 }
             }
         }
@@ -868,6 +943,8 @@ Json workstream_prune_ephemeral_snapshots(const Project& p, Database& db,
         {"pruned_snapshots", std::move(pruned_snapshots)},
         {"recycled_blobs_count", recycled_blobs.size()},
         {"recycled_blobs", std::move(recycled_blobs)},
+        {"recycle_failed_count", recycle_failed.size()},
+        {"recycle_failed", std::move(recycle_failed)},
         {"bytes_freed", bytes_freed}
     };
 }
@@ -889,6 +966,9 @@ Json tool_workstream(const Project& p, Database& db, const Json& args) {
         const std::string ws_id = args.value("workstream_id", "ws-" + unique_id());
         const int lease_sec = std::clamp(args.value("lease_seconds", 3600), 60, 86400 * 7);
         const bool simulate_dead_pid = args.value("simulate_dead_pid", false);
+        if (simulate_dead_pid && !failpoints_enabled()) {
+            throw std::runtime_error("SAFETY_VIOLATION: simulate_dead_pid está deshabilitado en producción");
+        }
         const int64_t owner_pid = simulate_dead_pid ? int64_t{999999} : static_cast<int64_t>(GetCurrentProcessId());
         const int64_t proc_created = simulate_dead_pid ? int64_t{12345} : query_process_create_time(static_cast<DWORD>(owner_pid));
 
@@ -1059,6 +1139,80 @@ Json tool_workstream(const Project& p, Database& db, const Json& args) {
                                      " archivo(s); especifique resolution='accept_disk'|'restore_snapshot'|'split_workstream': " +
                                      external_conflicts.dump());
         }
+        if (!resolution.empty() && resolution != "accept_disk" && resolution != "restore_snapshot" && resolution != "split_workstream") {
+            throw std::runtime_error("INVALID_RESOLUTION: resolution debe ser 'accept_disk', 'restore_snapshot' o 'split_workstream': " + resolution);
+        }
+
+        if (!external_conflicts.empty() && resolution == "split_workstream") {
+            // AUD-012 / M-12: Actually split into a new isolated child workstream while preserving the conflicted parent as paused!
+            const std::string split_ws_id = ws_id + "-split-" + unique_id().substr(0, 8);
+            const DWORD pid = GetCurrentProcessId();
+            const int64_t pcr = query_process_create_time(pid);
+            const std::string ts = now();
+            const std::string exp = iso_after_seconds(args.value("lease_seconds", 3600));
+            auto parent_rows = db.query("SELECT title, goal, base_git_head, base_git_branch, base_snapshot_id, current_step, next_steps, resume_instructions FROM agent_workstreams WHERE id=?", {ws_id});
+            if (parent_rows.empty()) throw std::runtime_error("WORKSTREAM_NOT_FOUND: " + ws_id);
+            const auto& pr = parent_rows[0];
+
+            std::unordered_set<std::string> conflict_set;
+            std::vector<fs::path> split_snap_targets;
+            for (const auto& c : external_conflicts) {
+                const std::string cp = norm_rel_ws(c["path"].get<std::string>());
+                conflict_set.insert(cp);
+                split_snap_targets.push_back(resolve_project_file_ws(p, cp));
+            }
+            const std::string split_snap = split_snap_targets.empty()
+                ? ""
+                : create_content_snapshot(p, db, split_snap_targets, split_ws_id, "split_base_" + split_ws_id, actor, true);
+
+            SyncFullGuard sfg(db);
+            db.exec("UPDATE agent_workstreams SET status='paused', updated_at=?, revision=revision+1 WHERE id=?", {ts, ws_id});
+            const int64_t pseq = db.integer("SELECT COALESCE(MAX(seq),0)+1 FROM workstream_checkpoints WHERE workstream_id=?", {ws_id});
+            db.exec("INSERT INTO workstream_checkpoints(workstream_id,seq,at_iso,actor,trigger_kind,summary,state_json,revision) VALUES(?,?,?,?,?,?,?,?)",
+                    {ws_id, pseq, ts, actor, "split_workstream",
+                     "Conflicto externo aislado hacia nuevo workstream " + split_ws_id,
+                     Json{{"split_workstream_id", split_ws_id}, {"external_conflicts", external_conflicts}}.dump(), pseq});
+
+            db.exec(
+                "INSERT INTO agent_workstreams("
+                "id,title,goal,status,owner_actor,owner_session_id,owner_pid,owner_proc_created,"
+                "lease_expires_at,heartbeat_at,created_at,updated_at,base_git_head,base_git_branch,base_snapshot_id,"
+                "current_step,next_steps,resume_instructions,revision)"
+                "VALUES(?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                {split_ws_id, pr["title"].get<std::string>() + " [split]", pr["goal"].get<std::string>(),
+                 actor, args.value("session_id", ""), static_cast<int64_t>(pid), pcr,
+                 exp, ts, ts, ts, pr["base_git_head"].get<std::string>(), pr["base_git_branch"].get<std::string>(), split_snap,
+                 pr["current_step"].get<std::string>(), pr["next_steps"].get<std::string>(),
+                 "Dividido desde " + ws_id + " por ediciones externas en " + std::to_string(external_conflicts.size()) + " archivo(s)"});
+
+            for (const auto& c : external_conflicts) {
+                const std::string cp = norm_rel_ws(c["path"].get<std::string>());
+                const std::string dsha = c["disk_sha256"].get<std::string>();
+                const uint64_t frn = query_path_frn(resolve_project_file_ws(p, cp));
+                db.exec(
+                    "INSERT INTO workstream_file_intents(workstream_id,path,frn,role,lock_mode,status,intent,pre_sha256,post_sha256,last_edit_at,actor)"
+                    "VALUES(?,?,?,'split_conflict','exclusive','planned','isolated_external_edit',?,?,?,?)",
+                    {split_ws_id, cp, static_cast<int64_t>(frn), dsha, dsha, ts, actor});
+            }
+            db.exec("INSERT INTO workstream_checkpoints(workstream_id,seq,at_iso,actor,trigger_kind,summary,snapshot_id,state_json,revision) VALUES(?,1,?,?,'split_start',?,?,?,1)",
+                    {split_ws_id, ts, actor, "Workstream dividido desde " + ws_id, split_snap,
+                     Json{{"parent_workstream_id", ws_id}, {"isolated_conflicts", external_conflicts}}.dump()});
+
+            return {
+                {"schema", "migratool.workstream/1"},
+                {"action", action},
+                {"ok", true},
+                {"workstream_id", split_ws_id},
+                {"parent_workstream_id", ws_id},
+                {"parent_status", "paused"},
+                {"split_created", true},
+                {"status", "active"},
+                {"new_owner_actor", actor},
+                {"resolution_applied", "split_workstream"},
+                {"base_snapshot_id", split_snap},
+                {"external_conflicts_count", external_conflicts.size()}
+            };
+        }
 
         if (!external_conflicts.empty() && resolution == "accept_disk") {
             for (const auto& c : external_conflicts) {
@@ -1081,6 +1235,9 @@ Json tool_workstream(const Project& p, Database& db, const Json& args) {
             "UPDATE agent_workstreams SET status='active', owner_actor=?, owner_pid=?, owner_proc_created=?, "
             "lease_expires_at=?, heartbeat_at=?, updated_at=?, revision=revision+1 WHERE id=?",
             {actor, static_cast<int64_t>(pid), pcr, exp, ts, ts, ws_id});
+        if (sqlite3_changes(db.native_handle()) == 0) {
+            throw std::runtime_error("WORKSTREAM_NOT_FOUND: " + ws_id);
+        }
         const int64_t seq = db.integer("SELECT COALESCE(MAX(seq),0)+1 FROM workstream_checkpoints WHERE workstream_id=?", {ws_id});
         db.exec(
             "INSERT INTO workstream_checkpoints(workstream_id,seq,at_iso,actor,trigger_kind,summary,state_json,revision)"
@@ -1141,6 +1298,9 @@ Json tool_workstream(const Project& p, Database& db, const Json& args) {
         SyncFullGuard sfg(db);
         db.exec("UPDATE agent_workstreams SET status=?, closed_at=?, updated_at=?, revision=revision+1 WHERE id=?",
                 {final_status, ts, ts, ws_id});
+        if (sqlite3_changes(db.native_handle()) == 0) {
+            throw std::runtime_error("WORKSTREAM_NOT_FOUND: " + ws_id);
+        }
         if (final_status == "completed" || final_status == "abandoned" || final_status == "rolled_back") {
             db.exec("UPDATE workstream_snapshots SET pinned=0, retention_class='ephemeral' WHERE workstream_id=? AND retention_class='active_guard'",
                     {ws_id});
@@ -1153,6 +1313,8 @@ Json tool_workstream(const Project& p, Database& db, const Json& args) {
         std::vector<fs::path> targets;
         if (args.contains("files") && args["files"].is_array()) {
             for (const auto& f : args["files"]) targets.push_back(resolve_project_file_ws(p, f.get<std::string>()));
+        } else if (args.contains("paths") && args["paths"].is_array()) {
+            for (const auto& f : args["paths"]) targets.push_back(resolve_project_file_ws(p, f.get<std::string>()));
         } else if (!ws_id.empty()) {
             auto intents = db.query("SELECT path FROM workstream_file_intents WHERE workstream_id=?", {ws_id});
             for (const auto& it : intents) targets.push_back(resolve_project_file_ws(p, it["path"].get<std::string>()));

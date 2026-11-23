@@ -1,6 +1,7 @@
 param(
     [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
-    [string]$OutDir = (Join-Path (Split-Path -Parent $PSScriptRoot) "build\dist")
+    [string]$OutDir = (Join-Path (Split-Path -Parent $PSScriptRoot) "build\dist"),
+    [string]$Version = "3.0.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,56 +12,33 @@ if (-not (Test-Path $OutDir)) {
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 }
 
-$srcZipPath = Join-Path $OutDir "Migratool-2.1-src-clean.zip"
-$evidZipPath = Join-Path $OutDir "Migratool-2.1-evidence.zip"
+$srcZipPath = Join-Path $OutDir "Migratool-$Version-src-clean.zip"
+$evidZipPath = Join-Path $OutDir "Migratool-$Version-evidence.zip"
 
 if (Test-Path $srcZipPath) { Remove-Item $srcZipPath -Force }
 if (Test-Path $evidZipPath) { Remove-Item $evidZipPath -Force }
 
-$excludedRootDirs = @(
-    ".git",
-    ".migratool",
-    ".serena",
-    ".vs",
-    ".vscode",
-    "backups",
-    "build",
-    "out",
-    "qa",
-    "release"
-)
+$gitExe = "git"
+if (Test-Path "D:\DevTools\Tools\Git\cmd\git.exe") {
+    $gitExe = "D:\DevTools\Tools\Git\cmd\git.exe"
+}
 
-$excludedSubDirs = @(
-    "bin",
-    "obj",
-    ".serena",
-    ".migratool",
-    "__pycache__"
-)
+$trackedFiles = & $gitExe -C $RepoRoot ls-files
+if ($LASTEXITCODE -ne 0 -or -not $trackedFiles) {
+    throw "git ls-files failed in $RepoRoot"
+}
 
 $srcZip = [System.IO.Compression.ZipFile]::Open($srcZipPath, [System.IO.Compression.ZipArchiveMode]::Create)
 $srcEntries = 0
 try {
-    $allFiles = Get-ChildItem -Path $RepoRoot -Recurse -File -Force
-    foreach ($file in $allFiles) {
-        $rel = $file.FullName.Substring($RepoRoot.Length).TrimStart('\', '/')
-        $parts = $rel -split '[\\/]'
-        if ($parts.Length -eq 0) { continue }
-        if ($excludedRootDirs -contains $parts[0]) { continue }
-        $skip = $false
-        foreach ($seg in $parts) {
-            if ($excludedSubDirs -contains $seg) {
-                $skip = $true
-                break
-            }
-        }
-        if ($skip) { continue }
-        if ($file.Extension -in @(".user", ".suo", ".tmp", ".bak", ".zip")) { continue }
-
+    foreach ($rel in $trackedFiles) {
+        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+        $fullPath = Join-Path $RepoRoot $rel
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { continue }
         $entryName = ($rel -replace '\\', '/')
         [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
             $srcZip,
-            $file.FullName,
+            $fullPath,
             $entryName,
             [System.IO.Compression.CompressionLevel]::Optimal
         ) | Out-Null
@@ -100,6 +78,7 @@ $srcInfo = Get-Item $srcZipPath
 $evidInfo = Get-Item $evidZipPath
 
 $manifest = [ordered]@{
+    version = $Version
     generated_at_utc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     source_package = [ordered]@{
         path = $srcZipPath
@@ -107,7 +86,7 @@ $manifest = [ordered]@{
         size_kb = [math]::Round($srcInfo.Length / 1024.0, 2)
         entries_count = $srcEntries
         sha256 = (Get-FileHash -Path $srcZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-        excludes = $excludedRootDirs
+        source_selection = "git ls-files (tracked files only)"
     }
     evidence_package = [ordered]@{
         path = $evidZipPath

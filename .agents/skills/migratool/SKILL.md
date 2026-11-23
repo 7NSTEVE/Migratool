@@ -1,15 +1,17 @@
 ---
 name: migratool
 description: >
-  Flujo de trabajo óptimo para agentes de IA usando las 62 herramientas MCP y CLI de
-  Migratool v3.0.0 (AI Agent Project OS): Arranque y orientación en 1 llamada (`agent_wake` con
-  verificación en vivo disco/Git), Continuidad de Sesiones a prueba de cortes/cuota (`workstream`
-  con protocolo durable de 7 etapas `PREPARED..COMMITTED` y snapshots anclados P4), Libro Mayor
-  de Conocimiento con proveniencia epistemológica (`knowledge`), Docs Hub con TOC H1-H4 y deriva
-  (`docs_hub`), Linaje de Rutas por FRN (`path_history`), Inventario Global de Toolchains del Host
-  (`env_tools` sobre `D:\DevTools` + PATH shadows), `repo_map` PageRank, `read_bundle`, `batch_edit`,
-  `run_verified` (selector de tests + destilador de errores), Motor Ultra-Escala 6M+ archivos y
-  Organización/Deduplicación Transaccional (`fs_organize`).
+  Flujo de trabajo óptimo para agentes de IA usando las 69 herramientas MCP y CLI de
+  Migratool v3.1.0 (AI Agent Project OS & Multi-Agent Coordinator): Arranque y orientación en 1 llamada
+  (`agent_wake` y `project_resume` con verificación en vivo disco/Git), Coordinación Multi-Agente de
+  Worktrees (`worktree_inventory` con 4 estados `IMPLEMENTED..DELIVERED`), Gestor de Integración sin
+  tocar el árbol (`integrate_ready` con `git merge-tree`), Manifiestos de Compilación y Trazabilidad
+  Inversa Binario->Código (`build_canonical` / `trace_binary`), Auditoría Segura de Almacenamiento en
+  4 niveles (`storage_audit`), Descubrimiento de Réplicas y Trabajo Huérfano (`discover_replicas`),
+  Trazabilidad Quirúrgica de Requisitos (`project_health` sobre `PRODUCT_REQUIREMENTS_MASTER`),
+  Continuidad de Sesiones (`workstream`), Libro Mayor de Conocimiento (`knowledge`), Docs Hub
+  (`docs_hub`), Linaje FRN (`path_history`), Toolchains (`env_tools`), `repo_map`, `read_bundle`,
+  `batch_edit`, `run_verified`, Motor Ultra-Escala 6M+ archivos y `fs_organize`.
 ---
 
 # Migratool v3.0 — AI Agent Project OS (Guía de Superpoderes para Agentes)
@@ -146,6 +148,27 @@ Migratool v2.1 se autolimpia automáticamente en segundo plano cada 30 minutos (
 1. **Arranque (`session_bootstrap`)**: `{"token_budget": 2500, "limit": 5, "depth": 2}` -> revisión, estado global, `denominator_blockers`, módulos y tareas.
 2. **Inspección quirúrgica (`get_task_context`)**: `outline_only: true` para esqueleto o `task_ids: [...]` (hasta 50 símbolos) con cuerpos, callees, callers y candidatos destino.
 3. **Cierre atómico (`complete_task`)**: escribe en `target` (`write_files`) o aplica `edits`, auto-sincroniza sin `INDEX_STALE`, mapea (`auto_map_symbols: true`), libera claims y ejecuta `verify_cases`.
+
+---
+
+## 6. Coordinación Multi-Agente de Worktrees, Integración, Builds Canónicos y Almacenamiento Seguro (`v3.1.0`)
+
+1. **Inventario de Worktrees y Relevo ante Corte de Cuota (`worktree_inventory` & `project_resume`)**:
+   - Estados estrictos: `IMPLEMENTED` $\rightarrow$ `CONFIRMED` $\rightarrow$ `INTEGRATED` $\rightarrow$ `DELIVERED`.
+   - `worktree_inventory({"action": "scan"})`: descubre todos los worktrees de Git (`git worktree list --porcelain`), cambios sin commit y commits adelantados/atrasados.
+   - `project_resume({"task_query": "BUILD"})`: paquete de relevo en 1 llamada con worktrees activos, ramas obligatorias pendientes de integrar, último build canónico y solo los requisitos `REQ-*` relevantes de `docs/PRODUCT_REQUIREMENTS_MASTER.json`.
+2. **Evaluación de Integración No Destructiva (`integrate_ready`)**:
+   - `integrate_ready({"action": "evaluate", "target_branch": "main"})`: verifica conflictos con `git merge-tree --write-tree` sin modificar el árbol de trabajo y calcula `canonical_build_ready`.
+3. **Compilación Canónica y Trazabilidad Inversa Binario $\rightarrow$ Código (`build_canonical`)**:
+   - Bloquea declarar cualquier build como `INTEGRATED` o `DELIVERED` si existen worktrees obligatorios en estado `IMPLEMENTED` o `CONFIRMED` sin integrar (salvo exclusión explícita con `excluded_by` y `exclusion_reason`).
+   - `build_canonical({"action": "trace_binary", "sha256": "<hash>"})`: identifica en $O(1)$ qué commit, rama, worktree, agente y pruebas produjeron cualquier `.exe` o `.dll`.
+4. **Auditoría de Almacenamiento en 4 Niveles y Descubrimiento de Réplicas (`storage_audit` & `discover_replicas` & `project_health`)**:
+   - `storage_audit({"action": "audit"})`: clasifica carpetas en 9 categorías configurables y 4 niveles (`PROTECTED`, `TEMP_RETAINED`, `VERIFIED_SAFE_CLEAN`, `NEEDS_REVIEW`), prohibiendo borrar a ciegas por nombre (`old`, `backup`, `temp`, `tests`, `include`, `tools`).
+   - `discover_replicas({"action": "discover", "candidate_paths": [...]})`: clasifica copias como `MAIN_PROJECT`, `RELATED_WORKTREE`, `POSSIBLE_CLONE` u `ORPHAN_WORK` e identifica archivos únicos no integrados.
+   - `project_health({"action": "summary"})`: resumen ejecutivo de baja carga cognitiva, respuesta a las 6 preguntas de trazabilidad (`action: "query_requirements"`) y separación de `session_pendings` frente a requisitos maestros.
+5. **Auditoría Técnica Continua e Incremental y Verificación de Afirmaciones (`code_audit`)**:
+   - `code_audit({"action": "scan_incremental"})`: caché incremental por `(file_sha256, compile_flags_sha256, headers_deps_sha256)`, distinción C (`NULL`) vs C++23 (`nullptr`), complejidad ciclomática AST, desambiguación de `TEST_CASE` por línea y triage de seguridad en `tests/` como `PENDING_VALIDATION`.
+   - `code_audit({"action": "verify_claim", "actor": "Claude", "module_or_path": "src/...", "claimed_functions_count": 12, "claimed_compiled": true, "claimed_tests_passed": true})`: verifica entregas contra evidencia real en 5 dimensiones separadas (`AST`, `build_manifests`, `verified_runs`, calidad y equivalencia funcional).
 
 ---
 

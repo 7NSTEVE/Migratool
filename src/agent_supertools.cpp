@@ -7,6 +7,7 @@
 #include "migratool/knowledge.hpp"
 #include "migratool/path_lineage.hpp"
 #include "migratool/workstream.hpp"
+#include "migratool/multiagent_coordinator.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -46,30 +47,10 @@ std::vector<std::string> split_lines_st(const std::string& text) {
 }
 
 fs::path resolve_project_file_st(const Project& p, const std::string& raw_rel) {
-    if (raw_rel.empty()) return {};
+    if (raw_rel.empty()) throw std::runtime_error("SAFETY_VIOLATION: ruta vacía en supertool");
     const std::string norm = norm_rel_st(raw_rel);
-    fs::path fp(wide(norm));
-    if (fp.is_absolute()) return fp;
-    std::error_code ec;
-    if (p.config.contains("roots") && p.config["roots"].is_array() && !p.config["roots"].empty()) {
-        for (const auto& r : p.config["roots"]) {
-            const std::string rpath = r.value("path", "");
-            if (rpath.empty()) continue;
-            const fs::path base = p.resolve(rpath);
-            const fs::path cand = base / fp;
-            if (fs::exists(native_path(cand), ec)) return cand;
-            const fs::path direct = p.resolve(norm);
-            if (within(direct, base) && fs::exists(native_path(direct), ec)) return direct;
-        }
-        const std::string first_rpath = p.config["roots"][0].value("path", "");
-        if (!first_rpath.empty()) {
-            const fs::path base = p.resolve(first_rpath);
-            const fs::path direct = p.resolve(norm);
-            if (within(direct, base)) return direct;
-            return base / fp;
-        }
-    }
-    return p.resolve(norm);
+    // AUD-004 / M-29: Enforce unified physical confinement across read_bundle and batch_edit!
+    return p.resolve_confined(norm, false, nullptr, nullptr, false, false);
 }
 
 } // namespace
@@ -340,6 +321,14 @@ Json select_affected_tests(const Project& p, Database& db, const std::vector<std
             targets.insert("env_git_supertools_tests");
             suites.insert("env_git_supertools");
         }
+        if (low.find("multiagent_coordinator") != std::string::npos) {
+            targets.insert("multiagent_coordinator_tests");
+            suites.insert("multiagent_coordinator");
+        }
+        if (low.find("code_audit") != std::string::npos) {
+            targets.insert("code_audit_tests");
+            suites.insert("code_audit");
+        }
     }
 
     if (suites.empty() && !target_to_suite.empty()) {
@@ -438,6 +427,17 @@ Json tool_agent_wake(const Project& p, Database& db, const Json& args) {
     const int64_t tok_saved = db.integer("SELECT COALESCE(SUM(tokens_saved_est),0) FROM efficiency_telemetry");
     const int64_t tok_returned = db.integer("SELECT COALESCE(SUM(tokens_returned_est),0) FROM efficiency_telemetry");
 
+    // AUD-054 / M-25: Compute observed crash recovery rate from workstream_operations (null if none observed)
+    const int64_t ops_total = db.integer("SELECT COUNT(*) FROM workstream_operations");
+    const int64_t ops_committed = db.integer("SELECT COUNT(*) FROM workstream_operations WHERE stage='COMMITTED'");
+    Json bm6_val = (ops_total > 0) ? Json(100.0 * static_cast<double>(ops_committed) / static_cast<double>(ops_total)) : Json(nullptr);
+
+    ensure_multiagent_coordinator_schema(db);
+    const int64_t wt_total = db.integer("SELECT COUNT(*) FROM agent_worktrees_catalog");
+    const int64_t wt_unintegrated = db.integer(
+        "SELECT COUNT(*) FROM agent_worktrees_catalog WHERE is_mandatory=1 AND excluded_by='' AND lifecycle_state IN('IMPLEMENTED','CONFIRMED')");
+    const int64_t bld_total = db.integer("SELECT COUNT(*) FROM build_manifests");
+
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     record_efficiency(db, "agent_wake", args.value("profile", "agent-os"), actor, 8800, 120, 1800, 6, 0, 4800, 900, elapsed_ms);
 
@@ -451,6 +451,11 @@ Json tool_agent_wake(const Project& p, Database& db, const Json& args) {
         {"git", std::move(git_sum)},
         {"tree_freshness", std::move(roots)},
         {"workstreams", std::move(ws_reconcile)},
+        {"multiagent_coordination", {
+            {"registered_worktrees_count", wt_total},
+            {"unintegrated_mandatory_worktrees_count", wt_unintegrated},
+            {"recorded_builds_count", bld_total}
+        }},
         {"knowledge_alerts", kn_warn.value("items", Json::array())},
         {"task_dag", std::move(dag)},
         {"inbox_messages", std::move(inbox)},
@@ -464,7 +469,14 @@ Json tool_agent_wake(const Project& p, Database& db, const Json& args) {
             {"BM3_native_calls_avoided", native_saved + 6},
             {"BM4_wake_wall_clock_latency_ms", elapsed_ms},
             {"BM5_rework_files_skipped_by_sha256", sha_skipped},
-            {"BM6_crash_recovery_fidelity_pct", 100.0}
+            {"BM6_crash_recovery_fidelity_pct", bm6_val}
+        }},
+        {"cost_dimensions", {
+            {"tool_calls_count", total_calls + 1},
+            {"input_output_tokens_est", tok_returned},
+            {"wall_clock_ms", elapsed_ms},
+            {"provider_quota_units", nullptr},
+            {"quota_note", "Las plataformas contabilizan cuota de manera independiente; los tokens estimados no equivalen a cuota facturada por el proveedor."}
         }}
     };
 }
@@ -824,6 +836,10 @@ Json tool_batch_edit(const Project& p, Database& db, const Json& args, Log log, 
     const std::string ws_id = args.value("workstream_id", active_workstream_id(db, actor));
     const std::string crash_stage = args.value("simulate_crash_at_stage", "");
     const int inject_fail_after = args.value("inject_failure_after_file", -1);
+    // AUD-007 / M-10: Block test failpoints in production binaries!
+    if ((!crash_stage.empty() || inject_fail_after >= 0) && !failpoints_enabled()) {
+        throw std::runtime_error("SAFETY_VIOLATION: simulate_crash_at_stage / inject_failure_after_file están deshabilitados en producción");
+    }
 
     struct BatchFilePlan {
         std::string rel_path;
@@ -877,11 +893,18 @@ Json tool_batch_edit(const Project& p, Database& db, const Json& args, Log log, 
         } else if (op == "replace_text" || op == "replace_content") {
             const std::string needle = ed.at("needle").get<std::string>();
             const std::string repl = ed.at("replacement").get<std::string>();
+            // AUD-005 / MIG-002 / M-14: Reject empty needle before search to prevent infinite loop / OOM!
+            if (needle.empty()) throw std::runtime_error("EMPTY_NEEDLE: needle no puede estar vacío en batch_edit (" + rel + ")");
             const size_t pos = pl.updated.find(needle);
             if (pos == std::string::npos) throw std::runtime_error("NEEDLE_NOT_FOUND in " + rel);
             if (ed.value("allow_multiple", false)) {
+                constexpr size_t kMaxBatchFileBytes = 64 * 1024 * 1024;
                 size_t ppos = 0;
                 while ((ppos = pl.updated.find(needle, ppos)) != std::string::npos) {
+                    if (cancel && cancel->requested) throw std::runtime_error("CANCELLED");
+                    if (repl.size() > needle.size() && pl.updated.size() + (repl.size() - needle.size()) > kMaxBatchFileBytes) {
+                        throw std::runtime_error("BATCH_EDIT_SIZE_LIMIT_EXCEEDED: " + rel);
+                    }
                     pl.updated.replace(ppos, needle.size(), repl);
                     ppos += repl.size();
                 }
@@ -900,6 +923,22 @@ Json tool_batch_edit(const Project& p, Database& db, const Json& args, Log log, 
     // Check multi-agent workstream file locks
     check_workstream_file_conflicts(db, ws_id, target_rels, target_frns);
 
+    // AUD-022 / M-09: Reserve idempotency_key atomically BEFORE mutating disk
+    bool idemp_reserved = false;
+    if (!idemp_key.empty()) {
+        db.exec(
+            "INSERT OR IGNORE INTO idempotency_ledger(idempotency_key,tool,args_sha256,status,response_json,created_at)"
+            "VALUES(?,'batch_edit',?,'IN_PROGRESS','{}',?)",
+            {idemp_key, args_hash, now()});
+        if (sqlite3_changes(db.native_handle()) == 0) {
+            if (auto replay = check_idempotency_ledger(db, idemp_key, "batch_edit", args_hash)) {
+                return *replay;
+            }
+            throw std::runtime_error("IDEMPOTENCY_CONFLICT: clave reservada concurrentemente: " + idemp_key);
+        }
+        idemp_reserved = true;
+    }
+
     // STAGE 1: PREPARED
     Json files_plan_json = Json::array();
     Json pre_blobs = Json::object();
@@ -909,7 +948,8 @@ Json tool_batch_edit(const Project& p, Database& db, const Json& args, Log log, 
         files_plan_json.push_back({{"path", pl.rel_path}, {"pre_sha256", pl.pre_sha}, {"expected_post_sha256", pl.post_sha}});
         pre_blobs[pl.rel_path] = pl.pre_sha;
         post_blobs[pl.rel_path] = pl.post_sha;
-        if (pl.existed) snap_paths.push_back(pl.abs_path);
+        // AUD-019: Always include target path (even if existed==false) so snapshot_restore deletes newly created files on rollback!
+        snap_paths.push_back(pl.abs_path);
     }
     const std::string op_id = begin_durable_operation(p, db, ws_id, "batch_edit", idemp_key, files_plan_json, actor);
     if (crash_stage == "PREPARED") TerminateProcess(GetCurrentProcess(), 137);
@@ -971,6 +1011,9 @@ Json tool_batch_edit(const Project& p, Database& db, const Json& args, Log log, 
             } catch (...) {}
         }
         advance_durable_operation(db, op_id, "FAILED", {{"error", e.what()}});
+        if (idemp_reserved) {
+            try { db.exec("DELETE FROM idempotency_ledger WHERE idempotency_key=? AND status='IN_PROGRESS'", {idemp_key}); } catch (...) {}
+        }
         throw;
     }
 
@@ -1035,7 +1078,17 @@ Json tool_run_verified(const Project& p, Database& db, const Json& args, Log /*l
         }
     } else if (args.value("auto_select_tests", false) && !sel_plan["ctest_regex"].get<std::string>().empty()) {
         selection_mode = "auto_selected";
-        argv = {"D:/DevTools/CMake/bin/ctest.exe", "--preset", args.value("preset", "release"),
+        std::string ctest_bin = "ctest.exe";
+        wchar_t cbuf[32768]{};
+        if (SearchPathW(nullptr, L"ctest.exe", nullptr, 32768, cbuf, nullptr)) {
+            ctest_bin = utf8(cbuf);
+        } else {
+            std::error_code cec;
+            if (fs::is_regular_file(L"D:\\DevTools\\CMake\\bin\\ctest.exe", cec)) {
+                ctest_bin = "D:/DevTools/CMake/bin/ctest.exe";
+            }
+        }
+        argv = {ctest_bin, "--preset", args.value("preset", "release"),
                 "-R", sel_plan["ctest_regex"].get<std::string>(), "--output-on-failure"};
     }
     if (argv.empty()) throw std::runtime_error("run_verified requiere command o auto_select_tests:true");
@@ -1102,10 +1155,24 @@ Json tool_run_verified(const Project& p, Database& db, const Json& args, Log /*l
             ++passed_cnt;
         }
     }
-    if (exit_code == 0 && passed_cnt == 0) passed_cnt = 1;
-    if (exit_code != 0 && failed_cnt == 0) failed_cnt = 1;
+    const bool timed_out = proc.value("timed_out", false);
+    const bool cancelled = proc.value("cancelled", false);
+    const bool output_limit = proc.value("output_limit", false);
+    const bool proc_ok = (exit_code == 0 && !timed_out && !cancelled && !output_limit);
+    const bool detected_failures = (failed_cnt > 0);
+    if (!proc_ok && failed_cnt == 0) failed_cnt = 1;
 
-    const std::string status_str = (exit_code == 0) ? "PASSED" : "FAILED";
+    // AUD-020 / M-11: Never fabricate passed_count=1 when 0 tests were detected; propagate timeouts/cancellations/overflows!
+    const bool allow_no_tests = args.value("allow_no_tests", false);
+    std::string status_str;
+    if (timed_out) status_str = "TIMED_OUT";
+    else if (cancelled) status_str = "CANCELLED";
+    else if (output_limit) status_str = "OUTPUT_OVERFLOW";
+    else if (!proc_ok || detected_failures) status_str = "FAILED";
+    else if (passed_cnt > 0) status_str = "PASSED";
+    else status_str = "NO_TESTS_DETECTED";
+    const bool run_ok = (status_str == "PASSED") || (allow_no_tests && status_str == "NO_TESTS_DETECTED");
+
     const auto git_sum = git_repo_summary_cached(p, db);
     const std::string distilled_str = errors.dump();
 
@@ -1125,9 +1192,13 @@ Json tool_run_verified(const Project& p, Database& db, const Json& args, Log /*l
     return {
         {"schema", "migratool.run_verified/1"},
         {"run_id", run_id},
-        {"ok", exit_code == 0},
+        {"ok", run_ok},
         {"status", status_str},
+        {"process_ok", proc_ok},
         {"exit_code", exit_code},
+        {"timed_out", timed_out},
+        {"cancelled", cancelled},
+        {"output_limit", output_limit},
         {"duration_ms", elapsed_ms},
         {"selection_mode", selection_mode},
         {"selected_tests", sel_plan["selected_suites"]},
@@ -1158,7 +1229,7 @@ Json tool_impact_analysis(const Project& p, Database& db, const Json& args) {
                 {"from", dr["dependent_path"]},
                 {"to", target_path},
                 {"kind", dr["kind"]},
-                {"edge_confidence", "exact_semantic"}
+                {"edge_confidence", "heuristic_name_match"}
             });
         }
     }
@@ -1172,7 +1243,7 @@ Json tool_impact_analysis(const Project& p, Database& db, const Json& args) {
                 {"from", sr["dependent_path"]},
                 {"to", symbol},
                 {"kind", "symbol_ref"},
-                {"edge_confidence", "exact_semantic"}
+                {"edge_confidence", "heuristic_name_match"}
             });
         }
     }

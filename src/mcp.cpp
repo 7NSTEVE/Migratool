@@ -42,8 +42,9 @@ bool is_read_only_mcp_tool(const std::string& name, const Json& args) {
         return act == "list" || act == "search" || act == "get" || act == "for_files" || act == "warnings";
     }
     if (name == "workstream") {
+        // AUD-040 / M-15: workstream(list) runs reconciliation writes; only inbox & snapshot_diff are strictly read-only!
         std::string act = args.value("action", args.value("op", "status"));
-        return act == "list" || act == "inbox" || act == "snapshot_diff";
+        return act == "inbox" || act == "snapshot_diff";
     }
     if (name == "run_verified") {
         return args.value("action", "run") == "select_tests";
@@ -128,21 +129,56 @@ int mcp_server(const std::optional<Project>& initial_project, const std::string&
         send({{"jsonrpc", "2.0"}, {"id", id}, {"result", value}});
     };
 
+    // AUD-015 / M-04: Bounded line reader (16 MiB cap enforced during reading, never unbounded allocation)
+    constexpr size_t kMaxMcpLineBytes = 16 * 1024 * 1024;
+    auto read_bounded_line = [&](std::string& out_line, bool& oversized) -> bool {
+        out_line.clear();
+        oversized = false;
+        int ch = std::cin.get();
+        if (ch == std::char_traits<char>::eof()) return false;
+        while (ch != std::char_traits<char>::eof() && ch != '\n') {
+            if (ch != '\r') {
+                if (out_line.size() < kMaxMcpLineBytes) out_line.push_back(static_cast<char>(ch));
+                else oversized = true;
+            }
+            ch = std::cin.get();
+        }
+        return true;
+    };
+
     std::string line;
-    while (std::getline(std::cin, line)) {
+    bool oversized = false;
+    while (read_bounded_line(line, oversized)) {
         join_finished();
+        if (oversized) { error(nullptr, -32700, "Mensaje excede 16 MiB"); continue; }
         if (line.empty()) continue;
-        if (line.size() > 16 * 1024 * 1024) { error(nullptr, -32700, "Mensaje excede 16 MiB"); continue; }
         Json request;
         try { request = Json::parse(line); } catch (...) { error(nullptr, -32700, "JSON inválido"); continue; }
-        if (!request.is_object() || request.value("jsonrpc", "") != "2.0" || !request.contains("method")) {
-            error(request.value("id", Json()), -32600, "Solicitud inválida");
+        if (!request.is_object()) {
+            error(nullptr, -32600, "Solicitud inválida: se esperaba objeto JSON");
             continue;
         }
-        auto method = request.at("method").get<std::string>();
-        auto id = request.value("id", Json());
-        auto params = request.value("params", Json::object());
-        bool notification = !request.contains("id");
+        Json id = nullptr;
+        const bool notification = !request.contains("id");
+        if (!notification) {
+            const auto& rid = request["id"];
+            if (rid.is_string() || rid.is_number() || rid.is_null()) id = rid;
+            else { error(nullptr, -32600, "Solicitud inválida: id debe ser string, number o null"); continue; }
+        }
+        if (!request.contains("jsonrpc") || !request["jsonrpc"].is_string() || request["jsonrpc"].get<std::string>() != "2.0" ||
+            !request.contains("method") || !request["method"].is_string()) {
+            error(id, -32600, "Solicitud inválida: jsonrpc='2.0' y method string requeridos");
+            continue;
+        }
+        const std::string method = request["method"].get<std::string>();
+        Json params = Json::object();
+        if (request.contains("params")) {
+            if (!request["params"].is_object()) {
+                if (!notification) error(id, -32602, "params debe ser objeto JSON");
+                continue;
+            }
+            params = request["params"];
+        }
         try {
             if (method == "notifications/cancelled") {
                 std::lock_guard lock(state_mutex);
@@ -245,75 +281,97 @@ int mcp_server(const std::optional<Project>& initial_project, const std::string&
                 else active_write = true;
                 in_flight[key] = op;
                 default_project_snapshot = active_project_file;
-            }
 
-            op->worker = std::thread([&, name, arguments, id, op, key, is_ro, default_project_snapshot]() {
-                std::unique_ptr<LiveSession> live;
-                auto token = op->cancel;
+                // AUD-013 / M-03: Assign op->worker while still holding state_mutex (and roll back lane if std::thread throws!)
                 try {
-                    Json result;
-                    if (name == "activate_workspace") {
-                        fs::path new_proj;
-                        result = tool_activate_workspace(arguments, &new_proj,
-                                                         [](const std::string& m) { std::cerr << m << '\n'; }, token.get());
-                        if (!new_proj.empty() && arguments.value("switch_active", true)) {
-                            std::lock_guard lk(state_mutex);
-                            active_project_file = new_proj;
+                    op->worker = std::thread([&, name, arguments, id, op, key, is_ro, default_project_snapshot]() {
+                        std::unique_ptr<LiveSession> live;
+                        auto token = op->cancel;
+                        try {
+                            Json result;
+                            if (name == "activate_workspace") {
+                                fs::path new_proj;
+                                result = tool_activate_workspace(arguments, &new_proj,
+                                                                 [](const std::string& m) { std::cerr << m << '\n'; }, token.get());
+                                if (!new_proj.empty() && arguments.value("switch_active", true)) {
+                                    std::lock_guard lk(state_mutex);
+                                    active_project_file = new_proj;
+                                    try {
+                                        watcher = std::make_unique<IndexWatcher>(
+                                            Project::load(active_project_file), 900000,
+                                            [](const std::string& text) { std::cerr << text << '\n'; }, false);
+                                    } catch (...) {}
+                                }
+                            } else if (name == "list_workspaces") {
+                                result = tool_list_workspaces(arguments);
+                            } else if (name == "query_workspace") {
+                                result = tool_query_workspace(arguments, [](const std::string& m) { std::cerr << m << '\n'; }, token.get());
+                            } else if (name == "env_tools" && default_project_snapshot.empty() && !arguments.contains("project")) {
+                                result = tool_env_tools(std::nullopt, arguments);
+                            } else {
+                                fs::path selected = default_project_snapshot;
+                                if (arguments.contains("project")) {
+                                    if (!arguments["project"].is_string()) throw std::runtime_error("project debe ser ruta absoluta");
+                                    selected = fs::path(wide(arguments["project"].get<std::string>()));
+                                    if (!selected.is_absolute()) throw std::runtime_error("project debe ser ruta absoluta");
+                                }
+                                if (selected.empty()) {
+                                    throw std::runtime_error("NO_ACTIVE_WORKSPACE: llame primero a activate_workspace o pase project absoluto.");
+                                }
+                                auto current = Project::load(selected);
+                                auto request_args = arguments;
+                                request_args.erase("project");
+                                live = std::make_unique<LiveSession>(current, "MCP", name, request_args.value("actor", client));
+                                result = agent_request(current, name, request_args,
+                                                       [&live](const std::string& message) { std::cerr << message << '\n'; live->log(message); },
+                                                       token.get());
+                                live->finish(token->requested ? 1 : 0, result);
+                            }
+
+                            if (!token->requested) {
+                                const auto payload = result.dump(-1, ' ', false, Json::error_handler_t::replace);
+                                Json answer = {{"content", Json::array({{{"type", "text"}, {"text", payload}}})}, {"isError", false}};
+                                if (protocol == "2025-06-18" || protocol == "2025-11-25") answer["structuredContent"] = result;
+                                response(id, answer);
+                            }
+                        } catch (const std::exception& e) {
+                            try { if (live) live->finish(1, {{"error", e.what()}}); } catch (...) {}
                             try {
-                                watcher = std::make_unique<IndexWatcher>(
-                                    Project::load(active_project_file), 900000,
-                                    [](const std::string& text) { std::cerr << text << '\n'; }, false);
+                                if (!token->requested) {
+                                    // AUD-014: Always use error_handler_t::replace so non-UTF-8 Win32 error text never throws into std::terminate()!
+                                    const std::string err_payload = Json{{"error", e.what()}}.dump(-1, ' ', false, Json::error_handler_t::replace);
+                                    response(id, {{"content", Json::array({{{"type", "text"}, {"text", err_payload}}})}, {"isError", true}});
+                                }
+                            } catch (...) {}
+                        } catch (...) {
+                            try { if (live) live->finish(1, {{"error", "UNKNOWN_EXCEPTION"}}); } catch (...) {}
+                            try {
+                                if (!token->requested) {
+                                    response(id, {{"content", Json::array({{{"type", "text"}, {"text", "{\"error\":\"UNKNOWN_EXCEPTION\"}"}}})}, {"isError", true}});
+                                }
                             } catch (...) {}
                         }
-                    } else if (name == "list_workspaces") {
-                        result = tool_list_workspaces(arguments);
-                    } else if (name == "query_workspace") {
-                        result = tool_query_workspace(arguments, [](const std::string& m) { std::cerr << m << '\n'; }, token.get());
-                    } else if (name == "env_tools" && default_project_snapshot.empty() && !arguments.contains("project")) {
-                        result = tool_env_tools(std::nullopt, arguments);
-                    } else {
-                        fs::path selected = default_project_snapshot;
-                        if (arguments.contains("project")) {
-                            if (!arguments["project"].is_string()) throw std::runtime_error("project debe ser ruta absoluta");
-                            selected = fs::path(wide(arguments["project"].get<std::string>()));
-                            if (!selected.is_absolute()) throw std::runtime_error("project debe ser ruta absoluta");
-                        }
-                        if (selected.empty()) {
-                            throw std::runtime_error("NO_ACTIVE_WORKSPACE: llame primero a activate_workspace o pase project absoluto.");
-                        }
-                        auto current = Project::load(selected);
-                        auto request_args = arguments;
-                        request_args.erase("project");
-                        live = std::make_unique<LiveSession>(current, "MCP", name, request_args.value("actor", client));
-                        result = agent_request(current, name, request_args,
-                                               [&live](const std::string& message) { std::cerr << message << '\n'; live->log(message); },
-                                               token.get());
-                        live->finish(token->requested ? 1 : 0, result);
-                    }
-
-                    if (!token->requested) {
-                        const auto payload = result.dump(-1, ' ', false, Json::error_handler_t::replace);
-                        Json answer = {{"content", Json::array({{{"type", "text"}, {"text", payload}}})}, {"isError", false}};
-                        if (protocol == "2025-06-18" || protocol == "2025-11-25") answer["structuredContent"] = result;
-                        response(id, answer);
-                    }
-                } catch (const std::exception& e) {
-                    try { if (live) live->finish(1, {{"error", e.what()}}); } catch (...) {}
-                    if (!token->requested) {
-                        response(id, {{"content", Json::array({{{"type", "text"}, {"text", Json{{"error", e.what()}}.dump()}}})}, {"isError", true}});
-                    }
+                        try {
+                            std::lock_guard lk(state_mutex);
+                            if (is_ro) --active_reads;
+                            else active_write = false;
+                            if (op->worker.joinable()) {
+                                finished_threads.push_back(std::move(op->worker));
+                            }
+                            if (auto it = in_flight.find(key); it != in_flight.end() && it->second == op) {
+                                in_flight.erase(it);
+                            }
+                            state_cv.notify_all();
+                        } catch (...) {}
+                    });
+                } catch (...) {
+                    if (is_ro) --active_reads;
+                    else active_write = false;
+                    in_flight.erase(key);
+                    state_cv.notify_all();
+                    throw;
                 }
-                std::lock_guard lock(state_mutex);
-                if (is_ro) --active_reads;
-                else active_write = false;
-                if (op->worker.joinable()) {
-                    finished_threads.push_back(std::move(op->worker));
-                }
-                if (auto it = in_flight.find(key); it != in_flight.end() && it->second == op) {
-                    in_flight.erase(it);
-                }
-                state_cv.notify_all();
-            });
+            }
         } catch (const std::exception& e) {
             if (!notification) error(id, -32602, e.what());
         }

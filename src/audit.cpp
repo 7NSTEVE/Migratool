@@ -80,23 +80,23 @@ bool process_ok(const Json& r, int expected=0) {
 }
 bool files_fresh(const Json& files) {
     for(auto it=files.begin();it!=files.end();++it) {
-        auto path=fs::path(wide(it.key())); if(!fs::is_regular_file(path)||hash_file(path)!=it.value().get<std::string>()) return false;
+        auto path=fs::path(wide(it.key())); if(!fs::is_regular_file(native_path(path))||hash_file(path)!=it.value().get<std::string>()) return false;
     }
     return true;
 }
-Json maybe(const fs::path& path, const Json& fallback) { return fs::exists(path)?read_json(path):fallback; }
+Json maybe(const fs::path& path, const Json& fallback) { return fs::exists(native_path(path))?read_json(path):fallback; }
 Json observed_files(const fs::path& path) {
-    if(!fs::exists(path)) return nullptr;
+    if(!fs::exists(native_path(path))) return nullptr;
     Json out=Json::object();
     auto add=[&](const fs::path& f,const std::string& rel) {
-        if(GetFileAttributesW(f.c_str())&FILE_ATTRIBUTE_REPARSE_POINT) throw std::runtime_error("Observador no permite enlaces: "+path_text(f));
-        out[rel]={{"bytes",fs::file_size(f)},{"sha256",hash_file(f)}};
+        if(GetFileAttributesW(native_path(f).c_str())&FILE_ATTRIBUTE_REPARSE_POINT) throw std::runtime_error("Observador no permite enlaces: "+path_text(f));
+        out[rel]={{"bytes",fs::file_size(native_path(f))},{"sha256",hash_file(f)}};
     };
-    if(fs::is_regular_file(path)) add(path,".");
-    else for(const auto& e:fs::recursive_directory_iterator(path)) {
-        if(GetFileAttributesW(e.path().c_str())&FILE_ATTRIBUTE_REPARSE_POINT) throw std::runtime_error("Observador no permite enlaces");
-        if(e.is_regular_file()) add(e.path(),path_text(e.path().lexically_relative(path)));
-        else if(e.is_directory()) out[path_text(e.path().lexically_relative(path))+"/"]="directory";
+    if(fs::is_regular_file(native_path(path))) add(path,".");
+    else for(const auto& e:fs::recursive_directory_iterator(native_path(path))) {
+        if(GetFileAttributesW(native_path(e.path()).c_str())&FILE_ATTRIBUTE_REPARSE_POINT) throw std::runtime_error("Observador no permite enlaces");
+        if(e.is_regular_file()) add(e.path(),path_text(e.path().lexically_relative(native_path(path))));
+        else if(e.is_directory()) out[path_text(e.path().lexically_relative(native_path(path)))+"/"]="directory";
     }
     return out;
 }
@@ -235,8 +235,8 @@ Json compare_outputs(const Json& test,const Json& l,const Json& r,const fs::path
         auto relative=fs::path(wide(observer.at("path")));
         auto lp=lw/relative,rp=rw/relative;
         if(relative.is_absolute()||!within(lp,lw)||!within(rp,rw)) throw std::runtime_error("Observador debe quedar dentro de {work}");
-        if(observer.value("expect","")=="absent") { if(fs::exists(lp)||fs::exists(rp)) diff("expected_absent:"+path_text(relative)); continue; }
-        if(!fs::exists(lp)||!fs::exists(rp)) { result["state"]="ERROR";result["differences"].push_back("missing_observer:"+path_text(relative));continue; }
+        if(observer.value("expect","")=="absent") { if(fs::exists(native_path(lp))||fs::exists(native_path(rp))) diff("expected_absent:"+path_text(relative)); continue; }
+        if(!fs::exists(native_path(lp))||!fs::exists(native_path(rp))) { result["state"]="ERROR";result["differences"].push_back("missing_observer:"+path_text(relative));continue; }
         auto kind=observer.value("kind","files");
         if(kind!="files"&&kind!="sqlite") throw std::runtime_error("Observador desconocido");
         auto a=kind=="sqlite"?sqlite_snapshot(lp):observed_files(lp);
@@ -249,7 +249,7 @@ Json compare_outputs(const Json& test,const Json& l,const Json& r,const fs::path
 }
 Json run_builds(const Project& p,Log log,Cancel* cancel) {
     auto before=audit_inventory_gate(p,log,cancel); if(!before.value("complete",false)) throw std::runtime_error("Inventario incompleto; no se registrará compilación válida");
-    auto run=p.state_dir()/L"builds"/wide(unique_id()); fs::create_directories(run);
+    auto run=p.state_dir()/L"builds"/wide(unique_id()); fs::create_directories(native_path(run));
     Json result={{"id",run.filename().string()},{"at",now()},{"fingerprints",fingerprints(before)},{"builds",Json::array()}};
     for(const auto& b:p.config.value("builds",Json::array())) {
         if(cancel&&cancel->requested) break;
@@ -327,7 +327,7 @@ Json run_cases(const Project& p, Log log, Cancel* cancel, const std::vector<std:
             throw std::runtime_error("Caso no configurado: " + id);
     }
     auto before=audit_inventory_gate(p,log,cancel); if(!before.value("complete",false)) throw std::runtime_error("Inventario incompleto; revise raíces");
-    auto run=p.state_dir()/L"runs"/wide(unique_id()); fs::create_directories(run);
+    auto run=p.state_dir()/L"runs"/wide(unique_id()); fs::create_directories(native_path(run));
     Json results={{"id",run.filename().string()},{"at",now()},{"fingerprints",fingerprints(before)},{"cases",Json::array()}};
     for(const auto& test:configured) {
         if(cancel&&cancel->requested) break;
@@ -336,16 +336,16 @@ Json run_cases(const Project& p, Log log, Cancel* cancel, const std::vector<std:
         const bool has_lr=(test.contains("left")&&test["left"].is_object())||(test.contains("right")&&test["right"].is_object());
         const std::string kind=test.value("kind",has_lr?"differential":"target_test");
         Json result={{"id",test["id"]},{"kind",kind},{"config_sha256",sha256(test.dump())},{"state","ERROR"}};
-        auto case_dir=run/wide(unique_id()); fs::create_directories(case_dir);
+        auto case_dir=run/wide(unique_id()); fs::create_directories(native_path(case_dir));
         try {
             if(kind=="target_test") {
                 const Json& runner=test.contains("target")?test.at("target"):test;
-                auto work=case_dir/L"target"; fs::create_directories(work);
+                auto work=case_dir/L"target"; fs::create_directories(native_path(work));
                 Json fixture_hashes=Json::object();
                 for(const auto& fixture:test.value("fixtures",Json::array())) {
                     auto src=p.resolve(fixture.at("source")); auto dst=work/fs::path(wide(fixture.at("destination")));
-                    if(!within(dst,work)||!fs::is_regular_file(src)) throw std::runtime_error("Fixture inválido");
-                    fs::create_directories(dst.parent_path()); fs::copy_file(src,dst,fs::copy_options::none);
+                    if(!within(dst,work)||!fs::is_regular_file(native_path(src))) throw std::runtime_error("Fixture inválido");
+                    fs::create_directories(native_path(dst.parent_path())); fs::copy_file(native_path(src),native_path(dst),fs::copy_options::none);
                     fixture_hashes[path_text(src)]=hash_file(src);
                 }
                 auto root_path=p.resolve(root_config(p,runner.at("root"))["path"]);
@@ -388,7 +388,7 @@ Json run_cases(const Project& p, Log log, Cancel* cancel, const std::vector<std:
                     }
                     for(const auto& req_art:test.value("required_artifacts",Json::array())) {
                         auto art_file=p.resolve(expand(req_art.get<std::string>(),p,work,path_text(root_path)));
-                        if(!fs::is_regular_file(art_file)) { ok=false; result["differences"].push_back("missing_artifact:"+path_text(art_file)); }
+                        if(!fs::is_regular_file(native_path(art_file))) { ok=false; result["differences"].push_back("missing_artifact:"+path_text(art_file)); }
                         else result["artifacts"][path_text(art_file)]=hash_file(art_file);
                     }
                     result["state"]=ok?"PASS":"DIFFERENT";
@@ -397,12 +397,12 @@ Json run_cases(const Project& p, Log log, Cancel* cancel, const std::vector<std:
             } else {
                 std::vector<fs::path> works; Json executed=Json::array();
                 for(const auto* side:{"left","right"}) {
-                    auto work=case_dir/wide(side); fs::create_directories(work); works.push_back(work);
+                    auto work=case_dir/wide(side); fs::create_directories(native_path(work)); works.push_back(work);
                     Json fixture_hashes=Json::object();
                     for(const auto& fixture:test.value("fixtures",Json::array())) {
                         auto src=p.resolve(fixture.at("source")); auto dst=work/fs::path(wide(fixture.at("destination")));
-                        if(!within(dst,work)||!fs::is_regular_file(src)) throw std::runtime_error("Fixture inválido");
-                        fs::create_directories(dst.parent_path()); fs::copy_file(src,dst,fs::copy_options::none);
+                        if(!within(dst,work)||!fs::is_regular_file(native_path(src))) throw std::runtime_error("Fixture inválido");
+                        fs::create_directories(native_path(dst.parent_path())); fs::copy_file(native_path(src),native_path(dst),fs::copy_options::none);
                         fixture_hashes[path_text(src)]=hash_file(src);
                     }
                     auto args=command(test[side],p,work); auto inputs=execution_files(args,work);

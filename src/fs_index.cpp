@@ -506,18 +506,38 @@ CREATE INDEX IF NOT EXISTS idx_fs_nodes_size ON fs_nodes(root_id, size_bytes) WH
 int64_t fs_ensure_root(const Project& p, Database& db, const Json& root_cfg) {
     fs_schema(db);
     const std::string key = root_cfg.at("id").get<std::string>();
-    const std::string abs_path = path_text(p.resolve(root_cfg.at("path").get<std::string>()));
+    const fs::path resolved = p.resolve(root_cfg.at("path").get<std::string>());
+    const std::string abs_path = path_text(resolved);
     const std::string role = root_cfg.value("role", "workspace");
     const std::string mode = project_mode(p);
-    auto rows = db.query("SELECT root_id, abs_path, role, mode FROM fs_roots WHERE root_key=?", {key});
+    const uint64_t root_frn = query_path_frn(resolved);
+    auto rows = db.query("SELECT root_id, abs_path, role, mode, root_frn FROM fs_roots WHERE root_key=?", {key});
     if (!rows.empty()) {
-        int64_t rid = rows[0]["root_id"].get<int64_t>();
-        if (rows[0]["abs_path"] != abs_path || rows[0]["role"] != role || rows[0]["mode"] != mode) {
+        const int64_t rid = rows[0]["root_id"].get<int64_t>();
+        const std::string existing_abs = rows[0]["abs_path"].get<std::string>();
+        const uint64_t existing_frn = static_cast<uint64_t>(rows[0]["root_frn"].get<int64_t>());
+        const bool path_changed = (to_lower_ascii(normalize_rel_path(existing_abs)) != to_lower_ascii(normalize_rel_path(abs_path)));
+        const bool frn_changed = (existing_frn != 0 && root_frn != 0 && existing_frn != root_frn);
+        if (path_changed || frn_changed) {
+            ScopedTx tx(db);
+            db.exec("DELETE FROM fs_nodes WHERE root_id=?", {rid});
+            db.exec("DELETE FROM fs_dirs WHERE root_id=?", {rid});
+            db.exec("DELETE FROM fs_dir_fts WHERE root_id=?", {rid});
+            db.exec("DELETE FROM fs_hashes WHERE root_id=?", {rid});
+            db.exec("DELETE FROM fs_errors WHERE root_id=?", {rid});
+            exec_raw(db.native_handle(), "INSERT INTO fs_name_fts(fs_name_fts) VALUES('rebuild');");
+            db.exec("UPDATE fs_roots SET abs_path=?, role=?, mode=?, volume_guid='', volume_serial=0, "
+                    "usn_journal_id=0, next_usn=0, root_frn=?, complete=0, last_sync_ns=0, "
+                    "total_files=0, total_dirs=0, total_links=0, total_bytes=0, scan_errors=0 WHERE root_id=?",
+                    {abs_path, role, mode, static_cast<int64_t>(root_frn), rid});
+            tx.commit();
+        } else if (existing_abs != abs_path || rows[0]["role"] != role || rows[0]["mode"] != mode) {
             db.exec("UPDATE fs_roots SET abs_path=?, role=?, mode=? WHERE root_id=?", {abs_path, role, mode, rid});
         }
         return rid;
     }
-    db.exec("INSERT INTO fs_roots(root_key,abs_path,role,mode) VALUES(?,?,?,?)", {key, abs_path, role, mode});
+    db.exec("INSERT INTO fs_roots(root_key,abs_path,role,mode,root_frn) VALUES(?,?,?,?,?)",
+            {key, abs_path, role, mode, static_cast<int64_t>(root_frn)});
     return db.integer("SELECT root_id FROM fs_roots WHERE root_key=?", {key});
 }
 
@@ -699,6 +719,7 @@ Json fs_bulk_replace_root(Database& db, int64_t root_id, uint64_t root_frn, int6
     {
         db.begin();
         try {
+            db.exec("UPDATE fs_roots SET complete=0 WHERE root_id=?", {root_id});
             if (!new_exts.empty()) {
                 RawStmt ins_ext(raw, "INSERT OR IGNORE INTO fs_extensions(ext_id,ext) VALUES(?,?)");
                 for (const auto& [eid, ename] : new_exts) {
@@ -885,7 +906,7 @@ void fs_apply_upsert(Database& db, int64_t root_id, uint64_t frn, uint64_t paren
     const std::string ext = (kind == static_cast<int>(FsNodeKind::Directory)) ? "" : extract_ext_lower(name);
     const int64_t ext_id = get_or_create_ext_id(db, ext);
 
-    auto existing = db.query("SELECT node_id, parent_frn, name, kind, size_bytes, flags FROM fs_nodes WHERE root_id=? AND frn=?",
+    auto existing = db.query("SELECT node_id, parent_frn, name, kind, size_bytes, mtime_ns, flags FROM fs_nodes WHERE root_id=? AND frn=?",
                              {root_id, static_cast<int64_t>(frn)});
     if (!existing.empty()) {
         const auto& row = existing[0];
@@ -894,38 +915,44 @@ void fs_apply_upsert(Database& db, int64_t root_id, uint64_t frn, uint64_t paren
         const std::string old_name = row["name"].get<std::string>();
         const int old_kind = row["kind"].get<int>();
         const int64_t old_size = row["size_bytes"].get<int64_t>();
+        const int64_t old_mtime = row["mtime_ns"].get<int64_t>();
         const int64_t old_flags = row["flags"].get<int64_t>();
         const bool was_deleted = (old_flags & 1) != 0;
 
-        if (!was_deleted && (old_parent != parent_frn || old_name != name)) {
-            fs_apply_rename_or_move(db, root_id, frn, parent_frn, name, mtime_ns, log_change);
-        }
-
-        if (was_deleted || old_size != size_bytes || old_kind != kind) {
-            if (was_deleted) {
-                db.exec("INSERT INTO fs_name_fts(rowid, name) VALUES(?,?)", {node_id, name});
-            }
-            db.exec("UPDATE fs_nodes SET parent_frn=?, name=?, ext_id=?, kind=?, size_bytes=?, mtime_ns=?, attrs=?, flags=0, link_target=? WHERE node_id=?",
-                    {static_cast<int64_t>(parent_frn), name, ext_id, kind, size_bytes, mtime_ns, static_cast<int64_t>(attrs), link_target, node_id});
-            if (kind == static_cast<int>(FsNodeKind::File)) {
-                int64_t d_files = was_deleted ? 1 : 0;
-                int64_t d_bytes = was_deleted ? size_bytes : (size_bytes - old_size);
-                if (was_deleted) {
-                    db.exec("UPDATE fs_dirs SET direct_files=direct_files+1 WHERE root_id=? AND frn=?",
-                            {root_id, static_cast<int64_t>(parent_frn)});
-                }
-                update_ancestors_delta(db, root_id, parent_frn, d_files, 0, d_bytes);
-            }
-            if (log_change) {
-                std::string rel = join_rel(lookup_dir_rel(db, root_id, parent_frn), name);
-                log_fs_change(db, root_id, frn, was_deleted ? "created" : "modified", kind, "", rel, size_bytes);
-            }
+        if (was_deleted) {
+            db.exec("DELETE FROM fs_nodes WHERE node_id=?", {node_id});
+        } else if (old_kind != kind) {
+            fs_apply_delete(db, root_id, frn, false);
         } else {
-            db.exec("UPDATE fs_nodes SET mtime_ns=?, attrs=?, link_target=? WHERE node_id=?",
-                    {mtime_ns, static_cast<int64_t>(attrs), link_target, node_id});
+            const bool moved_or_renamed = (old_parent != parent_frn || old_name != name);
+            if (moved_or_renamed) {
+                fs_apply_rename_or_move(db, root_id, frn, parent_frn, name, mtime_ns, log_change);
+            }
+            if (old_size != size_bytes) {
+                db.exec("UPDATE fs_nodes SET size_bytes=?, mtime_ns=?, attrs=?, flags=0, link_target=? WHERE node_id=?",
+                        {size_bytes, mtime_ns, static_cast<int64_t>(attrs), link_target, node_id});
+                db.exec("DELETE FROM fs_hashes WHERE root_id=? AND frn=?", {root_id, static_cast<int64_t>(frn)});
+                if (kind == static_cast<int>(FsNodeKind::File)) {
+                    update_ancestors_delta(db, root_id, parent_frn, 0, 0, size_bytes - old_size);
+                }
+                if (log_change && !moved_or_renamed) {
+                    std::string rel = join_rel(lookup_dir_rel(db, root_id, parent_frn), name);
+                    log_fs_change(db, root_id, frn, "modified", kind, "", rel, size_bytes);
+                }
+            } else {
+                if (old_mtime != mtime_ns) {
+                    db.exec("DELETE FROM fs_hashes WHERE root_id=? AND frn=?", {root_id, static_cast<int64_t>(frn)});
+                }
+                db.exec("UPDATE fs_nodes SET mtime_ns=?, attrs=?, link_target=? WHERE node_id=?",
+                        {mtime_ns, static_cast<int64_t>(attrs), link_target, node_id});
+                if (kind == static_cast<int>(FsNodeKind::Directory) && mtime_ns > 0) {
+                    db.exec("UPDATE fs_dirs SET dir_mtime_ns=? WHERE root_id=? AND frn=?",
+                            {mtime_ns, root_id, static_cast<int64_t>(frn)});
+                }
+            }
+            tx.commit();
+            return;
         }
-        tx.commit();
-        return;
     }
 
     // Evict any superseded FRN previously occupying the exact same (parent_frn, name)
@@ -1044,11 +1071,10 @@ bool fs_apply_rename_or_move(Database& db, int64_t root_id, uint64_t frn,
             db.exec("UPDATE fs_dirs SET parent_frn=?, rel_path=?, depth=?, dir_mtime_ns=CASE WHEN ?>0 THEN ? ELSE dir_mtime_ns END WHERE root_id=? AND frn=?",
                     {static_cast<int64_t>(new_parent_frn), new_rel, new_depth, new_mtime_ns, new_mtime_ns, root_id, static_cast<int64_t>(frn)});
 
-            // Update descendant subdirs in one B-tree range SQL statement
+            // Update descendant subdirs in one B-tree range SQL statement (use SQLite length(?) for exact UTF-8 codepoint offset)
             if (!prev_rel.empty()) {
-                const int64_t cut_pos = static_cast<int64_t>(old_pfx.size()) + 1;
-                db.exec("UPDATE fs_dirs SET rel_path=? || substr(rel_path, ?), depth=depth+? WHERE root_id=? AND rel_path>=? AND rel_path<?",
-                        {new_pfx, cut_pos, depth_delta, root_id, old_pfx, old_hi});
+                db.exec("UPDATE fs_dirs SET rel_path=? || substr(rel_path, length(?) + 1), depth=depth+? WHERE root_id=? AND rel_path>=? AND rel_path<?",
+                        {new_pfx, old_pfx, depth_delta, root_id, old_pfx, old_hi});
             }
 
             // Re-index moved dir + descendant subdirs into fs_dir_fts

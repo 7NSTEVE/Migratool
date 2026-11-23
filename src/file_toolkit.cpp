@@ -231,7 +231,11 @@ Json tool_create_file(const Project& p, Database& db, const Json& args) {
         prev_content = read_text(abs_path, 32 * 1024 * 1024);
     }
 
-    write_text(abs_path, content);
+    if (!overwrite) {
+        write_text_exclusive(abs_path, content);
+    } else {
+        write_text(abs_path, content);
+    }
     const std::string digest = sha256(content);
     int64_t rev = 0;
     bool tx_active = false;
@@ -240,6 +244,7 @@ Json tool_create_file(const Project& p, Database& db, const Json& args) {
         tx_active = true;
         fs_sync_single_path(p, db, abs_path, true);
         if (args.value("inject_db_failure", false)) {
+            if (!failpoints_enabled()) throw std::runtime_error("SAFETY_VIOLATION: inject_db_failure deshabilitado en producción");
             throw std::runtime_error("INJECTED_DB_FAILURE_FOR_ROLLBACK_TEST");
         }
         const uint64_t new_frn = query_path_frn(abs_path);
@@ -289,6 +294,9 @@ Json tool_edit_file(const Project& p, Database& db, const Json& args) {
     const std::string actor = args.value("actor", "agent");
     const std::string expected_sha = args.value("expected_sha256", "");
     const int inject_fail_after = args.value("inject_failure_after_file", -1);
+    if ((inject_fail_after >= 0 || args.value("inject_db_failure", false)) && !failpoints_enabled()) {
+        throw std::runtime_error("SAFETY_VIOLATION: failpoints de prueba deshabilitados en producción");
+    }
 
     struct FileEditPlan {
         std::string root_key;

@@ -55,6 +55,7 @@ DWORD run_child_process_and_wait(const std::wstring& cmdline_str, const fs::path
 
 int wmain(int argc, wchar_t** argv) {
     using namespace mt;
+    mt::set_failpoints_enabled_for_tests(true);
     try {
         if (argc != 2) throw std::runtime_error("Requiere raíz del repositorio");
         auto root_dir = fs::path(argv[1]);

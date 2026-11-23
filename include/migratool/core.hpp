@@ -18,6 +18,8 @@ std::string path_text(const fs::path&);
 fs::path native_path(const fs::path&);
 std::string read_text(const fs::path&, size_t limit = 256 * 1024 * 1024);
 void write_text(const fs::path&, const std::string&);
+void write_text_exclusive(const fs::path&, const std::string&);
+void append_durable_line(const fs::path&, const std::string&);
 Json read_json(const fs::path&);
 void write_json(const fs::path&, const Json&);
 std::string sha256(const std::string&);
@@ -27,6 +29,11 @@ std::string now();
 std::string unique_id();
 fs::path executable_dir();
 bool within(const fs::path&, const fs::path&);
+fs::path canonical_win32_path(const fs::path&);
+bool has_reparse_point_in_chain(const fs::path& candidate, const fs::path& stop_ancestor = {});
+bool is_path_within_dir(const fs::path& candidate, const fs::path& dir, bool allow_equal = true, bool reject_reparse = true);
+bool failpoints_enabled();
+void set_failpoints_enabled_for_tests(bool enabled);
 std::wstring quote_arg(const std::wstring&);
 Json run_process(const std::vector<std::string>& argv, const fs::path& cwd,
                  const std::string& input, const fs::path& logs, unsigned timeout_ms = 30000,
@@ -39,6 +46,9 @@ struct Project {
     fs::path directory() const { return file.parent_path(); }
     fs::path state_dir() const;
     fs::path resolve(const std::string&) const;
+    fs::path resolve_confined(const std::string& raw, bool allow_state_dir = false,
+                              std::string* out_root_id = nullptr, std::string* out_rel = nullptr,
+                              bool allow_root_equal = false, bool reject_ambiguous_rel = false) const;
     void save() const;
     static Project load(const fs::path&);
     static Project create(const fs::path&, const std::string&, const Json& roots);

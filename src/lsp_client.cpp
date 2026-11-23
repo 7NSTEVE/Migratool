@@ -234,25 +234,35 @@ class LspSession {
     }
 
     void reader_loop() {
+        constexpr size_t MAX_LSP_CONTENT_LEN = 32 * 1024 * 1024;
         std::string buf;
         char chunk[8192];
-        while (alive_.load()) {
+        bool protocol_error = false;
+        while (alive_.load() && !protocol_error) {
             DWORD got = 0;
             if (!ReadFile(stdout_rd_, chunk, sizeof(chunk), &got, nullptr) || got == 0) break;
             buf.append(chunk, got);
+            if (buf.size() > MAX_LSP_CONTENT_LEN + 65536) {
+                break;
+            }
             for (;;) {
                 auto hdr_end = buf.find("\r\n\r\n");
                 if (hdr_end == std::string::npos) break;
-                size_t content_len = 0;
+                int64_t parsed_len = -1;
                 std::istringstream hss(buf.substr(0, hdr_end));
                 std::string line;
                 while (std::getline(hss, line)) {
                     if (!line.empty() && line.back() == '\r') line.pop_back();
                     auto low = lower_lsp(line);
                     if (low.starts_with("content-length:")) {
-                        try { content_len = static_cast<size_t>(std::stoull(line.substr(15))); } catch (...) {}
+                        try { parsed_len = std::stoll(line.substr(15)); } catch (...) { parsed_len = -1; }
                     }
                 }
+                if (parsed_len <= 0 || parsed_len > static_cast<int64_t>(MAX_LSP_CONTENT_LEN)) {
+                    protocol_error = true;
+                    break;
+                }
+                const size_t content_len = static_cast<size_t>(parsed_len);
                 if (buf.size() < hdr_end + 4 + content_len) break;
                 std::string payload = buf.substr(hdr_end + 4, content_len);
                 buf.erase(0, hdr_end + 4 + content_len);
@@ -309,7 +319,10 @@ public:
         job_ = CreateJobObjectW(nullptr, nullptr);
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jinfo{};
         jinfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (job_) SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &jinfo, sizeof(jinfo));
+        if (job_ && !SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &jinfo, sizeof(jinfo))) {
+            CloseHandle(job_);
+            job_ = nullptr;
+        }
 
         std::wstring cmd;
         for (const auto& a : argv_) {
@@ -334,7 +347,10 @@ public:
             if (job_) { CloseHandle(job_); job_ = nullptr; }
             return false;
         }
-        if (job_) AssignProcessToJobObject(job_, pi.hProcess);
+        if (job_ && !AssignProcessToJobObject(job_, pi.hProcess)) {
+            CloseHandle(job_);
+            job_ = nullptr;
+        }
         ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
 
@@ -384,8 +400,9 @@ public:
         }
         if (stdin_wr_ != INVALID_HANDLE_VALUE) { CloseHandle(stdin_wr_); stdin_wr_ = INVALID_HANDLE_VALUE; }
         if (proc_) {
-            if (WaitForSingleObject(proc_, 400) == WAIT_TIMEOUT && job_) {
-                TerminateJobObject(job_, 0);
+            if (WaitForSingleObject(proc_, 400) == WAIT_TIMEOUT) {
+                if (job_) TerminateJobObject(job_, 0);
+                TerminateProcess(proc_, 0);
                 WaitForSingleObject(proc_, 1000);
             }
             CloseHandle(proc_);
@@ -465,7 +482,8 @@ public:
         }
     }
 
-    Json collect_diagnostics(const fs::path& file_path, unsigned wait_ms = 1200) {
+    Json collect_diagnostics(const fs::path& file_path, unsigned wait_ms = 1200, bool* out_timed_out = nullptr) {
+        if (out_timed_out) *out_timed_out = false;
         sync_document(file_path);
         std::string uri = percent_encode_uri(path_text(file_path));
         std::string key = lower_lsp(uri);
@@ -479,11 +497,15 @@ public:
         }
         // Otherwise wait briefly for publishDiagnostics notification
         std::unique_lock lk(state_mu_);
-        cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [&]() {
+        bool received = cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [&]() {
             return diagnostics_.contains(key) || !alive_.load();
         });
         auto it = diagnostics_.find(key);
-        return (it != diagnostics_.end()) ? it->second : Json::array();
+        if (it != diagnostics_.end()) {
+            return it->second;
+        }
+        if (out_timed_out) *out_timed_out = !received || !diagnostics_.contains(key);
+        return Json::array();
     }
 };
 
@@ -621,11 +643,17 @@ Json normalize_locations(const Json& lsp_result) {
 
 // Convert 0-based (line, UTF-16 code unit column) per LSP 3.17 specification to UTF-8 byte offset
 size_t line_col_to_offset(const std::string& text, int line_0, int utf16_col_0) {
+    if (line_0 < 0 || utf16_col_0 < 0) {
+        throw std::runtime_error("LSP_OFFSET_OUT_OF_RANGE: posición UTF-16 inválida en WorkspaceEdit");
+    }
     int cur_line = 0;
     size_t pos = 0;
     while (cur_line < line_0 && pos < text.size()) {
         if (text[pos] == '\n') ++cur_line;
         ++pos;
+    }
+    if (cur_line < line_0) {
+        throw std::runtime_error("LSP_OFFSET_OUT_OF_RANGE: posición UTF-16 inválida en WorkspaceEdit");
     }
     size_t byte_off = 0;
     int u16_col = 0;
@@ -647,12 +675,17 @@ size_t line_col_to_offset(const std::string& text, int line_0, int utf16_col_0) 
         } else if ((c & 0xF8) == 0xF0) {
             seq_len = 4;
             u16_step = 2; // Astral code point -> UTF-16 surrogate pair (2 code units)
+        } else {
+            throw std::runtime_error("LSP_OFFSET_OUT_OF_RANGE: posición UTF-16 inválida en WorkspaceEdit");
         }
         if (pos + byte_off + seq_len > text.size()) {
-            seq_len = text.size() - (pos + byte_off);
+            throw std::runtime_error("LSP_OFFSET_OUT_OF_RANGE: posición UTF-16 inválida en WorkspaceEdit");
         }
         byte_off += seq_len;
         u16_col += u16_step;
+    }
+    if (u16_col != utf16_col_0) {
+        throw std::runtime_error("LSP_OFFSET_OUT_OF_RANGE: posición UTF-16 inválida en WorkspaceEdit");
     }
     return pos + byte_off;
 }
@@ -678,7 +711,8 @@ Json tool_get_diagnostics(const Project& p, Database& db, const Json& args) {
     fs::path abs = resolve_lsp_target_file(p, db, args, line_0, col_0, root_dir, lang);
 
     if (auto sess = lsp_manager().get_or_start(p, lang, root_dir)) {
-        auto diags = sess->collect_diagnostics(abs, static_cast<unsigned>(args.value("wait_ms", 1200)));
+        bool timed_out = false;
+        auto diags = sess->collect_diagnostics(abs, static_cast<unsigned>(args.value("wait_ms", 1200)), &timed_out);
         Json items = Json::array();
         for (const auto& d : diags) {
             int sev = d.value("severity", 1);
@@ -699,6 +733,7 @@ Json tool_get_diagnostics(const Project& p, Database& db, const Json& args) {
             {"backend", "lsp:" + sess->server_name()},
             {"language", lang},
             {"path", path_text(abs)},
+            {"timed_out", timed_out},
             {"count", items.size()},
             {"items", std::move(items)}
         };
@@ -718,6 +753,7 @@ Json tool_get_diagnostics(const Project& p, Database& db, const Json& args) {
         {"backend", "native_index_fallback"},
         {"language", lang},
         {"path", path_text(abs)},
+        {"timed_out", false},
         {"count", items.size()},
         {"items", std::move(items)}
     };
@@ -861,14 +897,18 @@ Json tool_lsp_rename_symbol(const Project& p, Database& db, const Json& args) {
     }
 
     // Validate all targets are inside authorized workspace roots & compute transactional edit plan
-    struct PlannedFile { fs::path path; std::string original; std::string updated; size_t edit_count; };
+    struct PlannedFile { fs::path path; std::string original; std::string original_sha; std::string updated; size_t edit_count; };
     std::vector<PlannedFile> plan;
     for (const auto& [fp, edits] : file_edits) {
         bool authorized = false;
-        for (const auto& r : p.config["roots"]) if (within(fp, p.resolve(r["path"]))) { authorized = true; break; }
+        for (const auto& r : p.config["roots"]) {
+            fs::path rb = p.resolve(r["path"]);
+            if (is_path_within_dir(fp, rb, false, true)) { authorized = true; break; }
+        }
         if (!authorized) throw std::runtime_error("LSP_RENAME_OUTSIDE_WORKSPACE: " + path_text(fp));
 
         std::string orig = read_text(fp, 16 * 1024 * 1024);
+        std::string orig_sha = sha256(orig);
         struct SpanEdit { size_t start; size_t end; std::string text; };
         std::vector<SpanEdit> spans;
         for (const auto& te : edits) {
@@ -900,7 +940,7 @@ Json tool_lsp_rename_symbol(const Project& p, Database& db, const Json& args) {
         for (const auto& sp : spans) {
             upd.replace(sp.start, sp.end - sp.start, sp.text);
         }
-        plan.push_back(PlannedFile{fp, std::move(orig), std::move(upd), spans.size()});
+        plan.push_back(PlannedFile{fp, std::move(orig), std::move(orig_sha), std::move(upd), spans.size()});
     }
 
     if (dry_run) {
@@ -911,12 +951,18 @@ Json tool_lsp_rename_symbol(const Project& p, Database& db, const Json& args) {
 
     // Unified atomic transactional write + SQLite sync/commit with full disk & DB rollback on failure
     const bool inject_db_failure = args.value("inject_db_failure", false);
+    if (inject_db_failure && !failpoints_enabled()) {
+        throw std::runtime_error("SAFETY_VIOLATION: inject_db_failure deshabilitado en producción");
+    }
     size_t written = 0;
     bool tx_active = false;
     int64_t rev = 0;
     Json files = Json::array();
     try {
         for (size_t i = 0; i < plan.size(); ++i) {
+            if (hash_file(plan[i].path) != plan[i].original_sha) {
+                throw std::runtime_error("CONCURRENT_MODIFICATION: el archivo cambió antes de aplicar WorkspaceEdit: " + path_text(plan[i].path));
+            }
             write_text(plan[i].path, plan[i].updated);
             written = i + 1;
         }

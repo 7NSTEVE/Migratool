@@ -17,6 +17,16 @@ struct Handle {
     explicit Handle(HANDLE v = INVALID_HANDLE_VALUE) : h(v) {}
     ~Handle() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
     Handle(const Handle&) = delete;
+    Handle& operator=(const Handle&) = delete;
+    Handle(Handle&& o) noexcept : h(o.h) { o.h = INVALID_HANDLE_VALUE; }
+    Handle& operator=(Handle&& o) noexcept {
+        if (this != &o) {
+            if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            h = o.h;
+            o.h = INVALID_HANDLE_VALUE;
+        }
+        return *this;
+    }
 };
 std::runtime_error error(const std::string& what) {
     return std::runtime_error(what + " (Win32 " + std::to_string(GetLastError()) + ")");
@@ -137,10 +147,28 @@ void write_text(const fs::path& p, const std::string& s) {
     const auto destination = native_path(p);
     if (!destination.parent_path().empty()) fs::create_directories(destination.parent_path());
     {
-        std::ofstream out(native_staged, std::ios::binary);
-        out.write(s.data(), static_cast<std::streamsize>(s.size()));
-        out.flush();
-        if (!out) throw std::runtime_error("No se pudo escribir: " + path_text(staged));
+        Handle out(CreateFileW(native_staged.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (out.h == INVALID_HANDLE_VALUE) throw error("No se pudo crear staging: " + path_text(staged));
+        size_t off = 0;
+        while (off < s.size()) {
+            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(s.size() - off, 16 * 1024 * 1024));
+            DWORD written = 0;
+            if (!WriteFile(out.h, s.data() + off, chunk, &written, nullptr) || written != chunk) {
+                const DWORD werr = GetLastError();
+                out = Handle{};
+                DeleteFileW(native_staged.c_str());
+                SetLastError(werr);
+                throw error("No se pudo escribir: " + path_text(staged));
+            }
+            off += written;
+        }
+        if (!FlushFileBuffers(out.h)) {
+            const DWORD ferr = GetLastError();
+            out = Handle{};
+            DeleteFileW(native_staged.c_str());
+            SetLastError(ferr);
+            throw error("No se pudo sincronizar a disco (FlushFileBuffers): " + path_text(staged));
+        }
     }
     const auto start = GetTickCount64();
     for (unsigned attempt = 0;; ++attempt) {
@@ -154,6 +182,60 @@ void write_text(const fs::path& p, const std::string& s) {
         DeleteFileW(native_staged.c_str());
         SetLastError(err);
         throw error("No se pudo guardar " + path_text(p));
+    }
+}
+void write_text_exclusive(const fs::path& p, const std::string& s) {
+    const auto destination = native_path(p);
+    if (!destination.parent_path().empty()) fs::create_directories(destination.parent_path());
+    Handle out(CreateFileW(destination.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (out.h == INVALID_HANDLE_VALUE) {
+        const DWORD err = GetLastError();
+        if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
+            throw std::runtime_error("Archivo ya existe y overwrite=false: " + path_text(p));
+        }
+        SetLastError(err);
+        throw error("No se pudo crear archivo exclusivo: " + path_text(p));
+    }
+    size_t off = 0;
+    while (off < s.size()) {
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(s.size() - off, 16 * 1024 * 1024));
+        DWORD written = 0;
+        if (!WriteFile(out.h, s.data() + off, chunk, &written, nullptr) || written != chunk) {
+            const DWORD werr = GetLastError();
+            out = Handle{};
+            DeleteFileW(destination.c_str());
+            SetLastError(werr);
+            throw error("No se pudo escribir archivo exclusivo: " + path_text(p));
+        }
+        off += written;
+    }
+    if (!FlushFileBuffers(out.h)) {
+        const DWORD ferr = GetLastError();
+        out = Handle{};
+        DeleteFileW(destination.c_str());
+        SetLastError(ferr);
+        throw error("No se pudo sincronizar archivo exclusivo (FlushFileBuffers): " + path_text(p));
+    }
+}
+void append_durable_line(const fs::path& p, const std::string& line) {
+    const auto destination = native_path(p);
+    if (!destination.parent_path().empty()) fs::create_directories(destination.parent_path());
+    Handle out(CreateFileW(destination.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (out.h == INVALID_HANDLE_VALUE) throw error("No se pudo abrir journal durable: " + path_text(p));
+    std::string payload = line;
+    if (payload.empty() || payload.back() != '\n') payload.push_back('\n');
+    size_t off = 0;
+    while (off < payload.size()) {
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(payload.size() - off, 16 * 1024 * 1024));
+        DWORD written = 0;
+        if (!WriteFile(out.h, payload.data() + off, chunk, &written, nullptr) || written != chunk) {
+            throw error("No se pudo escribir línea en journal durable: " + path_text(p));
+        }
+        off += written;
+    }
+    if (!FlushFileBuffers(out.h)) {
+        throw error("No se pudo sincronizar journal durable (FlushFileBuffers): " + path_text(p));
     }
 }
 Json read_json(const fs::path& p) { return Json::parse(read_text(p)); }
@@ -216,6 +298,146 @@ bool within(const fs::path& child, const fs::path& parent) {
         if (ci == c.end() || CompareStringOrdinal(ci->c_str(), -1, pi->c_str(), -1, TRUE) != CSTR_EQUAL) return false;
     return true;
 }
+namespace {
+std::wstring strip_win32_extended_prefix(std::wstring s) {
+    if (s.starts_with(L"\\\\?\\UNC\\")) return L"\\\\" + s.substr(8);
+    if (s.starts_with(L"\\\\?\\")) return s.substr(4);
+    return s;
+}
+bool path_is_unc(const fs::path& p) {
+    const std::wstring w = p.wstring();
+    return w.starts_with(L"\\\\") || w.starts_with(L"//");
+}
+bool equal_path_segment(const fs::path& a, const fs::path& b) {
+    return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+} // namespace
+
+fs::path canonical_win32_path(const fs::path& input) {
+    if (input.empty()) return {};
+    std::error_code ec;
+    fs::path abs_p = input.is_absolute() ? input : fs::absolute(input, ec);
+    if (ec) abs_p = input;
+    abs_p = fs::path(strip_win32_extended_prefix(abs_p.wstring())).lexically_normal();
+
+    std::vector<fs::path> tail;
+    fs::path cur = abs_p;
+    for (;;) {
+        const DWORD attrs = GetFileAttributesW(native_path(cur).c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES) {
+            Handle h(CreateFileW(native_path(cur).c_str(), 0,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                 nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+            if (h.h != INVALID_HANDLE_VALUE) {
+                DWORD need = GetFinalPathNameByHandleW(h.h, nullptr, 0, VOLUME_NAME_DOS);
+                if (need > 0) {
+                    std::wstring buf(need + 1, L'\0');
+                    DWORD got = GetFinalPathNameByHandleW(h.h, buf.data(), static_cast<DWORD>(buf.size()), VOLUME_NAME_DOS);
+                    if (got > 0 && got < buf.size()) {
+                        buf.resize(got);
+                        cur = fs::path(strip_win32_extended_prefix(std::move(buf))).lexically_normal();
+                    }
+                }
+            }
+            break;
+        }
+        fs::path parent = cur.parent_path();
+        if (parent.empty() || parent == cur) break;
+        tail.push_back(cur.filename());
+        cur = parent;
+    }
+    for (auto it = tail.rbegin(); it != tail.rend(); ++it) {
+        if (!it->empty() && *it != L".") cur /= *it;
+    }
+    return cur.lexically_normal();
+}
+
+bool has_reparse_point_in_chain(const fs::path& candidate, const fs::path& stop_ancestor) {
+    if (candidate.empty()) return false;
+    std::error_code ec;
+    fs::path abs_c = candidate.is_absolute() ? candidate : fs::absolute(candidate, ec);
+    abs_c = fs::path(strip_win32_extended_prefix(abs_c.wstring())).lexically_normal();
+    fs::path abs_stop;
+    if (!stop_ancestor.empty()) {
+        abs_stop = stop_ancestor.is_absolute() ? stop_ancestor : fs::absolute(stop_ancestor, ec);
+        abs_stop = fs::path(strip_win32_extended_prefix(abs_stop.wstring())).lexically_normal();
+    }
+
+    fs::path cur;
+    auto ci = abs_c.begin();
+    if (!abs_stop.empty()) {
+        auto si = abs_stop.begin();
+        bool matched_stop = true;
+        for (; si != abs_stop.end(); ++si, ++ci) {
+            if (ci == abs_c.end() || !equal_path_segment(*ci, *si)) {
+                matched_stop = false;
+                break;
+            }
+            cur /= *ci;
+        }
+        if (!matched_stop) {
+            cur.clear();
+            ci = abs_c.begin();
+        }
+    }
+    for (; ci != abs_c.end(); ++ci) {
+        cur /= *ci;
+        if (cur == cur.root_path()) continue;
+        const DWORD attrs = GetFileAttributesW(native_path(cur).c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_path_within_dir(const fs::path& candidate, const fs::path& dir, bool allow_equal, bool reject_reparse) {
+    if (candidate.empty() || dir.empty()) return false;
+    if (path_is_unc(candidate) && !path_is_unc(dir)) return false;
+
+    const fs::path lex_c = fs::path(strip_win32_extended_prefix((candidate.is_absolute() ? candidate : fs::absolute(candidate)).wstring())).lexically_normal();
+    const fs::path lex_d = fs::path(strip_win32_extended_prefix((dir.is_absolute() ? dir : fs::absolute(dir)).wstring())).lexically_normal();
+    for (const auto& part : lex_c) {
+        if (part == L"..") return false;
+    }
+
+    auto check_prefix = [&](const fs::path& c, const fs::path& d) -> bool {
+        auto ci = c.begin();
+        auto di = d.begin();
+        for (; di != d.end(); ++di, ++ci) {
+            if (di->empty() || *di == L".") {
+                if (ci != c.end() && (ci->empty() || *ci == L".")) continue;
+                --ci;
+                continue;
+            }
+            if (ci == c.end() || !equal_path_segment(*ci, *di)) return false;
+        }
+        bool exact = (ci == c.end()) || (std::next(ci) == c.end() && (ci->empty() || *ci == L"."));
+        if (exact) return allow_equal;
+        return true;
+    };
+
+    if (!check_prefix(lex_c, lex_d)) return false;
+    if (reject_reparse && has_reparse_point_in_chain(lex_c, lex_d)) return false;
+
+    const fs::path phys_c = canonical_win32_path(lex_c);
+    const fs::path phys_d = canonical_win32_path(lex_d);
+    return check_prefix(phys_c, phys_d);
+}
+namespace {
+std::atomic_bool g_failpoints_enabled{false};
+}
+bool failpoints_enabled() {
+    if (g_failpoints_enabled.load(std::memory_order_relaxed)) return true;
+    wchar_t buf[8] = {};
+    DWORD n = GetEnvironmentVariableW(L"MIGRATOOL_INTERNAL_TEST_FAILPOINTS", buf, 8);
+    return (n == 1 && buf[0] == L'1');
+}
+void set_failpoints_enabled_for_tests(bool enabled) {
+    g_failpoints_enabled.store(enabled, std::memory_order_relaxed);
+    SetEnvironmentVariableW(L"MIGRATOOL_INTERNAL_TEST_FAILPOINTS", enabled ? L"1" : nullptr);
+}
+
 std::wstring quote_arg(const std::wstring& s) {
     std::wstring result = L"\"";
     size_t slashes = 0;
@@ -243,7 +465,19 @@ Json run_process(const std::vector<std::string>& argv, const fs::path& cwd, cons
     Handle err(CreateFileW(native_path(logs / L"stderr.bin").c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
     if (in.h == INVALID_HANDLE_VALUE || out.h == INVALID_HANDLE_VALUE || err.h == INVALID_HANDLE_VALUE) throw error("No se pudieron abrir logs");
     std::wstring command;
-    for (const auto& arg : argv) { if (!command.empty()) command += L' '; command += quote_arg(wide(arg)); }
+    auto is_cmd_c = [&]() -> bool {
+        if (argv.size() != 3) return false;
+        std::string a0 = argv[0];
+        for (auto& ch : a0) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+        return (a0 == "cmd.exe" || a0 == "cmd" || a0.ends_with("\\cmd.exe") || a0.ends_with("/cmd.exe")) &&
+               (argv[1] == "/c" || argv[1] == "/C");
+    };
+    if (is_cmd_c()) {
+        // Windows cmd.exe /d /s /c strips one outer pair of quotes without backslash-unescaping inner quotes!
+        command = quote_arg(wide(argv[0])) + L" /d /s /c \"" + wide(argv[2]) + L"\"";
+    } else {
+        for (const auto& arg : argv) { if (!command.empty()) command += L' '; command += quote_arg(wide(arg)); }
+    }
     // Un bloque de entorno propio evita modificar PATH o variables del proceso de la GUI.
     struct CaseLess { bool operator()(const std::wstring& a, const std::wstring& b) const { return _wcsicmp(a.c_str(), b.c_str()) < 0; } };
     std::map<std::wstring, std::wstring, CaseLess> env;
@@ -305,6 +539,110 @@ Json run_process(const std::vector<std::string>& argv, const fs::path& cwd, cons
 fs::path Project::resolve(const std::string& s) const {
     fs::path p(wide(s)); return fs::weakly_canonical(p.is_absolute() ? p : directory() / p);
 }
+fs::path Project::resolve_confined(const std::string& raw, bool allow_state_dir,
+                                   std::string* out_root_id, std::string* out_rel,
+                                   bool allow_root_equal, bool reject_ambiguous_rel) const {
+    if (raw.empty() || raw.find('\0') != std::string::npos) {
+        throw std::runtime_error("SAFETY_VIOLATION: ruta vacía o inválida");
+    }
+    fs::path wp(wide(raw));
+    struct AuthRoot {
+        std::string id;
+        fs::path path;
+        bool is_state = false;
+    };
+    std::vector<AuthRoot> roots;
+    if (config.contains("roots") && config["roots"].is_array()) {
+        for (const auto& r : config["roots"]) {
+            if (!r.is_object() || !r.contains("path") || !r["path"].is_string()) continue;
+            roots.push_back({r.value("id", ""), resolve(r["path"].get<std::string>()), false});
+        }
+    }
+    if (allow_state_dir) {
+        roots.push_back({"__state__", canonical_win32_path(state_dir()), true});
+        if (!directory().empty()) {
+            roots.push_back({"__project__", canonical_win32_path(directory()), true});
+        }
+    }
+    if (roots.empty()) {
+        throw std::runtime_error("SAFETY_VIOLATION: el proyecto no tiene raíces autorizadas");
+    }
+
+    auto rel_for = [](const fs::path& cand, const fs::path& base) -> std::string {
+        std::error_code ec;
+        auto r = fs::relative(canonical_win32_path(cand), canonical_win32_path(base), ec);
+        std::string s = ec ? "" : path_text(r);
+        if (s == ".") s.clear();
+        return s;
+    };
+
+    if (wp.is_absolute() || wp.has_root_name() || wp.has_root_directory()) {
+        for (const auto& ar : roots) {
+            if (is_path_within_dir(wp, ar.path, allow_root_equal, true)) {
+                const fs::path phys = canonical_win32_path(wp);
+                if (out_root_id) *out_root_id = ar.id;
+                if (out_rel) *out_rel = rel_for(phys, ar.path);
+                return phys;
+            }
+        }
+        throw std::runtime_error("SAFETY_VIOLATION: ruta fuera de las raíces autorizadas: " + raw);
+    }
+
+    // Relative path: reject explicit escape outside any authorized root
+    // 1. Check if prefixed with "<root_id>/" or matches an existing file in a root
+    std::vector<std::pair<AuthRoot, fs::path>> existing_matches;
+    for (const auto& ar : roots) {
+        if (ar.is_state) continue;
+        fs::path cand = ar.path / wp;
+        if (!is_path_within_dir(cand, ar.path, allow_root_equal, true)) continue;
+        if (GetFileAttributesW(native_path(cand).c_str()) != INVALID_FILE_ATTRIBUTES) {
+            existing_matches.emplace_back(ar, canonical_win32_path(cand));
+        }
+    }
+    if (existing_matches.size() == 1 || (!reject_ambiguous_rel && !existing_matches.empty())) {
+        if (out_root_id) *out_root_id = existing_matches[0].first.id;
+        if (out_rel) *out_rel = rel_for(existing_matches[0].second, existing_matches[0].first.path);
+        return existing_matches[0].second;
+    }
+    if (reject_ambiguous_rel && existing_matches.size() > 1) {
+        throw std::runtime_error("AMBIGUOUS_ROOT_PATH: la ruta relativa existe en múltiples raíces (" + raw + "); especifique root_id o ruta absoluta");
+    }
+
+    // 2. Check directory() / wp if it lands inside an authorized root (or state_dir when allowed)
+    {
+        fs::path proj_cand = directory() / wp;
+        for (const auto& ar : roots) {
+            if (is_path_within_dir(proj_cand, ar.path, allow_root_equal, true)) {
+                const fs::path phys = canonical_win32_path(proj_cand);
+                if (out_root_id) *out_root_id = ar.id;
+                if (out_rel) *out_rel = rel_for(phys, ar.path);
+                return phys;
+            }
+        }
+    }
+
+    // 3. New file under primary root (or state_dir if allow_state_dir and no normal root fits)
+    for (const auto& ar : roots) {
+        if (ar.is_state) continue;
+        fs::path cand = ar.path / wp;
+        if (is_path_within_dir(cand, ar.path, allow_root_equal, true)) {
+            const fs::path phys = canonical_win32_path(cand);
+            if (out_root_id) *out_root_id = ar.id;
+            if (out_rel) *out_rel = rel_for(phys, ar.path);
+            return phys;
+        }
+    }
+    if (allow_state_dir) {
+        fs::path cand = state_dir() / wp;
+        if (is_path_within_dir(cand, state_dir(), allow_root_equal, true)) {
+            const fs::path phys = canonical_win32_path(cand);
+            if (out_root_id) *out_root_id = "__state__";
+            if (out_rel) *out_rel = rel_for(phys, state_dir());
+            return phys;
+        }
+    }
+    throw std::runtime_error("SAFETY_VIOLATION: ruta relativa escapa de las raíces autorizadas: " + raw);
+}
 fs::path Project::state_dir() const {
     if (config.contains("state_dir") && config["state_dir"].is_string() && !config["state_dir"].get<std::string>().empty()) {
         fs::path custom(wide(config["state_dir"].get<std::string>()));
@@ -316,7 +654,7 @@ namespace {
 struct FileLock {
     Handle h;
     explicit FileLock(const fs::path& p) : h() {
-        fs::create_directories(p.parent_path());
+        fs::create_directories(native_path(p.parent_path()));
         auto start = GetTickCount64();
         do {
             h.h = CreateFileW(native_path(p).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -354,9 +692,7 @@ void event(const Project& p, const std::string& action, const Json& detail, cons
     Json entry = {{"id",unique_id()},{"at",now()},{"actor",actor.empty()?utf8(user):actor},{"action",action},{"detail",detail}};
     index_record_event(p,action,detail,entry["actor"]);
     const auto log = p.state_dir() / L"changelog.jsonl";
-    std::ofstream out(log, std::ios::binary | std::ios::app);
-    out << entry.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n'; out.flush();
-    if (!out) throw std::runtime_error("No se pudo registrar el changelog");
+    append_durable_line(log, entry.dump(-1, ' ', false, Json::error_handler_t::replace));
 }
 void add_note(const Project& p, const std::string& text, const std::string& actor, const std::string& source) {
     if (text.empty()) throw std::runtime_error("Nota vacía");

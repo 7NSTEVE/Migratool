@@ -104,6 +104,11 @@ class SharedBudgetLedger {
         }
         return {{"budget_mib",4096},{"active_projects",active},{"total_allocated_mib",total_alloc},{"project_allocated_mib",proj_alloc}};
     }
+    static bool acquire_mutex(HANDLE h, DWORD timeout_ms = 5000) {
+        if (!h) return false;
+        const DWORD rc = WaitForSingleObject(h, timeout_ms);
+        return rc == WAIT_OBJECT_0 || rc == WAIT_ABANDONED;
+    }
 public:
     explicit SharedBudgetLedger(const Project& p)
         : key_(sha256(lower(path_text(fs::weakly_canonical(p.state_dir())))).substr(0, 31)) {
@@ -111,13 +116,21 @@ public:
         map_.h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(SharedLedgerPage), L"Local\\MigratoolSharedLedgerData");
         if (map_.h) {
             page_ = static_cast<SharedLedgerPage*>(MapViewOfFile(map_.h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedLedgerPage)));
-            if (page_ && page_->version != 1) std::memset(page_, 0, sizeof(SharedLedgerPage)), page_->version = 1;
+            // AUD-037: Acquire interprocess mutex before initializing shared memory!
+            if (page_ && acquire_mutex(mutex_.h)) {
+                if (page_->version != 1) {
+                    std::memset(page_, 0, sizeof(SharedLedgerPage));
+                    page_->version = 1;
+                }
+                ReleaseMutex(mutex_.h);
+            }
         }
     }
     ~SharedBudgetLedger() { release(); if (page_) UnmapViewOfFile(page_); }
     Json sync(DWORD requested_mib, DWORD workers, DWORD analyzers) {
-        if (!page_ || !mutex_.h) return {{"budget_mib",4096},{"active_projects",1},{"total_allocated_mib",requested_mib},{"project_allocated_mib",requested_mib},{"effective_workers",workers},{"saturated",false}};
-        WaitForSingleObject(mutex_.h, 5000);
+        if (!page_ || !mutex_.h || !acquire_mutex(mutex_.h)) {
+            return {{"budget_mib",4096},{"active_projects",1},{"total_allocated_mib",requested_mib},{"project_allocated_mib",requested_mib},{"effective_workers",workers},{"saturated",false}};
+        }
         struct Unlocker { HANDLE h; ~Unlocker(){ if(h) ReleaseMutex(h); } } unlock{mutex_.h};
         const DWORD me = GetCurrentProcessId();
         int mine = -1, empty = -1;
@@ -150,15 +163,15 @@ public:
         return out;
     }
     Json status() const {
-        if (!page_ || !mutex_.h) return {{"budget_mib",4096},{"active_projects",0},{"total_allocated_mib",0},{"project_allocated_mib",0}};
-        WaitForSingleObject(mutex_.h, 5000);
+        if (!page_ || !mutex_.h || !acquire_mutex(mutex_.h)) {
+            return {{"budget_mib",4096},{"active_projects",0},{"total_allocated_mib",0},{"project_allocated_mib",0}};
+        }
         auto out = read_locked();
         ReleaseMutex(mutex_.h);
         return out;
     }
     void release() {
-        if (!page_ || !mutex_.h) return;
-        WaitForSingleObject(mutex_.h, 5000);
+        if (!page_ || !mutex_.h || !acquire_mutex(mutex_.h)) return;
         const DWORD me = GetCurrentProcessId();
         for (auto& s : page_->slots) if (s.pid == me && key_ == s.key) s = SharedLedgerSlot{};
         rebalance();
@@ -592,14 +605,16 @@ bool is_build_config_path(const fs::path& path){
 Json analyzer_tool_hashes(const Project& p){
     Json out={{"binary",build_identity().value("binary_sha256",build_identity().value("source_sha256",Json()))}};
     std::error_code ec;
-    const fs::path clang_dll(MIGRATOOL_CLANG_DLL);
-    if(fs::exists(clang_dll,ec))out["clang"]=hash_file(clang_dll);
-    else out["clang"]="";
+    // AUD-036: Hash executable_dir()/libclang.dll first (matching analyzers.cpp load order!) before compile-time MIGRATOOL_CLANG_DLL
+    fs::path clang_dll = executable_dir() / L"libclang.dll";
+    if (!fs::exists(native_path(clang_dll), ec)) clang_dll = fs::path(MIGRATOOL_CLANG_DLL);
+    if (fs::exists(native_path(clang_dll), ec)) out["clang"] = hash_file(clang_dll);
+    else out["clang"] = "";
     const auto helper_dir=(executable_dir()/L"adapters/roslyn");
     Json roslyn_parts=Json::array();
     for(const auto* rel_name:{"RoslynAdapter.dll","RoslynAdapter.deps.json","RoslynAdapter.runtimeconfig.json"}){
         const auto fp=helper_dir/wide(rel_name);
-        if(fs::exists(fp,ec))roslyn_parts.push_back(Json::array({rel_name,hash_file(fp)}));
+        if(fs::exists(native_path(fp),ec))roslyn_parts.push_back(Json::array({rel_name,hash_file(fp)}));
     }
     out["roslyn"]=roslyn_parts.empty()?std::string():sha256(roslyn_parts.dump());
     Json custom=Json::object();
@@ -1205,15 +1220,16 @@ void content(const Project& p,Database& db,const Json& job){
             input["files"].push_back(data);db.exec("UPDATE inventory_tasks SET state='running' WHERE job_id=? AND file_id=?",{jid,id});
         }
         if(input["files"].empty())continue;
-        const auto work=p.state_dir()/L"work"/wide(jid)/wide(unique_id());fs::create_directories(work);
-        struct WorkCleanup { fs::path dir; ~WorkCleanup(){ std::error_code ec; fs::remove_all(dir, ec); } } work_guard{work};
+        // AUD-017: Always wrap work directory paths with native_path() for MAX_PATH (>260 char) resilience!
+        const auto work=p.state_dir()/L"work"/wide(jid)/wide(unique_id());fs::create_directories(native_path(work));
+        struct WorkCleanup { fs::path dir; ~WorkCleanup(){ std::error_code ec; fs::remove_all(native_path(dir), ec); } } work_guard{work};
         auto in=work/L"request.json",out=work/L"analysis.json";write_json(in,input);
         Cancel cancel;std::jthread observer([&](std::stop_token stop){try{Database reader(p);while(!stop.stop_requested()){auto control=scalar(reader,"SELECT control FROM inventory_jobs WHERE id=?",{jid});if(control=="pause"||control=="cancel"){cancel.requested=true;break;}for(int i=0;i<5&&!stop.stop_requested();++i)Sleep(20);}}catch(...){cancel.requested=true;}});
         Json analyzed;std::string failure;
         try{
             GlobalSlot slot(L"Analyzer",analyzer_slots,[&]{check_control(db,jid);});
             const auto proc=run_process({worker_path(),"__analyze","--project",path_text(p.file),"--input",path_text(in),"--out",path_text(out)},p.directory(),"",work/L"process",600000,&cancel);
-            if(proc["exit_code"]!=0||!fs::exists(out)||fs::file_size(out)>64*1024*1024)throw std::runtime_error("ANALYZER_FAILED_OR_LIMITED");
+            if(proc["exit_code"]!=0||!fs::exists(native_path(out))||fs::file_size(native_path(out))>64*1024*1024)throw std::runtime_error("ANALYZER_FAILED_OR_LIMITED");
             analyzed=read_json(out);
         }catch(const std::exception& error){failure=error.what();}
         observer.request_stop();observer.join();
@@ -1603,7 +1619,8 @@ Json scale_export(const Project& p,const Json& args,Cancel* cancel){
     const auto format=args.value("format",std::string("jsonl"));
     if(format!="jsonl"&&format!="json")throw std::runtime_error("EXPORT_FORMAT");
     if(output.empty())throw std::runtime_error("EXPORT_DESTINATION_REQUIRED");
-    const auto destination=p.resolve(output);
+    // AUD-009: Confine export destination to state_dir or authorized project roots!
+    const auto destination=p.resolve_confined(output,true);
     if(fs::exists(native_path(destination)))throw std::runtime_error("EXPORT_DESTINATION_EXISTS");
     if(cancel&&cancel->requested)throw std::runtime_error("EXPORT_CANCELLED");
     const auto id=unique_id(),created=now();
@@ -1641,8 +1658,9 @@ Json scale_context(const Project& p,Database& db,const Json& args){
     const auto file_id=std::stoll(source["id"].get<std::string>().substr(1));uint64_t begin=0,end=0;Json sym;
     if(symbol){sym=safe_parse(source["symbol_data"]);source.erase("symbol_data");source["symbol"]=sym;begin=sym.value("offset",uint64_t(0));end=sym.value("end_offset",uint64_t(0));}
     auto physical=fs::path(wide(source["absolute_path"]));if(classify_inventory_name(p,physical,physical.parent_path(),true).value("blocked_code",false))throw std::runtime_error("PROTECTED_CONFIGURATION");if(args.value("include_body",true)){
-        auto size=fs::file_size(physical);if(!symbol)end=size;const uint64_t cap=static_cast<uint64_t>(std::clamp(args.value("max_body_bytes",16384),256,65536));
-        std::ifstream in(physical,std::ios::binary);in.seekg(static_cast<std::streamoff>(begin));std::string body(static_cast<size_t>(std::min(end>=begin?end-begin:0,cap)),'\0');in.read(body.data(),static_cast<std::streamsize>(body.size()));body.resize(static_cast<size_t>(in.gcount()));source["body"]=body;source["body_truncated"]=end-begin>body.size();source["range"]={{"offset",begin},{"end_offset",begin+body.size()}};
+        auto size=fs::file_size(native_path(physical));if(!symbol)end=size;const uint64_t cap=static_cast<uint64_t>(std::clamp(args.value("max_body_bytes",16384),256,65536));
+        const uint64_t expected_len=(end>=begin)?(end-begin):0;
+        std::ifstream in(native_path(physical),std::ios::binary);in.seekg(static_cast<std::streamoff>(begin));std::string body(static_cast<size_t>(std::min(expected_len,cap)),'\0');in.read(body.data(),static_cast<std::streamsize>(body.size()));body.resize(static_cast<size_t>(in.gcount()));source["body"]=body;source["body_truncated"]=expected_len>body.size();source["range"]={{"offset",begin},{"end_offset",begin+body.size()}};
     }
     auto status=scale_file_status(p,db,{{"id",source["id"]},{"limit",1},{"include_total",false}});
     return {{"task_id",id},{"revision",db.revision()},{"source",source},{"status",status["items"].empty()?Json():status["items"][0]},
@@ -1799,7 +1817,12 @@ std::optional<Json> scale_query(const Project& p,Database& db,const Json& args){
         else if(kind=="reuse_candidates"){where+=" AND (instr(lower(COALESCE(source_path,'')),lower(?))>0 OR instr(lower(COALESCE(output_path,'')),lower(?))>0)";params.push_back(text);params.push_back(text);}
         else if(kind=="archive_members"){where+=" AND (instr(lower(absolute_path),lower(?))>0 OR instr(lower(entry_path),lower(?))>0)";params.push_back(text);params.push_back(text);}
         else if(kind=="scan_errors"){where+=" AND (instr(lower(path),lower(?))>0 OR instr(lower(message),lower(?))>0)";params.push_back(text);params.push_back(text);}
-        else if(kind=="dependencies"||kind=="relations"){where+=" AND instr(lower(name),lower(?))>0";params.push_back(text);}
+        else if(kind=="dependencies"){where+=" AND instr(lower(name),lower(?))>0";params.push_back(text);}
+        else if(kind=="relations"){
+            // AUD-011: relations subquery has source_path, target_path, reason (no 'name' column!)
+            where+=" AND (instr(lower(source_path),lower(?))>0 OR instr(lower(target_path),lower(?))>0 OR instr(lower(reason),lower(?))>0)";
+            params.push_back(text);params.push_back(text);params.push_back(text);
+        }
     }}
     int64_t last=args.value("after_id",int64_t(0));const auto fingerprint=sha256(from+where+params.dump()).substr(0,16);
     const std::string cursor_head=pinned_gen.has_value()?("v2:"+std::to_string(*pinned_gen)+":"+fingerprint+":"):("v2:"+fingerprint+":");
@@ -1849,6 +1872,9 @@ std::optional<Json> scale_query(const Project& p,Database& db,const Json& args){
                     const auto apfx_bs=r_abs+"\\";
                     error_dir_q.bind({r_root,r_abs,apfx,apfx+"\xF4\x8F\xBF\xBF"});
                     if(error_dir_q.next())errs=error_dir_q.row()["n"].get<int64_t>();
+                    error_dir_q.reset();
+                    error_dir_q.bind({r_root,r_abs,apfx_bs,apfx_bs+"\xF4\x8F\xBF\xBF"});
+                    if(error_dir_q.next())errs+=error_dir_q.row()["n"].get<int64_t>();
                     error_dir_q.reset();
                 }
                 if(path_excluded)excl=disc>0?disc:1;

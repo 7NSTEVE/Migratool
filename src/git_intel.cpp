@@ -5,6 +5,7 @@
 #include <chrono>
 #include <mutex>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -21,6 +22,7 @@ struct HandleCloser {
 
 struct GitCmdResult {
     int exit_code = -1;
+    bool timed_out = false;
     std::string stdout_text;
 };
 
@@ -42,6 +44,16 @@ GitCmdResult run_git_pipe(const fs::path& repo_dir, const std::vector<std::strin
     HandleCloser rg(rpipe), wg(wpipe);
     SetHandleInformation(rpipe, HANDLE_FLAG_INHERIT, 0);
 
+    // AUD-006: Redirect stdin to NUL so git.exe NEVER inherits or deadlocks the MCP JSON-RPC stdin pipe!
+    HandleCloser nul_in(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+
+    HandleCloser job(CreateJobObjectW(nullptr, nullptr));
+    if (job.h != INVALID_HANDLE_VALUE && job.h != nullptr) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job.h, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+    }
+
     std::wstring cmd = quote_arg(git.wstring()) + L" -C " + quote_arg(repo_dir.wstring());
     for (const auto& a : args) cmd += L" " + quote_arg(wide(a));
 
@@ -51,30 +63,46 @@ GitCmdResult run_git_pipe(const fs::path& repo_dir, const std::vector<std::strin
     si.wShowWindow = SW_HIDE;
     si.hStdOutput = wpipe;
     si.hStdError = wpipe;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdInput = (nul_in.h != INVALID_HANDLE_VALUE) ? nul_in.h : nullptr;
 
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
     cmd_buf.push_back(L'\0');
-    if (!CreateProcessW(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+    if (!CreateProcessW(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
                         nullptr, nullptr, &si, &pi)) {
         return res;
     }
     CloseHandle(wpipe);
     wg.h = INVALID_HANDLE_VALUE;
     HandleCloser ph(pi.hProcess), th(pi.hThread);
-
-    std::string out;
-    std::array<char, 8192> buf{};
-    DWORD got = 0;
-    while (ReadFile(rpipe, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr) && got > 0) {
-        out.append(buf.data(), got);
-        if (out.size() > 16 * 1024 * 1024) break;
+    if (job.h != INVALID_HANDLE_VALUE && job.h != nullptr) {
+        AssignProcessToJobObject(job.h, pi.hProcess);
     }
+    ResumeThread(pi.hThread);
+
+    // AUD-006 / MIG-006: Drain stdout pipe on a separate thread so WaitForSingleObject enforces timeout_ms!
+    std::string out;
+    std::thread reader([&]() {
+        std::array<char, 8192> buf{};
+        DWORD got = 0;
+        while (ReadFile(rpipe, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr) && got > 0) {
+            if (out.size() < 16 * 1024 * 1024) {
+                const size_t take = std::min<size_t>(got, 16 * 1024 * 1024 - out.size());
+                out.append(buf.data(), take);
+            }
+        }
+    });
+
     if (WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_TIMEOUT) {
-        TerminateProcess(pi.hProcess, 1);
+        res.timed_out = true;
+        if (job.h != INVALID_HANDLE_VALUE && job.h != nullptr) TerminateJobObject(job.h, 1);
+        else TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 2000);
+        CancelIoEx(rpipe, nullptr);
+        if (reader.joinable()) reader.join();
         return res;
     }
+    if (reader.joinable()) reader.join();
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
     res.exit_code = static_cast<int>(code);
@@ -172,20 +200,37 @@ Json git_repo_summary_cached(const Project& p, Database& /*db*/, const fs::path&
         };
     }
 
-    const int64_t head_mt = path_mtime_key(dot_git / L"HEAD");
-    const int64_t idx_mt = path_mtime_key(dot_git / L"index");
+    // AUD-046 / M-27: Support linked git worktrees (.git is a file pointing to gitdir: ...) and report git errors honestly!
+    fs::path git_dir = dot_git;
+    if (fs::is_regular_file(native_path(dot_git), ec)) {
+        try {
+            std::string gt = trim_copy(read_text(dot_git, 4096));
+            if (gt.starts_with("gitdir:")) {
+                std::string gpath = trim_copy(gt.substr(7));
+                fs::path gp(wide(gpath));
+                git_dir = gp.is_absolute() ? gp : (repo / gp);
+            }
+        } catch (...) {}
+    }
+
+    const int64_t head_mt = path_mtime_key(git_dir / L"HEAD");
+    const int64_t idx_mt = path_mtime_key(git_dir / L"index");
     const std::string key = path_text(repo);
     const auto now_tp = std::chrono::steady_clock::now();
 
-    {
-        std::lock_guard<std::mutex> lk(g_git_cache_mu);
-        auto it = g_git_cache.find(key);
-        if (it != g_git_cache.end() && it->second.head_mtime == head_mt && it->second.index_mtime == idx_mt &&
-            std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - it->second.cached_at).count() < 2500) {
-            Json hit = it->second.summary;
-            hit["cached"] = true;
-            return hit;
-        }
+    const auto st_res = run_git_pipe(repo, {"status", "--porcelain", "-uall"});
+    const auto br_res = run_git_pipe(repo, {"rev-parse", "--abbrev-ref", "HEAD"});
+    if (st_res.exit_code != 0 || st_res.timed_out) {
+        return {
+            {"available", false},
+            {"is_git_repo", true},
+            {"git_error", true},
+            {"timed_out", st_res.timed_out},
+            {"status_exit_code", st_res.exit_code},
+            {"repo_root", path_text(repo)},
+            {"reason", st_res.timed_out ? "GIT_STATUS_TIMEOUT" : "GIT_STATUS_FAILED"},
+            {"error", trim_copy(st_res.stdout_text)}
+        };
     }
 
     const auto head_res = run_git_pipe(repo, {"log", "-n", "1", "--format=%H%n%h%n%cI%n%an%n%s"});
@@ -199,27 +244,22 @@ Json git_repo_summary_cached(const Project& p, Database& /*db*/, const fs::path&
         if (lines.size() >= 5) subject = lines[4];
     }
 
-    const auto br_res = run_git_pipe(repo, {"rev-parse", "--abbrev-ref", "HEAD"});
     std::string branch = (br_res.exit_code == 0) ? trim_copy(br_res.stdout_text) : "HEAD";
-
-    const auto st_res = run_git_pipe(repo, {"status", "--porcelain", "-uall"});
     int64_t staged = 0, modified = 0, untracked = 0;
     Json changed_files = Json::array();
-    if (st_res.exit_code == 0) {
-        for (const auto& line : split_lines_clean(st_res.stdout_text)) {
-            if (line.size() < 3) continue;
-            const char x = line[0];
-            const char y = line[1];
-            std::string rel = trim_copy(line.substr(3));
-            if (x == '?' && y == '?') {
-                ++untracked;
-            } else {
-                if (x != ' ' && x != '?') ++staged;
-                if (y != ' ' && y != '?') ++modified;
-            }
-            if (changed_files.size() < 40) {
-                changed_files.push_back({{"status", line.substr(0, 2)}, {"path", rel}});
-            }
+    for (const auto& line : split_lines_clean(st_res.stdout_text)) {
+        if (line.size() < 3) continue;
+        const char x = line[0];
+        const char y = line[1];
+        std::string rel = trim_copy(line.substr(3));
+        if (x == '?' && y == '?') {
+            ++untracked;
+        } else {
+            if (x != ' ' && x != '?') ++staged;
+            if (y != ' ' && y != '?') ++modified;
+        }
+        if (changed_files.size() < 40) {
+            changed_files.push_back({{"status", line.substr(0, 2)}, {"path", rel}});
         }
     }
 
@@ -251,7 +291,10 @@ Json git_repo_summary_cached(const Project& p, Database& /*db*/, const fs::path&
 
 Json tool_git_intel(const Project& p, Database& db, const Json& args) {
     const std::string action = args.value("action", args.value("op", "summary"));
-    const fs::path explicit_repo = args.contains("repo_path") ? p.resolve(args["repo_path"].get<std::string>()) : fs::path{};
+    fs::path explicit_repo;
+    if (args.contains("repo_path") && args["repo_path"].is_string() && !args["repo_path"].get<std::string>().empty()) {
+        explicit_repo = p.resolve_confined(args["repo_path"].get<std::string>(), false, nullptr, nullptr, true, false);
+    }
     const fs::path repo = find_project_repo_dir(p, explicit_repo);
     const int token_budget = std::clamp(args.value("token_budget", 2000), 200, 32000);
     const size_t max_chars = static_cast<size_t>(token_budget) * 4;

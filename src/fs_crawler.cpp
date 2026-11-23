@@ -186,9 +186,9 @@ struct CrawlFilters {
             for (auto& c : fl) { if (c == L'/') c = L'\\'; else c = static_cast<wchar_t>(towlower(c)); }
             if (fl == state_dir_lower || fl.starts_with(state_dir_lower + L"\\")) return true;
         }
-        if (name_lower == ".migratool") return true;
-        if (!is_archive && exclude_dirs.contains(name_lower)) return true;
-        if (is_archive && exclude_dirs.contains(name_lower)) return true;
+        if (!is_archive && name_lower == ".migratool") return true;
+        // exclude_dirs holds config["exclude_dirs"] (!is_archive) or config["archive_exclude_dirs"] (is_archive)
+        if (exclude_dirs.contains(name_lower)) return true;
         if (respect_gitignore) {
             for (const auto& g : gitignore_globs) {
                 if (fs_glob_match(g, name_lower) || fs_glob_match(g, rel_path)) return true;
@@ -306,6 +306,7 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
     {
         db.begin();
         try {
+            db.exec("UPDATE fs_roots SET complete=0 WHERE root_id=?", {root_id});
             if (!other_roots_have_nodes) {
                 exec_raw(raw,
                     "DROP INDEX IF EXISTS idx_fs_nodes_parent;"
@@ -365,6 +366,7 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
     std::deque<BatchMsg> out_q;
     constexpr size_t MAX_INFLIGHT_BATCHES = 24;
     std::atomic<bool> producers_finished{false};
+    std::atomic<bool> writer_aborted{false};
 
     const int workers_n = std::clamp(thread_count, 1, 16);
     std::vector<std::thread> threads;
@@ -382,8 +384,9 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
             if (local.entries.empty() && local.discovered_dirs.empty() && local.errors.empty()) return;
             std::unique_lock lk(out_mu);
             out_cv_producer.wait(lk, [&]() {
-                return out_q.size() < MAX_INFLIGHT_BATCHES || (cancel && cancel->requested);
+                return out_q.size() < MAX_INFLIGHT_BATCHES || (cancel && cancel->requested.load()) || writer_aborted.load(std::memory_order_acquire);
             });
+            if ((cancel && cancel->requested.load()) || writer_aborted.load(std::memory_order_acquire)) return;
             out_q.push_back(std::move(local));
             local = BatchMsg{};
             local.entries.reserve(8192);
@@ -397,9 +400,9 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
             {
                 std::unique_lock lk(work_mu);
                 work_cv.wait(lk, [&]() {
-                    return !work_q.empty() || crawl_done || (cancel && cancel->requested);
+                    return !work_q.empty() || crawl_done || (cancel && cancel->requested.load()) || writer_aborted.load(std::memory_order_acquire);
                 });
-                if ((cancel && cancel->requested) || (work_q.empty() && crawl_done)) break;
+                if ((cancel && cancel->requested.load()) || writer_aborted.load(std::memory_order_acquire) || (work_q.empty() && crawl_done)) break;
                 if (work_q.empty()) continue;
                 task = std::move(work_q.front());
                 work_q.pop_front();
@@ -417,7 +420,7 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
             } else {
                 FILE_INFO_BY_HANDLE_CLASS cls = FileIdBothDirectoryRestartInfo;
                 for (;;) {
-                    if (cancel && cancel->requested) break;
+                    if ((cancel && cancel->requested.load()) || writer_aborted.load(std::memory_order_acquire)) break;
                     BOOL ok = GetFileInformationByHandleEx(dir_h.h, cls, buf.data(), BUF_BYTES);
                     cls = FileIdBothDirectoryInfo;
                     if (!ok) {
@@ -646,6 +649,7 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
         }
         commit_tx();
     } catch (...) {
+        writer_aborted.store(true, std::memory_order_release);
         if (tx_open) db.rollback();
         {
             std::lock_guard lk(work_mu);
@@ -657,6 +661,7 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
         throw;
     }
     if (joiner.joinable()) joiner.join();
+    if (cancel && cancel->requested.load()) throw std::runtime_error("CANCELLED");
 
     auto t_crawl = std::chrono::steady_clock::now();
 
@@ -786,14 +791,15 @@ Json crawl_root_streaming(const Project& p, Database& db, int64_t root_id, const
             if (build_trigram_fts) {
                 exec_raw(raw, "INSERT INTO fs_name_fts(fs_name_fts) VALUES('rebuild');");
             }
+            const int complete_flag = ((cancel && cancel->requested.load()) || writer_aborted.load(std::memory_order_acquire)) ? 0 : 1;
             db.exec("UPDATE fs_roots SET volume_guid=?, volume_serial=?, usn_journal_id=?, next_usn=?, root_frn=?, "
-                    "engine=?, complete=1, last_sync_ns=?, total_files=?, total_dirs=?, total_links=?, total_bytes=?, scan_errors=? "
+                    "engine=?, complete=?, last_sync_ns=?, total_files=?, total_dirs=?, total_links=?, total_bytes=?, scan_errors=? "
                     "WHERE root_id=?",
                     {usn_info.volume_guid, static_cast<int64_t>(usn_info.serial),
                      static_cast<int64_t>(usn_info.journal_id), static_cast<int64_t>(usn_info.next_usn),
                      static_cast<int64_t>(root_frn),
                      usn_info.available ? "mt_crawl+usn_ready" : "mt_crawl+rdcew",
-                     now_ns(), total_files, total_dirs, total_links, total_bytes,
+                     complete_flag, now_ns(), total_files, total_dirs, total_links, total_bytes,
                      static_cast<int64_t>(all_errors.size()), root_id});
             db.commit();
         } catch (...) { db.rollback(); throw; }
@@ -853,6 +859,8 @@ Json crawl_root_mft(const Project& p, Database& db, int64_t root_id, const fs::p
     name_arena.reserve(16 * 1024 * 1024);
     std::unordered_map<uint64_t, uint64_t> dir_parent;
     dir_parent.reserve(100000);
+    std::unordered_map<uint64_t, std::pair<uint32_t, uint16_t>> dir_name_span;
+    dir_name_span.reserve(100000);
 
     std::vector<unsigned char> buf(1024 * 1024);
     MFT_ENUM_DATA_V0 med{};
@@ -885,11 +893,13 @@ Json crawl_root_mft(const Project& p, Database& db, int64_t root_id, const fs::p
                 try { name = utf8(wname); } catch (...) { name.clear(); }
                 if (!name.empty() && name != "." && name != "..") {
                     uint32_t noff = static_cast<uint32_t>(name_arena.size());
+                    uint16_t nlen = static_cast<uint16_t>(name.size());
                     name_arena.append(name);
                     all_recs.push_back(RawRec{rec->FileReferenceNumber, rec->ParentFileReferenceNumber,
-                                              rec->FileAttributes, noff, static_cast<uint16_t>(name.size())});
+                                              rec->FileAttributes, noff, nlen});
                     if (rec->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                         dir_parent[rec->FileReferenceNumber] = rec->ParentFileReferenceNumber;
+                        dir_name_span[rec->FileReferenceNumber] = {noff, nlen};
                     }
                 }
             }
@@ -915,6 +925,26 @@ Json crawl_root_mft(const Project& p, Database& db, int64_t root_id, const fs::p
         bool res = is_inside(pit->second, depth + 1);
         inside_cache[frn] = res ? 1 : 2;
         return res;
+    };
+
+    std::unordered_map<uint64_t, std::string> dir_rel_cache;
+    dir_rel_cache.reserve(dir_parent.size() + 16);
+    dir_rel_cache[root_frn] = "";
+
+    std::function<std::string(uint64_t, int)> get_dir_rel = [&](uint64_t frn, int depth) -> std::string {
+        if (frn == root_frn || depth > 256 || frn == 0) return {};
+        auto it = dir_rel_cache.find(frn);
+        if (it != dir_rel_cache.end()) return it->second;
+        auto pit = dir_parent.find(frn);
+        auto nit = dir_name_span.find(frn);
+        if (pit == dir_parent.end() || nit == dir_name_span.end() || pit->second == frn) {
+            return {};
+        }
+        std::string prel = get_dir_rel(pit->second, depth + 1);
+        std::string dname = name_arena.substr(nit->second.first, nit->second.second);
+        std::string rel = prel.empty() ? std::move(dname) : (prel + "/" + dname);
+        dir_rel_cache.emplace(frn, rel);
+        return rel;
     };
 
     std::vector<FsBulkEntry> filtered;
@@ -944,6 +974,23 @@ Json crawl_root_mft(const Project& p, Database& db, int64_t root_id, const fs::p
         e.kind = static_cast<int>(classify_win32_node(r.attrs, rtag));
         e.ext = (e.kind == static_cast<int>(FsNodeKind::Directory)) ? "" : extract_ext(e.name);
         e.attrs = r.attrs;
+
+        const std::string parent_rel = get_dir_rel(r.parent_frn, 0);
+        const std::string rel_path = parent_rel.empty() ? e.name : (parent_rel + "/" + e.name);
+        const fs::path full_p = root_path / fs::path(wide(rel_path));
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (GetFileAttributesExW(native_path(full_p).c_str(), GetFileExInfoStandard, &fad)) {
+            LARGE_INTEGER li{};
+            li.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+            li.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+            e.mtime_ns = ft_to_ns(li);
+            if (e.kind == static_cast<int>(FsNodeKind::File) || e.kind == static_cast<int>(FsNodeKind::SymlinkFile)) {
+                e.size_bytes = static_cast<int64_t>((static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow);
+            }
+        }
+        if (is_rep && is_link_reparse_tag(rtag)) {
+            e.link_target = read_reparse_target(full_p);
+        }
         filtered.push_back(std::move(e));
     }
 
@@ -1086,7 +1133,7 @@ Json fs_usn_replay_root(const Project& p, Database& db, const Json& root_cfg, Ca
             if (c == L'/') c = L'\\';
             else c = static_cast<wchar_t>(towlower(c));
         }
-        while (s.size() > 3 && s.back() == L'\\') s.pop_back();
+        while (!s.empty() && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
         return s;
     };
     auto get_final_path_w = [](HANDLE h) -> std::wstring {
@@ -1107,6 +1154,9 @@ Json fs_usn_replay_root(const Project& p, Database& db, const Json& root_cfg, Ca
                                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
         if (bh.h != INVALID_HANDLE_VALUE) base_final_lower = normalize_final_lower(get_final_path_w(bh.h));
         if (base_final_lower.empty()) base_final_lower = normalize_final_lower(base.wstring());
+        while (!base_final_lower.empty() && (base_final_lower.back() == L'\\' || base_final_lower.back() == L'/')) {
+            base_final_lower.pop_back();
+        }
     }
     const std::wstring base_final_prefix = base_final_lower + L"\\";
 
@@ -1543,6 +1593,12 @@ Json fs_reconcile_incremental(const Project& p, Database& db, const Json& root_c
 
         // Second pass (deferred delete check): only delete entries under relisted dirs that STILL point to a parent
         // where the path no longer exists on disk (guarantees offline moves between ANY two dirs are NEVER lost!)
+        auto is_definitely_missing_win32 = [](const fs::path& p) -> bool {
+            if (GetFileAttributesW(native_path(p).c_str()) != INVALID_FILE_ATTRIBUTES) return false;
+            const DWORD err = GetLastError();
+            return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ||
+                   err == ERROR_INVALID_NAME || err == ERROR_BAD_NETPATH;
+        };
         if (dirs_relisted > 0) {
             std::vector<uint64_t> missing_frns;
             for (const auto& [dfrn, kd] : known_dirs) {
@@ -1553,7 +1609,7 @@ Json fs_reconcile_incremental(const Project& p, Database& db, const Json& root_c
                                             {root_id, static_cast<int64_t>(dfrn)});
                     if (!cur_row.empty()) {
                         fs::path check_p = base / fs::path(wide(cur_row[0]["rel_path"].get<std::string>()));
-                        if (GetFileAttributesW(native_path(check_p).c_str()) == INVALID_FILE_ATTRIBUTES) {
+                        if (is_definitely_missing_win32(check_p)) {
                             missing_frns.push_back(dfrn);
                         }
                     }
@@ -1574,7 +1630,7 @@ Json fs_reconcile_incremental(const Project& p, Database& db, const Json& root_c
                                   {root_id, static_cast<int64_t>(dfrn)});
             for (const auto& f : files) {
                 fs::path fp = dpath / fs::path(wide(f["name"].get<std::string>()));
-                if (GetFileAttributesW(native_path(fp).c_str()) == INVALID_FILE_ATTRIBUTES) {
+                if (is_definitely_missing_win32(fp)) {
                     if (fs_apply_delete(db, root_id, static_cast<uint64_t>(f["frn"].get<int64_t>()), true)) {
                         ++deleted_cnt; maybe_flush();
                     }

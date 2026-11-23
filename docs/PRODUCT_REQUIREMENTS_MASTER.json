@@ -1,0 +1,784 @@
+{
+  "schema_version": "3.1.0",
+  "project": {
+    "name": "Migratool",
+    "version": "3.1.0",
+    "subtitle": "AI Agent Project OS & Multi-Agent Worktree / Build / Storage Coordinator",
+    "updated_at": "2026-11-22",
+    "master_markdown_path": "docs/PRODUCT_REQUIREMENTS_MASTER.md",
+    "master_json_path": "docs/PRODUCT_REQUIREMENTS_MASTER.json",
+    "core_principles": [
+      "Ningún progreso válido de un agente o worktree puede perderse silenciosamente por cierre de sesión, agotamiento de cuota, cambio de modelo, fallo de red o limpieza de disco.",
+      "Migratool nunca debe ahorrar llamadas, tokens o tiempo a costa de perder trabajo, ocultar conflictos o presentar como completada una integración que no se verificó.",
+      "Separación estricta e inconfundible de los 4 estados del ciclo de vida del trabajo: IMPLEMENTED, CONFIRMED, INTEGRATED, DELIVERED.",
+      "Ningún build puede declararse INTEGRATED o DELIVERED si existen worktrees con trabajo obligatorio en estado CONFIRMED o IMPLEMENTED pendiente de integrar, salvo exclusión explícita registrada con motivo y autor.",
+      "Confinamiento físico fail-closed mediante GetFinalPathNameByHandleW y bloqueo de reparse points o junctions que escapen de las raíces del proyecto.",
+      "Prohibición de limpieza ciega por nombre de carpeta (old, backup, temp, build, tests, include, tools) o solo por antigüedad."
+    ]
+  },
+  "lifecycle_states": [
+    {
+      "order": 1,
+      "state": "IMPLEMENTED",
+      "label_es": "Implementado",
+      "description": "Código escrito en worktree o rama de trabajo por un agente o usuario, aún no verificado con compilación limpia y pruebas completas.",
+      "required_evidence": [
+        "Archivos modificados o commits en worktree registrados en agent_worktrees_catalog"
+      ]
+    },
+    {
+      "order": 2,
+      "state": "CONFIRMED",
+      "label_es": "Confirmado",
+      "description": "Los cambios están guardados en un commit de Git o snapshot verificable por SHA-256, compilan limpiamente y pasan las pruebas requeridas con evidencia directa.",
+      "required_evidence": [
+        "Commit SHA o snapshot P4 verificable por SHA-256",
+        "Compilación exitosa (exit_code == 0)",
+        "Pruebas requeridas ejecutadas y aprobadas con conteo real (passed_cnt > 0, tests_detected == true)"
+      ]
+    },
+    {
+      "order": 3,
+      "state": "INTEGRATED",
+      "label_es": "Integrado",
+      "description": "Los cambios en estado CONFIRMED fueron fusionados sin conflictos en la rama principal o de integración y compilados exitosamente dentro del build integrado del proyecto.",
+      "required_evidence": [
+        "Verificación sin conflictos con git merge-tree --write-tree",
+        "Commit presente en la historia de la rama principal/integración",
+        "Ausencia de worktrees obligatorios pendientes sin exclusión explícita registrada",
+        "Compilación y pruebas del árbol integrado superadas"
+      ]
+    },
+    {
+      "order": 4,
+      "state": "DELIVERED",
+      "label_es": "Entregado",
+      "description": "Empaquetado o publicado en el ejecutable final o release canónico con manifiesto inmutable (.migratool/builds/<build_id>/manifest.json) y hashes SHA-256 verificables.",
+      "required_evidence": [
+        "Estado previo INTEGRATED verificado",
+        "Manifiesto .migratool/builds/<build_id>/manifest.json persistido y registrado en build_manifests",
+        "Hashes SHA-256 de todos los binarios finales para trazabilidad inversa trace_binary"
+      ]
+    }
+  ],
+  "canonical_build_policy": {
+    "block_on_unintegrated_mandatory_worktrees": true,
+    "blocked_worktree_states": [
+      "IMPLEMENTED",
+      "CONFIRMED"
+    ],
+    "allow_explicit_exclusion": true,
+    "exclusion_required_fields": [
+      "excluded_by",
+      "exclusion_reason",
+      "excluded_at_utc"
+    ]
+  },
+  "storage_conservation_tiers": [
+    {
+      "tier": "PROTECTED",
+      "label_es": "Protegido",
+      "auto_clean_allowed": false,
+      "description": "Código sin confirmar (dirty), worktrees activos, respaldos de recuperación P4, directorios de código fuente/pruebas/documentación y compilaciones finales canónicas (INTEGRATED / DELIVERED) marcadas para conservar."
+    },
+    {
+      "tier": "TEMP_RETAINED",
+      "label_es": "Conservado temporalmente",
+      "auto_clean_allowed": false,
+      "description": "Compilaciones recientes dentro de la ventana de retención, registros de pruebas y artefactos necesarios para diagnosticar errores activos."
+    },
+    {
+      "tier": "VERIFIED_SAFE_CLEAN",
+      "label_es": "Limpieza segura verificada",
+      "auto_clean_allowed": true,
+      "deletion_mechanism": "WINDOWS_RECYCLE_BIN",
+      "description": "Archivos generados o directorios de compilación 100% reproducibles, sin archivos fuente ni modificaciones sin commit, con proceso propietario inactivo, sin referencias de un build protegido y con política de retención cumplida."
+    },
+    {
+      "tier": "NEEDS_REVIEW",
+      "label_es": "Requiere revisión",
+      "auto_clean_allowed": false,
+      "description": "Carpetas huérfanas, clones o proyectos duplicados, archivos no clasificados (UNKNOWN) o posibles avances recuperados pendientes de inspección humana o de agente."
+    }
+  ],
+  "directory_categories": [
+    "SOURCE",
+    "TEST_SOURCE",
+    "BUILD_OUTPUT",
+    "GENERATED",
+    "DEPENDENCY",
+    "CACHE",
+    "DOCUMENTATION",
+    "USER_DATA",
+    "UNKNOWN"
+  ],
+  "default_directory_classification_rules": [
+    {
+      "pattern": "src/**",
+      "category": "SOURCE",
+      "default_conservation_tier": "PROTECTED",
+      "notes": "Código fuente principal de aplicación"
+    },
+    {
+      "pattern": "include/**",
+      "category": "SOURCE",
+      "default_conservation_tier": "PROTECTED",
+      "notes": "Encabezados públicos e internos C/C++"
+    },
+    {
+      "pattern": "adapters/**",
+      "category": "SOURCE",
+      "default_conservation_tier": "PROTECTED",
+      "notes": "Adaptadores semánticos y puentes de lenguaje (ej. Roslyn)"
+    },
+    {
+      "pattern": "tools/**",
+      "category": "SOURCE",
+      "default_conservation_tier": "PROTECTED",
+      "notes": "Herramientas auxiliares del proyecto (código fuente legítimo fuera de src)"
+    },
+    {
+      "pattern": "scripts/**",
+      "category": "SOURCE",
+      "default_conservation_tier": "PROTECTED",
+      "notes": "Scripts de automatización y construcción"
+    },
+    {
+      "pattern": "resources/**",
+      "category": "SOURCE",
+      "default_conservation_tier": "PROTECTED",
+      "notes": "Manifiestos Win32, iconos y recursos compilables"
+    },
+    {
+      "pattern": "tests/**",
+      "category": "TEST_SOURCE",
+      "default_conservation_tier": "PROTECTED",
+      "notes": "Código fuente de pruebas unitarias, integración y regresión (jamás clasificable como descartable)"
+    },
+    {
+      "pattern": "docs/**",
+      "category": "DOCUMENTATION",
+      "default_conservation_tier": "PROTECTED",
+      "notes": "Especificaciones maestras, arquitectura y documentación"
+    },
+    {
+      "pattern": ".migratool/**",
+      "category": "USER_DATA",
+      "default_conservation_tier": "PROTECTED",
+      "notes": "Catálogo SQLite, blobs de snapshots, manifiestos de compilación y estado persistente"
+    },
+    {
+      "pattern": "third_party/**",
+      "category": "DEPENDENCY",
+      "default_conservation_tier": "PROTECTED",
+      "notes": "Encabezados o dependencias vendored bajo control de versiones"
+    },
+    {
+      "pattern": "vcpkg_installed/**",
+      "category": "DEPENDENCY",
+      "default_conservation_tier": "TEMP_RETAINED",
+      "notes": "Dependencias instaladas reproducibles por manifiesto"
+    },
+    {
+      "pattern": "build/**",
+      "category": "BUILD_OUTPUT",
+      "default_conservation_tier": "TEMP_RETAINED",
+      "notes": "Directorios de salida de compilación; elegibles para VERIFIED_SAFE_CLEAN solo si no son el build canónico protegido, no tienen procesos activos y no contienen código sin confirmar"
+    },
+    {
+      "pattern": "build-*/**",
+      "category": "BUILD_OUTPUT",
+      "default_conservation_tier": "TEMP_RETAINED",
+      "notes": "Variantes de compilación por agente o configuración (build-debug, build-release, build-old); requieren auditoría de procesos, retención y ausencia de archivos fuente antes de limpieza"
+    },
+    {
+      "pattern": "**/zip-headers/**",
+      "category": "GENERATED",
+      "default_conservation_tier": "VERIFIED_SAFE_CLEAN",
+      "notes": "Encabezados copiados o generados durante configuración de CMake"
+    },
+    {
+      "pattern": ".cache/**",
+      "category": "CACHE",
+      "default_conservation_tier": "VERIFIED_SAFE_CLEAN",
+      "notes": "Caché local reproducible de análisis o LSP"
+    }
+  ],
+  "requirements": [
+    {
+      "req_id": "REQ-SEC-001",
+      "title": "Confinamiento físico canónico y bloqueo de escape por reparse points",
+      "category": "SECURITY",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Confinamiento físico canónico mediante Project::resolve_confined con GetFinalPathNameByHandleW, detección de reparse points NTFS (symlinks y junctions), bloqueo de traversal '..' y bloqueo de rutas UNC externas en workstream, read_bundle, fs_organize, scale_export, backup_catalog, git_intel y lsp_client.",
+      "invariants": [
+        "Ninguna ruta con '..' que resuelva fuera de las raíces autorizadas del proyecto o state_dir puede leerse, escribirse, respaldarse ni eliminarse.",
+        "Ninguna ruta UNC externa no autorizada puede abrirse desde operaciones confinadas al proyecto.",
+        "Todo symlink o directory junction cuyo destino físico resuelto por GetFinalPathNameByHandleW escape de las raíces del proyecto es bloqueado en modo fail-closed."
+      ],
+      "implementation_files": [
+        "include/migratool/core.hpp",
+        "src/platform.cpp",
+        "src/workstream.cpp",
+        "src/agent_supertools.cpp",
+        "src/fs_organize.cpp",
+        "src/scale_export.cpp",
+        "src/database.cpp",
+        "src/git_intel.cpp",
+        "src/lsp_client.cpp"
+      ],
+      "test_suites": [
+        "agent_os_resilience",
+        "fs_organize_and_usn_regression",
+        "env_git_supertools",
+        "durable_inventory_export"
+      ],
+      "acceptance_criteria": [
+        "Intentos de path traversal '..' o rutas UNC externas en workstream, read_bundle, fs_organize, scale_export, backup_catalog, git_intel y lsp_client son rechazados con error estructurado y 0 bytes expuestos o modificados.",
+        "Un directory junction interno que apunte a una carpeta fuera del proyecto es detectado y bloqueado antes de acceder al archivo destino."
+      ]
+    },
+    {
+      "req_id": "REQ-SEC-002",
+      "title": "Desactivación en producción de puntos de inyección de fallos",
+      "category": "SECURITY",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Los puntos de inyección de fallos (failpoints) deben permanecer deshabilitados por defecto (failpoints_enabled() == false) en todos los binarios de producción y solo pueden habilitarse explícitamente en binarios de prueba.",
+      "invariants": [
+        "failpoints_enabled() retorna false por defecto en binarios de producción (CLI, MCP, GUI).",
+        "Las suites de resiliencia pueden habilitar failpoints explícitamente en su arnés de pruebas para validar la recuperación WAL."
+      ],
+      "implementation_files": [
+        "include/migratool/core.hpp",
+        "src/platform.cpp",
+        "src/workstream.cpp",
+        "src/fs_organize.cpp"
+      ],
+      "test_suites": [
+        "agent_os_resilience",
+        "fs_organize_and_usn_regression"
+      ],
+      "acceptance_criteria": [
+        "En estado predeterminado de producción, failpoints_enabled() es false.",
+        "Las pruebas de recuperación de caídas en agent_os_resilience habilitan y verifican las 7 etapas WAL sin afectar el comportamiento de producción."
+      ]
+    },
+    {
+      "req_id": "REQ-SEC-003",
+      "title": "Aislamiento de subprocesos Git y LSP sin bloqueo de stdin MCP",
+      "category": "SECURITY",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Aislamiento de subprocesos Git y LSP redirigiendo hStdInput a NUL cuando no son interactivos, confinándolos en un Win32 JobObject con JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE y aplicando lectura asíncrona con timeout real sin bloquear el stdin del servidor MCP.",
+      "invariants": [
+        "Ningún subproceso Git o comando hijo hereda ni consume bytes del descriptor stdin del servidor MCP JSON-RPC.",
+        "Todo subproceso hijo se asocia a un JobObject con JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE para garantizar cero procesos huérfanos.",
+        "La lectura de salida aplica un timeout real asíncrono que termina el JobObject si el subproceso se cuelga."
+      ],
+      "implementation_files": [
+        "src/platform.cpp",
+        "src/git_intel.cpp",
+        "src/lsp_client.cpp",
+        "src/agent_supertools.cpp"
+      ],
+      "test_suites": [
+        "serena_workspace_lsp",
+        "env_git_supertools",
+        "gateway"
+      ],
+      "acceptance_criteria": [
+        "Subprocesos que intentan leer stdin reciben EOF inmediato desde NUL sin interferir con el flujo JSON-RPC.",
+        "Subprocesos que exceden su timeout son terminados limpiamente por el JobObject sin dejar procesos huérfanos."
+      ]
+    },
+    {
+      "req_id": "REQ-SEC-004",
+      "title": "Transporte JSON-RPC MCP acotado, validación estructural y tolerancia UTF-8",
+      "category": "SECURITY",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Transporte JSON-RPC MCP acotado con límite de línea de 16 MiB, validación estructural de tipos JSON antes de accesos tipados, serialización UTF-8 tolerante con error_handler_t::replace y workers protegidos contra std::terminate.",
+      "invariants": [
+        "Ninguna línea de entrada en stdin puede superar 16 MiB en memoria sin ser rechazada de forma segura.",
+        "Todo acceso a params y arguments valida tipos antes de extraer valores para impedir excepciones type_error no controladas.",
+        "Toda respuesta JSON-RPC se serializa con error_handler_t::replace para tolerar bytes no UTF-8.",
+        "Todo hilo worker del pool MCP captura todas las excepciones evitando std::terminate."
+      ],
+      "implementation_files": [
+        "src/mcp.cpp",
+        "src/gateway.cpp"
+      ],
+      "test_suites": [
+        "gateway",
+        "serena_workspace_lsp"
+      ],
+      "acceptance_criteria": [
+        "Payloads con tipos inválidos, bytes no UTF-8 o líneas superiores a 16 MiB producen respuestas JSON-RPC de error controladas sin terminar el proceso servidor MCP."
+      ]
+    },
+    {
+      "req_id": "REQ-SEC-005",
+      "title": "Carga segura de DLLs opcionales y empaquetado restringido a git ls-files",
+      "category": "SECURITY",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Carga segura de DLLs opcionales (libzip.dll, libclang.dll) priorizando executable_dir() sobre el directorio de trabajo actual, y empaquetado de código fuente restringido estrictamente a la salida de git ls-files.",
+      "invariants": [
+        "La carga dinámica de libzip.dll y libclang.dll prioriza executable_dir() y rutas absolutas de compilación con banderas de búsqueda segura.",
+        "Ningún empaquetado de código fuente incluye archivos no rastreados por Git ni archivos privados ignorados."
+      ],
+      "implementation_files": [
+        "src/platform.cpp",
+        "src/analyzers.cpp",
+        "src/duplicates.cpp",
+        "src/fs_organize.cpp",
+        "src/scale_export.cpp"
+      ],
+      "test_suites": [
+        "durable_inventory_export",
+        "indexed_semantic_context",
+        "fs_organize_and_usn_regression"
+      ],
+      "acceptance_criteria": [
+        "Las DLLs opcionales se resuelven desde executable_dir() o ruta autorizada sin permitir secuestro desde CWD.",
+        "La exportación de fuentes incluye únicamente archivos devueltos por git ls-files dentro de la raíz confinada."
+      ]
+    },
+    {
+      "req_id": "REQ-DATA-001",
+      "title": "Preservación sin pérdida en fs_organize (SAFETY_CONFLICT, plan_id inmutable y SHA-256 en undo)",
+      "category": "DATA_INTEGRITY",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "En fs_organize, resume=true nunca elimina src cuando src y dst coexisten en disco (reporta SAFETY_CONFLICT); el plan_id es inmutable; y organize_undo verifica el hash SHA-256 del archivo antes de restaurar.",
+      "invariants": [
+        "Si src y dst coexisten durante organize_apply(resume=true), ambos archivos se conservan y se registra SAFETY_CONFLICT.",
+        "El plan_id asignado por organize_plan es inmutable.",
+        "organize_undo verifica que el SHA-256 actual en cuarentena/destino coincida con el manifiesto antes de mover de regreso a src."
+      ],
+      "implementation_files": [
+        "src/fs_organize.cpp",
+        "include/migratool/fs_organize.hpp"
+      ],
+      "test_suites": [
+        "fs_organize_and_usn_regression"
+      ],
+      "acceptance_criteria": [
+        "Ante coexistencia de src y dst en resume=true, se devuelve SAFETY_CONFLICT con 0 archivos eliminados.",
+        "Si un archivo en cuarentena fue alterado, organize_undo detecta la discrepancia de SHA-256 y aborta su sobrescritura."
+      ]
+    },
+    {
+      "req_id": "REQ-DATA-002",
+      "title": "Integridad de snapshots y blobs en workstream y rollback limpio en batch_edit",
+      "category": "DATA_INTEGRITY",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Verificación SHA-256 al escribir blobs existentes en el almacén direccionado por contenido, pre-validación del 100% de blobs antes de restaurar un snapshot, detección de modificaciones externas sin intent (EXTERNAL_MODIFICATION_WITHOUT_INTENT) y registro de existed=false para rollback limpio de archivos nuevos en batch_edit.",
+      "invariants": [
+        "Todo blob existente en disco se verifica por SHA-256 antes de reutilizarse y se repara si está corrupto.",
+        "restore_snapshot valida el 100% de los blobs requeridos antes de tocar el primer archivo del workspace.",
+        "Modificaciones en disco sin intent WAL activo se reportan como EXTERNAL_MODIFICATION_WITHOUT_INTENT sin sobrescribir el trabajo externo.",
+        "El rollback de batch_edit elimina los archivos recién creados (existed=false) y restaura los preexistentes (existed=true)."
+      ],
+      "implementation_files": [
+        "src/workstream.cpp",
+        "src/agent_supertools.cpp",
+        "src/file_toolkit.cpp"
+      ],
+      "test_suites": [
+        "agent_os_resilience",
+        "env_git_supertools",
+        "serena_workspace_lsp"
+      ],
+      "acceptance_criteria": [
+        "Un blob corrupto impide el inicio de restore_snapshot dejando el árbol de trabajo intacto.",
+        "Un batch_edit fallido tras crear un archivo nuevo revierte el archivo creado dejando el árbol idéntico al estado inicial.",
+        "Una edición externa fuera de WAL es detectada por agent_wake como EXTERNAL_MODIFICATION_WITHOUT_INTENT."
+      ]
+    },
+    {
+      "req_id": "REQ-DATA-003",
+      "title": "Reconciliación honesta de workstream, idempotencia en curso y conteo real en run_verified",
+      "category": "DATA_INTEGRITY",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Verificación de expected_post_sha256 antes de promover operaciones WAL a COMMITTED, bloqueo de claves idempotency_key mientras están en estado IN_PROGRESS, implementación transaccional real de split_workstream y prohibición de fabricar passed_cnt = 1 cuando run_verified no detecta tests ejecutados.",
+      "invariants": [
+        "Ninguna operación WAL pasa a COMMITTED sin confirmar que el SHA-256 en disco coincide con expected_post_sha256.",
+        "Una solicitud con idempotency_key en estado IN_PROGRESS se rechaza como duplicada en vuelo.",
+        "split_workstream particiona realmente las filas y bloqueos en SQLite hacia el nuevo workstream hijo.",
+        "run_verified reporta passed_cnt = 0 y tests_detected = false cuando la salida del comando no contiene evidencia de tests ejecutados."
+      ],
+      "implementation_files": [
+        "src/workstream.cpp",
+        "src/agent_supertools.cpp"
+      ],
+      "test_suites": [
+        "agent_os_resilience",
+        "env_git_supertools"
+      ],
+      "acceptance_criteria": [
+        "Comandos con exit_code 0 que no ejecutan tests devuelven passed_cnt == 0 y tests_detected == false en run_verified.",
+        "split_workstream transfiere los archivos especificados al nuevo workstream y actualiza workstream_files en SQLite."
+      ]
+    },
+    {
+      "req_id": "REQ-DATA-004",
+      "title": "Fidelidad del índice NTFS ultra-escala, MFT/USN y reconciliación incremental conservadora",
+      "category": "DATA_INTEGRITY",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "crawl_root_streaming sin interbloqueo productor-consumidor y con complete=0 durante reconstrucción; crawl_root_mft con tamaño y mtime reales; usn_delta_replay compatible con raíces de unidad (E:\\); fs_reconcile_incremental que solo purga ante ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND; fs_apply_rename_or_move con length(?) Unicode en SQLite; y fs_ensure_root con limpieza al cambiar ruta o FRN.",
+      "invariants": [
+        "fs_roots.complete se mantiene en 0 durante toda la reconstrucción y solo pasa a 1 al confirmar índices y FTS5.",
+        "Errores transitorios de acceso o bloqueo (ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION) nunca purgan nodos en fs_reconcile_incremental.",
+        "Los renombres de subárboles con caracteres UTF-8 multibyte usan longitud en caracteres SQLite length(?) sin corromper rutas hijas."
+      ],
+      "implementation_files": [
+        "src/fs_index.cpp",
+        "src/fs_crawler.cpp",
+        "src/usn.cpp",
+        "src/watcher.cpp"
+      ],
+      "test_suites": [
+        "fs_index_ultra_scale",
+        "fs_organize_and_usn_regression"
+      ],
+      "acceptance_criteria": [
+        "Renombrar directorios con tildes, eñes o caracteres Unicode multibyte mediante fs_apply_rename_or_move conserva intactas el 100% de las rutas hijas.",
+        "Archivos bloqueados temporalmente en disco no son eliminados del índice durante fs_reconcile_incremental."
+      ]
+    },
+    {
+      "req_id": "REQ-DATA-005",
+      "title": "Soporte completo de rutas largas (>260 caracteres) en Windows",
+      "category": "DATA_INTEGRITY",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Soporte completo de rutas largas (>260 caracteres) en Windows mediante native_path() (prefijo \\\\?\\) en todas las operaciones Win32 y declaración <longPathAware>true</longPathAware> en el manifiesto de todos los ejecutables y suites de prueba.",
+      "invariants": [
+        "Toda ruta larga (>= 248 caracteres) o con segmentos especiales utiliza el formato extendido \\\\?\\ en llamadas Win32.",
+        "Todos los binarios de producción y pruebas enlazan soporte longPathAware."
+      ],
+      "implementation_files": [
+        "src/platform.cpp",
+        "resources/app.manifest",
+        "CMakeLists.txt"
+      ],
+      "test_suites": [
+        "fs_index_ultra_scale",
+        "fs_organize_and_usn_regression",
+        "agent_os_resilience"
+      ],
+      "acceptance_criteria": [
+        "Operaciones de indexación, lectura, edición transaccional, snapshot y organización sobre rutas de más de 300 caracteres se ejecutan con éxito sin errores de límite MAX_PATH."
+      ]
+    },
+    {
+      "req_id": "REQ-DATA-006",
+      "title": "Sincronización interproceso real en SharedBudgetLedger y exactitud de consultas SQL",
+      "category": "DATA_INTEGRITY",
+      "priority": "P1",
+      "status": "CONFIRMED",
+      "summary": "Sincronización interproceso real con Named Mutex de Win32 en SharedBudgetLedger y corrección de columnas SQL (r.abs_path en knowledge_search y source_path/target_path/reason en scale_query(relations)).",
+      "invariants": [
+        "Todo acceso concurrente a SharedBudgetLedger entre procesos CLI, MCP y GUI está serializado por un mutex con nombre del kernel de Windows con manejo de WAIT_ABANDONED.",
+        "Las consultas SQL de knowledge_search y scale_query(relations) utilizan exclusivamente columnas reales del esquema vigente."
+      ],
+      "implementation_files": [
+        "src/platform.cpp",
+        "src/knowledge.cpp",
+        "src/scale.cpp",
+        "src/queries.cpp"
+      ],
+      "test_suites": [
+        "knowledge_docs_lineage",
+        "durable_inventory",
+        "live_sync"
+      ],
+      "acceptance_criteria": [
+        "knowledge(action='search') con rutas vinculadas a fs_roots resuelve r.abs_path sin errores SQLite.",
+        "scale_query(kind='relations') proyecta y devuelve source_path, target_path y reason correctamente."
+      ]
+    },
+    {
+      "req_id": "REQ-WORKTREE-001",
+      "title": "Registro central persistente de worktrees y protocolo de relevo multi-agente",
+      "category": "MULTI_AGENT_COORDINATION",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Catálogo persistente agent_worktrees_catalog y superherramienta worktree_inventory / project_resume que rastrean a qué proyecto pertenece cada worktree, qué agente lo creó, qué tarea desarrolla, archivos modificados, commits pendientes de integrar, cambios sin commit, procesos de build activos, espacio en disco y contexto de relevo ante agotamiento de cuota.",
+      "invariants": [
+        "Todo worktree descubierto por git worktree list --porcelain o registrado por un agente se conserva en agent_worktrees_catalog con su estado de ciclo de vida (IMPLEMENTED, CONFIRMED, INTEGRATED, DELIVERED).",
+        "Un worktree con modificaciones sin commit o sin pruebas verificadas nunca se marca como terminado ni integrado por simple declaración textual de un agente.",
+        "project_resume entrega en una sola llamada el estado completo de relevo para que otro agente continúe sin re-escanear el repositorio."
+      ],
+      "implementation_files": [
+        "include/migratool/database.hpp",
+        "src/database.cpp",
+        "src/git_intel.cpp",
+        "src/agent_supertools.cpp",
+        "src/mcp.cpp"
+      ],
+      "test_suites": [
+        "env_git_supertools",
+        "agent_os_resilience"
+      ],
+      "acceptance_criteria": [
+        "Detectar todos los worktrees registrados, sus commits pendientes de integración y sus modificaciones sin commit.",
+        "Mantener el registro persistente en SQLite y recuperar el contexto completo de relevo mediante project_resume."
+      ]
+    },
+    {
+      "req_id": "REQ-INTEGRATE-001",
+      "title": "Gestor de integración multi-agente y bloqueo de compilación final con avances pendientes",
+      "category": "MULTI_AGENT_COORDINATION",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Cola persistente integration_queue y superherramienta integrate_ready con detección no destructiva de conflictos mediante git merge-tree --write-tree y bloqueo duro de cualquier compilación final (INTEGRATED / DELIVERED) cuando existan worktrees obligatorios con trabajo en estado IMPLEMENTED o CONFIRMED pendiente de integrar.",
+      "invariants": [
+        "La evaluación de conflictos con git merge-tree --write-tree no altera el directorio de trabajo ni el índice de Git.",
+        "Ningún build puede declararse INTEGRATED o DELIVERED si existen worktrees obligatorios pendientes de integrar, salvo exclusión explícita registrada con motivo (exclusion_reason) y autor (excluded_by)."
+      ],
+      "implementation_files": [
+        "include/migratool/database.hpp",
+        "src/database.cpp",
+        "src/git_intel.cpp",
+        "src/agent_supertools.cpp",
+        "src/mcp.cpp"
+      ],
+      "test_suites": [
+        "env_git_supertools"
+      ],
+      "acceptance_criteria": [
+        "integrate_ready detecta ramas/worktrees pendientes y pre-evalúa fusiones y conflictos de forma no destructiva.",
+        "build_canonical rechaza etiquetar una compilación como INTEGRATED o DELIVERED si existe un worktree obligatorio sin integrar y sin exclusión explícita registrada."
+      ]
+    },
+    {
+      "req_id": "REQ-BUILD-001",
+      "title": "Manifiestos de compilación inmutables y trazabilidad inversa binario -> código",
+      "category": "BUILD_PROVENANCE",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Tabla build_manifests, archivo .migratool/builds/<build_id>/manifest.json, superherramienta build_canonical y acción trace_binary que permiten seleccionar cualquier .exe/.dll o hash SHA-256 y determinar exactamente qué commit, rama, worktree, agente, compilador y conjunto de avances produjeron ese binario.",
+      "invariants": [
+        "Cada compilación gestionada persiste su manifiesto JSON en .migratool/builds/<build_id>/manifest.json y su registro en build_manifests.",
+        "Todo artefacto binario registrado incluye su hash SHA-256 real para trazabilidad inversa inmediata mediante trace_binary."
+      ],
+      "implementation_files": [
+        "include/migratool/database.hpp",
+        "src/database.cpp",
+        "src/agent_supertools.cpp",
+        "src/mcp.cpp"
+      ],
+      "test_suites": [
+        "env_git_supertools"
+      ],
+      "acceptance_criteria": [
+        "build_canonical genera .migratool/builds/<build_id>/manifest.json con commit_sha, worktree, agente, estado de integración y hashes SHA-256 de los artefactos.",
+        "trace_binary resuelve por ruta o SHA-256 el origen exacto del ejecutable y advierte si corresponde a una compilación parcial o anterior."
+      ]
+    },
+    {
+      "req_id": "REQ-STORAGE-001",
+      "title": "Auditoría segura de almacenamiento, políticas de directorios y 4 niveles de conservación",
+      "category": "STORAGE_MANAGEMENT",
+      "priority": "P1",
+      "status": "CONFIRMED",
+      "summary": "Superherramienta storage_audit con políticas configurables por proyecto para clasificar rutas en 9 categorías (SOURCE, TEST_SOURCE, BUILD_OUTPUT, GENERATED, DEPENDENCY, CACHE, DOCUMENTATION, USER_DATA, UNKNOWN) y 4 niveles de conservación (PROTECTED, TEMP_RETAINED, VERIFIED_SAFE_CLEAN, NEEDS_REVIEW), prohibiendo limpiezas ciegas por nombre o antigüedad.",
+      "invariants": [
+        "Directorios SOURCE, TEST_SOURCE, DOCUMENTATION, USER_DATA, worktrees con cambios sin confirmar y builds canónicos protegidos reciben siempre el nivel PROTECTED.",
+        "Solo los artefactos clasificados como VERIFIED_SAFE_CLEAN pueden limpiarse automáticamente, enviándolos siempre a la Papelera de Reciclaje de Windows."
+      ],
+      "implementation_files": [
+        "src/agent_supertools.cpp",
+        "src/housekeep.cpp",
+        "src/fs_organize.cpp",
+        "src/database.cpp",
+        "src/mcp.cpp"
+      ],
+      "test_suites": [
+        "env_git_supertools",
+        "fs_organize_and_usn_regression"
+      ],
+      "acceptance_criteria": [
+        "storage_audit distingue código fuente y tests (incluyendo tests/, include/, tools/ fuera de src/) de directorios BUILD_OUTPUT.",
+        "Carpetas con nombres como old, backup, temp o build que contengan código o cambios sin confirmar son protegidas (PROTECTED / NEEDS_REVIEW) y excluidas del cálculo de limpieza automática."
+      ]
+    },
+    {
+      "req_id": "REQ-DISCOVERY-001",
+      "title": "Descubrimiento inteligente de réplicas, clones y trabajo huérfano",
+      "category": "PROJECT_DISCOVERY",
+      "priority": "P1",
+      "status": "CONFIRMED",
+      "summary": "Superherramienta discover_replicas que localiza e indexa incrementalmente instancias dispersas de un proyecto clasificándolas como MAIN_PROJECT, RELATED_WORKTREE, POSSIBLE_CLONE u ORPHAN_WORK mediante commit raíz de Git, remotos, historial compartido y hashes SHA-256 de archivos fuente.",
+      "invariants": [
+        "La identificación de réplicas nunca se basa únicamente en que las carpetas tengan nombres parecidos.",
+        "discover_replicas nunca fusiona ni elimina carpetas automáticamente; identifica cambios ya incorporados, duplicados exactos y avances únicos huérfanos."
+      ],
+      "implementation_files": [
+        "src/agent_supertools.cpp",
+        "src/git_intel.cpp",
+        "src/database.cpp",
+        "src/mcp.cpp"
+      ],
+      "test_suites": [
+        "env_git_supertools"
+      ],
+      "acceptance_criteria": [
+        "Clasificar con precisión MAIN_PROJECT, RELATED_WORKTREE, POSSIBLE_CLONE y ORPHAN_WORK a partir de identidad Git y hashes SHA-256.",
+        "Detectar archivos modificados únicos en una copia huérfana sin requerir barridos completos repetitivos en cada turno."
+      ]
+    },
+    {
+      "req_id": "REQ-TRACE-001",
+      "title": "Índice consultable de requisitos y matriz de trazabilidad quirúrgica",
+      "category": "TRACEABILITY",
+      "priority": "P1",
+      "status": "CONFIRMED",
+      "summary": "Indexación de PRODUCT_REQUIREMENTS_MASTER.json y matriz Requisito -> Implementación -> Prueba -> Commit -> Compilación consultable mediante project_health / requirements_trace para entregar a cada agente únicamente los requisitos relevantes a su tarea activa sin saturar su ventana de contexto.",
+      "invariants": [
+        "Cada requisito mantiene vínculos verificables a sus archivos de implementación, suites de prueba CTest, commits y compilaciones.",
+        "Las consultas filtradas por archivo, categoría o identificador devuelven solo los requisitos pertinentes al contexto de la tarea."
+      ],
+      "implementation_files": [
+        "docs/PRODUCT_REQUIREMENTS_MASTER.md",
+        "docs/PRODUCT_REQUIREMENTS_MASTER.json",
+        "src/agent_supertools.cpp",
+        "src/docs_hub.cpp",
+        "src/database.cpp",
+        "src/mcp.cpp"
+      ],
+      "test_suites": [
+        "env_git_supertools",
+        "knowledge_docs_lineage"
+      ],
+      "acceptance_criteria": [
+        "Consultar requirements_trace / project_health por archivo o categoría retorna únicamente los requisitos aplicables con verificación en vivo de sus archivos de implementación y suites de prueba."
+      ]
+    },
+    {
+      "req_id": "REQ-GUI-001",
+      "title": "Panel de supervisión humana de baja carga cognitiva bajo Apple HIG",
+      "category": "HUMAN_SUPERVISION_GUI",
+      "priority": "P2",
+      "status": "CONFIRMED",
+      "summary": "Panel ejecutivo en la GUI Win32 diseñado bajo Apple HIG (Porcelana Claro, contraste WCAG AAA, cero emojis ni estética neón) que presenta de un vistazo integraciones pendientes, worktrees con cambios pendientes, compilaciones antiguas, espacio recuperable y estado del último build canónico, con reflujo adaptativo sin recortes a zoom 200%.",
+      "invariants": [
+        "El resumen ejecutivo destaca pendientes de integración, riesgos de pérdida y si el último ejecutable omite avances de algún agente.",
+        "A zoom 200% y DPI PerMonitorV2, la interfaz refluye barras y divisores sin truncar textos ni superponer controles."
+      ],
+      "implementation_files": [
+        "src/gui.cpp",
+        "src/scale_view.cpp",
+        "src/comparison_view.cpp",
+        "include/migratool/gui_theme.hpp"
+      ],
+      "test_suites": [
+        "gui_acceptance",
+        "gui_lifecycle",
+        "live_sync"
+      ],
+      "acceptance_criteria": [
+        "La suite gui_acceptance verifica contraste WCAG AAA, presencia del resumen de supervisión y cero solapamientos o recortes de controles hasta zoom 200%."
+      ]
+    },
+    {
+      "req_id": "REQ-AUDIT-001",
+      "title": "Motor modular de auditoría técnica continua e incremental con invalidación por dependencias de headers y compile_commands.json",
+      "category": "CONTINUOUS_TECHNICAL_AUDIT",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Subsistema code_audit en C++23 nativo con caché persistente SQLite indexada por (file_sha256, compile_flags_sha256, headers_deps_sha256, analyzer_version). Reutiliza resultados de archivos sin cambios y re-analiza únicamente archivos modificados y unidades de traducción cuyos encabezados incluidos (#include) o banderas de compile_commands.json hayan cambiado.",
+      "invariants": [
+        "Modificar un encabezado C/C++ invalida automáticamente todas las unidades de traducción que lo incluyen directa o transitivamente.",
+        "Los archivos cuyo hash, encabezados transitivos y banderas de compilación no cambiaron reutilizan la caché SQLite sin repetir el análisis sintáctico."
+      ],
+      "implementation_files": [
+        "include/migratool/code_audit.hpp",
+        "src/code_audit.cpp",
+        "src/gateway.cpp"
+      ],
+      "test_suites": [
+        "code_audit"
+      ],
+      "acceptance_criteria": [
+        "En un proyecto con múltiples unidades C/C++ e includes compartidos, editar un .cpp aislado re-analiza solo 1 archivo, y editar un header compartido re-analiza exactamente el header y sus unidades dependientes."
+      ]
+    },
+    {
+      "req_id": "REQ-AUDIT-002",
+      "title": "Precisión AST sin falsos positivos: separación C vs C++23, complejidad ciclomática AST y desambiguación de TEST_CASE por línea",
+      "category": "CONTINUOUS_TECHNICAL_AUDIT",
+      "priority": "P1",
+      "status": "CONFIRMED",
+      "summary": "Extracción sintáctica/AST de funciones y macros de prueba (TEST_CASE) identificadas por (file_path, qualified_name, start_line), cálculo de complejidad ciclomática sobre nodos de control de flujo reales (ignorando comentarios y literales de cadena) y aplicación diferenciada de reglas de modernización según el lenguaje real (NULL válido en C; nullptr exigible en C++23).",
+      "invariants": [
+        "El uso de NULL en archivos C (.c) nunca se reporta como hallazgo de modernización de C++ (nullptr).",
+        "Múltiples TEST_CASE con el mismo nombre en distintas líneas del mismo archivo se registran como funciones independientes.",
+        "Una complejidad ciclomática alta se clasifica para revisión de responsabilidades y nunca como defecto confirmado por sí sola."
+      ],
+      "implementation_files": [
+        "include/migratool/code_audit.hpp",
+        "src/code_audit.cpp"
+      ],
+      "test_suites": [
+        "code_audit"
+      ],
+      "acceptance_criteria": [
+        "La suite code_audit verifica 0 falsos positivos de nullptr sobre archivos C, distinción exacta de TEST_CASE homónimos y exclusión de ramas dentro de comentarios/strings."
+      ]
+    },
+    {
+      "req_id": "REQ-AUDIT-003",
+      "title": "Triage de seguridad consciente de archivos de prueba y cobertura de compile_commands.json",
+      "category": "CONTINUOUS_TECHNICAL_AUDIT",
+      "priority": "P1",
+      "status": "CONFIRMED",
+      "summary": "Clasifica patrones de alta entropía, claves ficticias y rutas absolutas dentro de archivos de prueba (TEST_SOURCE / tests/) como PENDING_VALIDATION en lugar de vulnerabilidades CONFIRMED, y cruza los archivos fuente contra compile_commands.json para identificar código desconectado que no se compila.",
+      "invariants": [
+        "Ningún dato de ensayo en archivos de prueba (tests/) se etiqueta automáticamente como vulnerabilidad de seguridad CONFIRMED.",
+        "Los archivos de implementación ausentes de compile_commands.json se señalan explícitamente como no compilados."
+      ],
+      "implementation_files": [
+        "include/migratool/code_audit.hpp",
+        "src/code_audit.cpp"
+      ],
+      "test_suites": [
+        "code_audit"
+      ],
+      "acceptance_criteria": [
+        "Claves simuladas y rutas de fixture en tests/ reciben triage_status == PENDING_VALIDATION, mientras llamadas inseguras en src/ reciben CONFIRMED."
+      ]
+    },
+    {
+      "req_id": "REQ-AUDIT-004",
+      "title": "Verificador anti-alucinación de afirmaciones de agentes (verify_claim) y atribución histórica de regresiones",
+      "category": "CONTINUOUS_TECHNICAL_AUDIT",
+      "priority": "P0",
+      "status": "CONFIRMED",
+      "summary": "Verifica independientemente las entregas declaradas por cualquier agente cruzando 5 dimensiones separadas (conteo AST de funciones, evidencia de compilación vigente en build_manifests, evidencia de pruebas en verified_runs, hallazgos de calidad/complejidad y equivalencia funcional en casos diferenciales) y conecta cada regresión con el commit, rama, agente, prueba y build correspondiente.",
+      "invariants": [
+        "Una afirmación de un agente jamás se convierte automáticamente en hecho verificado sin evidencia directa en SQLite y disco.",
+        "Compilación exitosa, pruebas unitarias aprobadas y equivalencia funcional se evalúan y reportan como tres evidencias independientes."
+      ],
+      "implementation_files": [
+        "include/migratool/code_audit.hpp",
+        "src/code_audit.cpp",
+        "src/multiagent_coordinator.cpp"
+      ],
+      "test_suites": [
+        "code_audit",
+        "multiagent_coordinator"
+      ],
+      "acceptance_criteria": [
+        "verify_claim rechaza entregas sin compilación o sin pruebas ejecutadas como UNVERIFIED_CLAIM o CONTRADICTED_BY_EVIDENCE, y mantiene functional_equivalence == NOT_PROVEN aunque compilación y pruebas unitarias pasen."
+      ]
+    }
+  ]
+}

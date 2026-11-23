@@ -9,6 +9,8 @@
 #include "migratool/comparison_view.hpp"
 #include "migratool/duplicates.hpp"
 #include "migratool/fs_organize.hpp"
+#include "migratool/multiagent_coordinator.hpp"
+#include "migratool/code_audit.hpp"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shobjidl.h>
@@ -40,7 +42,16 @@ mt::ui::Palette palette=mt::ui::system_palette();
 #define MUTED palette.secondary
 #define BLUE palette.accent
 #define NAV palette.sidebar
-const wchar_t* pages[]={L"Estado del proyecto",L"Origen y destino",L"Símbolos del código",L"Correspondencias registradas",L"Pruebas de comportamiento",L"Cobertura de pruebas",L"Historial de cambios",L"Todos los archivos",L"Archivos pendientes",L"Git y compilación",L"Buscar en el proyecto",L"Dependencias del código",L"Integración con agentes",L"Agentes en vivo",L"Proyectos recientes",L"Código duplicado",L"Trabajos del proyecto",L"Cobertura por carpeta",L"Trabajo existente",L"Diagnóstico local",L"Carpetas y configuración",L"Archivos dentro de ZIP",L"Problemas del escaneo",L"Matriz de módulos",L"Fases, tareas y documentos",L"Sesiones y Handoffs",L"Linaje de rutas y árbol",L"Conocimiento y métodos probados",L"Documentos del proyecto",L"Lenguajes y herramientas del host"};
+const wchar_t* pages[]={L"Estado del proyecto",L"Origen y destino",L"Símbolos del código",L"Correspondencias registradas",L"Pruebas de comportamiento",L"Cobertura de pruebas",L"Historial de cambios",L"Todos los archivos",L"Archivos pendientes",L"Git y compilación",L"Buscar en el proyecto",L"Dependencias del código",L"Integración con agentes",L"Agentes en vivo",L"Proyectos recientes",L"Código duplicado",L"Trabajos del proyecto",L"Cobertura por carpeta",L"Trabajo existente",L"Diagnóstico local",L"Carpetas y configuración",L"Archivos dentro de ZIP",L"Problemas del escaneo",L"Matriz de módulos",L"Fases, tareas y documentos",L"Sesiones y Handoffs",L"Linaje de rutas y árbol",L"Conocimiento y métodos probados",L"Documentos del proyecto",L"Lenguajes y herramientas del host",L"Coordinación y worktrees",L"Compilaciones y almacenamiento",L"Requisitos maestros",L"Auditoría técnica continua"};
+const wchar_t* page_subtitle(int p){
+    switch(p){
+        case 30:return L"Inventario persistente de worktrees, avances por agente y evaluación de fusión sin tocar el árbol.";
+        case 31:return L"Manifiestos de compilación, trazabilidad inversa de binarios y auditoría de almacenamiento en cuatro niveles.";
+        case 32:return L"Especificación maestra del producto y matriz de trazabilidad entre requisitos, código, pruebas y builds.";
+        case 33:return L"Auditoría incremental del código, complejidad sintáctica, seguridad y verificación de entregas.";
+        default:return navigation_groups()[navigation_group(p)].description;
+    }
+}
 constexpr int ID_SECTION_VIEW=31,ID_SECTION_COMPACT=32,ID_PROJECT_MENU=16,ID_LOG_TOGGLE=17,ID_NEXT_STEP=19;
 constexpr int ID_HELP=50,ID_EXIT=51,ID_ZOOM_IN=52,ID_ZOOM_OUT=53,ID_ZOOM_RESET=54,ID_FOCUS_SEARCH=55,ID_RELOAD_VIEW=56;
 constexpr int ID_SIDEBAR=57,ID_CODE_SETTINGS=58,ID_RESOURCES=59;
@@ -346,7 +357,7 @@ std::wstring validate_directories(const Form& form,size_t count){
         const auto paths=lines(form.values[i]);
         if(paths.empty())return i==0?L"Añada una carpeta de origen.":i==1?L"Añada una carpeta de destino.":L"Elija dónde guardar el proyecto.";
         if(i>=2&&paths.size()!=1)return L"Elija una sola carpeta donde guardar el proyecto.";
-        for(const auto& path:paths){std::error_code error;if(!fs::path(wide(path)).is_absolute()||!fs::is_directory(fs::path(wide(path)),error))return L"No se puede abrir esta carpeta: "+wide(path);}
+        for(const auto& path:paths){std::error_code error;const auto p=fs::path(wide(path));if(!p.is_absolute()||!fs::is_directory(native_path(p),error))return L"No se puede abrir esta carpeta: "+wide(path);}
     }
     return {};
 }
@@ -413,7 +424,7 @@ bool save_window_png(HWND hwnd,const fs::path& output){
     DeleteDC(mem);
     if(!printed){DeleteObject(bmp);return false;}
     std::error_code ec;
-    if(!output.parent_path().empty())fs::create_directories(output.parent_path(),ec);
+    if(!output.parent_path().empty())fs::create_directories(native_path(output.parent_path()),ec);
     IWICImagingFactory* factory=nullptr;
     IWICBitmap* wic_bmp=nullptr;
     IWICStream* stream=nullptr;
@@ -422,7 +433,7 @@ bool save_window_png(HWND hwnd,const fs::path& output){
     bool ok=false;
     if(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&factory)))&&factory){
         if(SUCCEEDED(factory->CreateBitmapFromHBITMAP(bmp,nullptr,WICBitmapIgnoreAlpha,&wic_bmp))&&wic_bmp){
-            if(SUCCEEDED(factory->CreateStream(&stream))&&stream&&SUCCEEDED(stream->InitializeFromFilename(output.wstring().c_str(),GENERIC_WRITE))){
+            if(SUCCEEDED(factory->CreateStream(&stream))&&stream&&SUCCEEDED(stream->InitializeFromFilename(native_path(output).wstring().c_str(),GENERIC_WRITE))){
                 if(SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng,nullptr,&encoder))&&encoder&&SUCCEEDED(encoder->Initialize(stream,WICBitmapEncoderNoCache))){
                     if(SUCCEEDED(encoder->CreateNewFrame(&frame,nullptr))&&frame&&SUCCEEDED(frame->Initialize(nullptr))){
                         WICPixelFormatGUID fmt=GUID_WICPixelFormat24bppBGR;
@@ -510,8 +521,8 @@ struct App {
     int px(int x)const{return MulDiv(x,dpi,96);}
     int type_px(int x)const{return ui::type_size(x,dpi);}
     fs::path preferences_path()const{wchar_t value[32768]{};auto length=GetEnvironmentVariableW(L"MIGRATOOL_REGISTRY_PATH",value,32768);if(length&&length<32768)return fs::path(value).parent_path()/L"ui-preferences.json";length=GetEnvironmentVariableW(L"LOCALAPPDATA",value,32768);return (length&&length<32768?fs::path(value)/L"Migratool":executable_dir())/L"ui-preferences.json";}
-    void read_preferences(){try{auto path=preferences_path();if(fs::exists(path)){auto p=read_json(path);ui::text_percent=std::clamp(p.value("text_percent",100),100,200);sidebar_hidden=p.value("sidebar_hidden",false);}}catch(...){}}
-    void flush_preferences_sync(){try{auto path=preferences_path();fs::create_directories(path.parent_path());write_json(path,{{"text_percent",ui::text_percent},{"sidebar_hidden",sidebar_hidden}});}catch(const std::exception& e){log("No se pudo guardar la presentación: "+std::string(e.what()));}}
+    void read_preferences(){try{auto path=preferences_path();if(fs::exists(native_path(path))){auto p=read_json(path);ui::text_percent=std::clamp(p.value("text_percent",100),100,200);sidebar_hidden=p.value("sidebar_hidden",false);ui::g_theme_mode=std::clamp(p.value("theme_mode",ui::g_theme_mode),0,1);ui::g_increased_contrast=p.value("increased_contrast",ui::g_increased_contrast);}}catch(...){}}
+    void flush_preferences_sync(){try{auto path=preferences_path();fs::create_directories(native_path(path.parent_path()));write_json(path,{{"text_percent",ui::text_percent},{"sidebar_hidden",sidebar_hidden},{"theme_mode",ui::g_theme_mode},{"increased_contrast",ui::g_increased_contrast}});}catch(const std::exception& e){log("No se pudo guardar la presentación: "+std::string(e.what()));}}
     void save_preferences(){prefs_dirty=true;if(window)SetTimer(window,4,250,nullptr);else flush_preferences_sync();}
     void apply_appearance(bool relayout=true){
         if(window)SendMessageW(window,WM_SETREDRAW,FALSE,0);
@@ -588,10 +599,11 @@ struct App {
             std::string error;
             try{
                 LiveSession session(copy,"GUI",operation,"GUI");
-                auto notify=[hwnd,&session](const std::string& s){session.log(s);PostMessageW(hwnd,WM_LOG,0,reinterpret_cast<LPARAM>(new std::string(s)));};
+                auto notify=[hwnd,&session](const std::string& s){session.log(s);auto msg=std::make_unique<std::string>(s);if(PostMessageW(hwnd,WM_LOG,0,reinterpret_cast<LPARAM>(msg.get())))msg.release();};
                 fn(copy,notify,&cancel);session.finish(cancel.requested?1:0);
             }catch(const std::exception& e){error=e.what();}
-            PostMessageW(hwnd,WM_DONE,error.empty()?0:1,reinterpret_cast<LPARAM>(new std::string(error)));
+            auto done_msg=std::make_unique<std::string>(error);
+            if(PostMessageW(hwnd,WM_DONE,error.empty()?0:1,reinterpret_cast<LPARAM>(done_msg.get())))done_msg.release();
         });
     }
     bool can_continue_import()const {
@@ -626,7 +638,7 @@ struct App {
         const auto hwnd=window;worker=std::jthread([this,path,discovered,hwnd](){
             auto result=std::make_unique<OpenProjectResult>();
             try{auto p=Project::load(path);result->session=std::make_unique<LiveSession>(p,"GUI","Proyecto abierto","GUI");
-                if(fs::exists(p.state_dir()/L"catalog.sqlite")){Database db(p);result->revision=db.revision();result->durable=scale_enabled(p,db);if(!result->durable){result->scan=index_snapshot(p,false);result->summary=mt::status(p,false);}}
+                if(fs::exists(native_path(p.state_dir()/L"catalog.sqlite"))){Database db(p);result->revision=db.revision();result->durable=scale_enabled(p,db);if(!result->durable){result->scan=index_snapshot(p,false);result->summary=mt::status(p,false);}}
                 if(cancel.requested)throw std::runtime_error("Apertura cancelada");result->project=std::move(p);
             }catch(const std::exception& e){result->error=e.what();}
             if(PostMessageW(hwnd,WM_OPEN_PROJECT,discovered?1:0,reinterpret_cast<LPARAM>(result.get())))result.release();
@@ -636,6 +648,7 @@ struct App {
         loading=false;set_busy(false);if(closing){if(!polling)DestroyWindow(window);return;}
         if(!result.error.empty()){log("No se pudo abrir el proyecto: "+result.error);return;}
         project=std::move(result.project);scan_data=std::move(result.scan);summary=std::move(result.summary);durable=result.durable;displayed_revision=result.revision;gui_session=std::move(result.session);last_activity_id=0;
+        for(size_t i=0;i<project_paths.size();++i)if(same_path(project->file,project_paths[i])){SendMessageW(project_selector,CB_SETCURSEL,i,0);break;}
         if(!same_path(navigation_project,project->file))last_views={0,1,16,4,20};navigation_project=project->file;
         page=requested_page>=0?requested_page:discovered?1:0;requested_page=-1;if(capture_active&&!capture_pages.empty())page=capture_pages[capture_index];if(!capture_active)watcher=std::make_unique<IndexWatcher>(*project,900000,Log{},true);
         log("Proyecto abierto: "+project->config.value("name",""));refresh_view();layout();InvalidateRect(window,nullptr,TRUE);poll_live();
@@ -698,11 +711,11 @@ struct App {
     void finish_poll(ProjectPoll& update){
         polling=false;
         if(closing){if(!busy)DestroyWindow(window);return;}
-        if(update.epoch!=project_epoch||loading)return;
+        if(update.epoch!=project_epoch||loading){if(!loading&&!closing)poll_live();return;}
         if(!update.error.empty())log("No se pudo actualizar la vista. Se reintentará: "+update.error);
         if(!update.registry.is_object())return;
         const bool changed=update.registry_signature!=registry_signature;
-        const bool projects_changed=update.projects_signature!=projects_signature;
+        const bool projects_changed=update.projects_signature!=projects_signature||project_paths.size()!=update.registry.value("projects",Json::array()).size();
         registry=std::move(update.registry);
         registry_signature=std::move(update.registry_signature);
         if(projects_changed&&SendMessageW(project_selector,CB_GETDROPPEDSTATE,0,0)==FALSE){
@@ -782,11 +795,11 @@ struct App {
         if(page==20){ShowWindow(scalable_view.window(),SW_HIDE);ShowWindow(comparison.window(),SW_HIDE);ShowWindow(list,SW_SHOW);SetWindowTextW(subtitle,L"Elija qué carpetas contienen el código original y dónde se guarda el resultado.");columns({{L"Uso",140},{L"Carpeta",250},{L"Ruta completa",780}});if(project){for(const auto& root:project->config["roots"]){auto path=project->resolve(root["path"]);row({root["role"]=="source"?"Origen":"Destino",path_text(path.filename()),path_text(path)});}row({"Inventario",project->config.value("inventory_mode","universal")=="source_only"?"Solo código fuente":"Todos los archivos","El censo conserva qué se encontró y qué quedó pendiente."});}return;}
         const bool scaled=project&&(durable||page>=16)&&page!=13&&page!=14&&page!=20;
         ShowWindow(scalable_view.window(),scaled?SW_SHOW:SW_HIDE);
-        if(scaled){ShowWindow(list,SW_HIDE);ShowWindow(comparison.window(),SW_HIDE);SetWindowTextW(subtitle,navigation_groups()[navigation_group(page)].description);scalable_view.show(*project,page,utf8(text(filter)));return;}
+        if(scaled){ShowWindow(list,SW_HIDE);ShowWindow(comparison.window(),SW_HIDE);SetWindowTextW(subtitle,page_subtitle(page));scalable_view.show(*project,page,utf8(text(filter)));return;}
         const wchar_t* hints[]={L"Estado de evidencia · los conteos no equivalen a paridad funcional",L"Rutas exactas y avance ponderado por unidades declaradas",L"Declaraciones extraídas por analizadores; filtre por nombre o ruta",L"Declaraciones del agente y evidencia de los casos configurados",L"Entradas, salidas, errores y efectos observables",L"Informes importados; los valores desconocidos permanecen sin verificar",L"Historial inmutable · seleccione un archivo antes de entrar para filtrarlo",L"Todos los archivos conocidos, incluidos recursos, documentos y generados",L"Archivos nuevos, huérfanos y eliminados; el índice conserva su identidad",L"Estado Git independiente del inventario y pertenencia a la compilación",L"SQLite FTS5 · busca documentación, rutas, símbolos, notas y relaciones",L"Dependencias inventariadas; resolución por nombre único cuando es posible",L"Procesos MCP observados y volumen medido de consultas compactas"};
         SetWindowTextW(subtitle,page==13?L"Operaciones CLI, MCP y GUI · mensajes y estados actualizados automáticamente":
             page==14?L"Proyectos usados por agentes · doble clic para abrir el catálogo compartido":
-            page==15?L"Copias de código con el mismo tamaño y SHA-256 · doble clic para ver la ruta completa":page<13?hints[page]:navigation_groups()[navigation_group(page)].description);
+            page==15?L"Copias de código con el mismo tamaño y SHA-256 · doble clic para ver la ruta completa":page<13?hints[page]:page_subtitle(page));
         ShowWindow(list,page==1?SW_HIDE:SW_SHOW);
         ShowWindow(comparison.window(),page==1?SW_SHOW:SW_HIDE);
         if(page==14){
@@ -908,11 +921,11 @@ struct App {
     }
     void layout() {
         if(!window||!filter)return;RECT rect{};GetClientRect(window,&rect);const int width=rect.right,height=rect.bottom;
-        const bool condensed=ui::text_percent>125&&height<px(850);
-        const int gap=condensed?px(8):px(12),margin=px(24),control=ui::control_height(dpi),label_height=type_px(18)+px(8);
-        compact=sidebar_hidden||width<px(1100)||((ui::text_percent>125)&&width<px(1600));
+        const bool condensed=ui::text_percent>=150||(ui::text_percent>125&&height<px(850));
+        const int gap=condensed?px(6):px(12),margin=condensed?px(16):px(24),control=condensed?std::max(px(32),type_px(18)+px(8)):ui::control_height(dpi),label_height=type_px(18)+px(8);
+        compact=sidebar_hidden||ui::text_percent>=150||width<px(1100)||((ui::text_percent>125)&&width<px(1600));
         const int sidebar=compact?0:std::max(px(224),type_px(18)*13),left=sidebar+margin,right=margin,content=std::max(px(240),width-left-right);
-        content_left=left;content_width=content;title_y=condensed?px(12):px(20);title_height=type_px(28)+px(10);
+        content_left=left;content_width=content;title_y=condensed?px(8):px(20);title_height=type_px(28)+px(6);
         for(auto item:nav)ui::show_if(item,false);
         const int nav_top=px(112),nav_height=std::max(px(44),label_height+px(14)),nav_gap=px(6);
         for(size_t i=0;i<section_nav.size();++i){ui::show_if(section_nav[i],!compact);if(!compact)ui::move_if(section_nav[i],px(16),nav_top+static_cast<int>(i)*(nav_height+nav_gap),sidebar-px(32),nav_height);}
@@ -1029,11 +1042,11 @@ struct App {
     void action(int id) {
         if(id==ID_HELP){Form f;f.parent=window;f.title=std::wstring(L"Ayuda · ")+pages[page];f.width=900;f.height=750;f.read_only=true;f.labels={pages[page]};
             std::wstring help=L"Migratool conserva el control de una migración entre lenguajes.\r\n\r\n1. Proyecto: elija las carpetas del código original y del resultado. Los originales se conservan.\r\n2. Inicio: escanee el proyecto y revise qué falta. El escaneo puede continuar en segundo plano.\r\n3. Migración: compare los archivos de origen y destino. Seleccione un archivo y use Registrar avance para guardar sus destinos exactos y una nota.\r\n4. Actividad: consulte los trabajos y las operaciones de sus agentes; puede pausar o continuar los trabajos que lo permitan.\r\n5. Revisión: compruebe pruebas, duplicados, cobertura y evidencia.\r\n\r\nLos porcentajes distinguen el avance declarado y las pruebas vigentes. «Por calcular» significa que todavía falta conocer parte del alcance; no equivale a cero. Un archivo detectado no se considera migrado automáticamente. Las notas y los cambios guardan autor y fecha.\r\n\r\nPuede cambiar de sección con Ctrl+1 a Ctrl+5 o el menú Ir a. Cada sección tiene un selector de pantallas. Ctrl+F busca en la pantalla actual, F5 actualiza, Ctrl++ amplía el texto hasta 200 %, Ctrl+0 restablece el tamaño y Ctrl+B muestra u oculta la barra lateral.\r\n\r\nPara agentes: abra el mismo archivo de proyecto desde CLI o MCP. La GUI comparte el catálogo y recibe sus cambios. Consulte Proyecto > Integración con agentes para comprobar las conexiones.\r\n\r\nLas funciones avanzadas siguen disponibles en los menús Proyecto e Ir a. «Detalles técnicos» muestra los mensajes del motor cuando necesite investigarlos.";
-            help+=L"\r\n\r\nEsta pantalla: ";help+=navigation_groups()[navigation_group(page)].description;f.values={help};show_form(f);return;}
+            help+=L"\r\n\r\nEsta pantalla: ";help+=page_subtitle(page);f.values={help};show_form(f);return;}
         if(id==ID_EXIT){SendMessageW(window,WM_CLOSE,0,0);return;}
         if(id==ID_ZOOM_IN||id==ID_ZOOM_OUT||id==ID_ZOOM_RESET){zoom(id==ID_ZOOM_IN?25:id==ID_ZOOM_OUT?-25:0);return;}
-        if(id==ID_INCREASE_CONTRAST){ui::g_increased_contrast=!ui::g_increased_contrast;apply_appearance();log(ui::g_increased_contrast?"Contraste reforzado y bordes nítidos activados (WCAG AAA).":"Contraste estándar restaurado.");return;}
-        if(id==ID_TOGGLE_THEME){ui::g_theme_mode=(ui::g_theme_mode==0)?1:0;apply_appearance();log(ui::g_theme_mode==1?"Modo oscuro calibrado activado.":"Tema Porcelana Claro activado.");return;}
+        if(id==ID_INCREASE_CONTRAST){ui::g_increased_contrast=!ui::g_increased_contrast;apply_appearance();save_preferences();log(ui::g_increased_contrast?"Contraste reforzado y bordes nítidos activados (WCAG AAA).":"Contraste estándar restaurado.");return;}
+        if(id==ID_TOGGLE_THEME){ui::g_theme_mode=(ui::g_theme_mode==0)?1:0;apply_appearance();save_preferences();log(ui::g_theme_mode==1?"Modo oscuro calibrado activado.":"Tema Porcelana Claro activado.");return;}
         if(id==ID_SIDEBAR){sidebar_hidden=!sidebar_hidden;save_preferences();layout();return;}
         if(id==ID_FOCUS_SEARCH){if(IsWindowVisible(filter))SetFocus(filter);else log("Esta pantalla no tiene búsqueda. Elija una lista desde el menú Ir a.");return;}
         if(id==ID_RELOAD_VIEW){if(!loading)refresh_view();return;}
@@ -1050,7 +1063,7 @@ struct App {
         if(id==ID_NEW){
             Form f;f.parent=window;f.title=L"Crear un proyecto de migración";f.width=900;f.height=670;f.browse_folders=true;f.single_folder=2;
             f.labels={L"Carpetas del código original",L"Carpetas del resultado",L"Carpeta donde guardar el proyecto",L"Nombre del proyecto"};f.values={L"",L"",L"",L"Nueva migración"};
-            f.validate=[](const Form& form){auto problem=validate_directories(form,3);if(!problem.empty())return problem;if(form.values[3].find_first_not_of(L" \r\n\t")==std::wstring::npos)return std::wstring(L"Escriba un nombre para el proyecto.");if(fs::exists(fs::path(form.values[2])/L"migration.json"))return std::wstring(L"Esta carpeta ya contiene un proyecto. Elija otra carpeta o abra el existente.");return std::wstring();};
+            f.validate=[](const Form& form){auto problem=validate_directories(form,3);if(!problem.empty())return problem;if(form.values[3].find_first_not_of(L" \r\n\t")==std::wstring::npos)return std::wstring(L"Escriba un nombre para el proyecto.");if(fs::exists(native_path(fs::path(form.values[2])/L"migration.json")))return std::wstring(L"Esta carpeta ya contiene un proyecto. Elija otra carpeta o abra el existente.");return std::wstring();};
             if(show_form(f)){auto p=Project::create(fs::path(f.values[2])/L"migration.json",utf8(f.values[3]),form_roots(f,nullptr));load(p.file);}
             return;
         }
@@ -1074,7 +1087,7 @@ struct App {
             f.values={L"",L"",L"100",L"GUI"};f.single_fields={0,1,2,3};f.browse_fields={0};
             f.validate=[](const Form& form){
                 const fs::path path(form.values[0]);std::error_code error;
-                if(!path.is_absolute()||!fs::is_regular_file(path,error))return std::wstring(L"Elija la ruta completa del registro o catálogo existente.");
+                if(!path.is_absolute()||!fs::is_regular_file(native_path(path),error))return std::wstring(L"Elija la ruta completa del registro o catálogo existente.");
                 try{size_t used{};const auto count=std::stoi(form.values[2],&used);if(used!=form.values[2].size()||count<1||count>1000)throw std::out_of_range("lote");}
                 catch(...){return std::wstring(L"El tamaño del lote debe estar entre 1 y 1000 registros.");}
                 if(form.values[3].find_first_not_of(L" \r\n\t")==std::wstring::npos)return std::wstring(L"Escriba el autor de la importación.");
@@ -1097,7 +1110,9 @@ struct App {
         if(id==ID_REVALIDATE_WORK){
             const auto selected_id=page==18?selected():std::string();
             if(selected_id.empty()){log("Seleccione un resultado en Revisión > Trabajo existente para comprobar de nuevo sus archivos.");return;}
-            import_work({{"action","revalidate"},{"ids",Json::array({std::stoll(selected_id)})},{"actor","GUI"}});
+            int64_t parsed_id=0;
+            try{parsed_id=std::stoll(selected_id);}catch(const std::exception&){log("El identificador seleccionado no es válido para revalidación.");return;}
+            import_work({{"action","revalidate"},{"ids",Json::array({parsed_id})},{"actor","GUI"}});
             return;
         }
         if(id==ID_CODE_SETTINGS||id==ID_RESOURCES){
@@ -1324,10 +1339,12 @@ struct App {
                 for(int i=0;i<4;++i)if(dp==disp_names[i])return i;
                 return 0;
             };
-            if(!source.empty()&&(source[0]=='F'||source[0]=='S')&&fs::exists(project->state_dir()/L"catalog.sqlite")){
+            if(!source.empty()&&(source[0]=='F'||source[0]=='S')&&fs::exists(native_path(project->state_dir()/L"catalog.sqlite"))){
                 Database db(*project);
-                auto rows=db.query(source[0]=='F'?"SELECT absolute_path FROM files WHERE id=? AND deleted=0":"SELECT f.absolute_path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.id=? AND s.active=1",{std::stoll(source.substr(1))});
-                if(!rows.empty()){path=wide(rows[0]["absolute_path"]);if(source[0]=='S')mark_entity=source;}
+                try{
+                    auto rows=db.query(source[0]=='F'?"SELECT absolute_path FROM files WHERE id=? AND deleted=0":"SELECT f.absolute_path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.id=? AND s.active=1",{std::stoll(source.substr(1))});
+                    if(!rows.empty()){path=wide(rows[0]["absolute_path"]);if(source[0]=='S')mark_entity=source;}
+                }catch(const std::exception&){}
                 auto mrows=db.query("SELECT targets,cases,complete,note,actor,hashes FROM mappings WHERE source=? LIMIT 1",{source});
                 if(!mrows.empty()){
                     const auto& mr=mrows[0];
@@ -1337,8 +1354,10 @@ struct App {
                             auto tstr=tid.get<std::string>();
                             std::wstring tpath;
                             if(tstr.size()>1&&(tstr[0]=='F'||tstr[0]=='S')){
-                                auto trows=db.query(tstr[0]=='F'?"SELECT absolute_path FROM files WHERE id=? AND deleted=0":"SELECT f.absolute_path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.id=? AND s.active=1",{std::stoll(tstr.substr(1))});
-                                if(!trows.empty())tpath=wide(trows[0]["absolute_path"]);
+                                try{
+                                    auto trows=db.query(tstr[0]=='F'?"SELECT absolute_path FROM files WHERE id=? AND deleted=0":"SELECT f.absolute_path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.id=? AND s.active=1",{std::stoll(tstr.substr(1))});
+                                    if(!trows.empty())tpath=wide(trows[0]["absolute_path"]);
+                                }catch(const std::exception&){}
                             }
                             if(tpath.empty())tpath=wide(tstr);
                             if(!prefill_targets.empty())prefill_targets+=L"\r\n";
@@ -1374,12 +1393,14 @@ struct App {
                 if(src_paths.empty())return std::wstring(L"Elija el archivo de origen.");
                 if(src_paths.size()!=1)return std::wstring(L"Elija un solo archivo de origen.");
                 std::error_code error;
-                if(!fs::path(wide(src_paths[0])).is_absolute()||!fs::is_regular_file(fs::path(wide(src_paths[0])),error))return L"Se necesita la ruta completa de un archivo existente: "+wide(src_paths[0]);
+                const auto sp=fs::path(wide(src_paths[0]));
+                if(!sp.is_absolute()||!fs::is_regular_file(native_path(sp),error))return L"Se necesita la ruta completa de un archivo existente: "+wide(src_paths[0]);
                 const auto tgt_paths=lines(form.values[1]);
                 if(dp<=1&&tgt_paths.empty())return std::wstring(L"Elija al menos un archivo de destino o cambie la disposición.");
                 if(dp>=2&&form.values[2].find_first_not_of(L" \r\n\t")==std::wstring::npos)return std::wstring(L"Escriba una nota explicativa para eliminación intencional o reemplazo externo.");
                 for(const auto& pth:tgt_paths){
-                    if(!fs::path(wide(pth)).is_absolute()||!fs::is_regular_file(fs::path(wide(pth)),error))return L"Se necesita la ruta completa de un archivo existente: "+wide(pth);
+                    const auto tp=fs::path(wide(pth));
+                    if(!tp.is_absolute()||!fs::is_regular_file(native_path(tp),error))return L"Se necesita la ruta completa de un archivo existente: "+wide(pth);
                 }
                 return std::wstring();
             };
@@ -1390,14 +1411,19 @@ struct App {
                 const bool complete=(st>=3);
                 const bool keep_sym=!mark_entity.empty()&&mark_entity[0]=='S'&&!path.empty()&&same_path(fs::path(f.values[0]),fs::path(path));
                 start([source_path=fs::path(f.values[0]),mark_entity,keep_sym,targets=std::move(targets),complete,note=utf8(f.values[2]),actor=utf8(f.values[3]),cases=lines(f.values[4]),stage,disp,ext_rep](Project& p,Log message,Cancel* cancellation){
-                    if(keep_sym&&fs::exists(p.state_dir()/L"catalog.sqlite")){
+                    if(keep_sym&&fs::exists(native_path(p.state_dir()/L"catalog.sqlite"))){
                         std::vector<std::string> target_ids;
                         {
                             Database db(p);
-                            const auto all_files=db.query("SELECT id,absolute_path FROM files WHERE deleted=0 AND sha256 IS NOT NULL");
                             for(const auto& t:targets){
                                 std::string tid;
-                                for(const auto& fr:all_files){if(same_path(t,fs::path(wide(fr["absolute_path"].get<std::string>())))){tid="F"+std::to_string(fr["id"].get<int64_t>());break;}}
+                                const auto norm_fwd=path_text(t.lexically_normal());
+                                auto t_pref=t.lexically_normal();t_pref.make_preferred();
+                                const auto norm_back=utf8(t_pref.wstring());
+                                auto rows=db.query("SELECT id FROM files WHERE deleted=0 AND sha256 IS NOT NULL AND (absolute_path=? OR absolute_path=?) LIMIT 1",{norm_fwd,norm_back});
+                                if(!rows.empty()){
+                                    tid="F"+std::to_string(rows[0]["id"].get<int64_t>());
+                                }
                                 target_ids.push_back(tid.empty()?path_text(t):tid);
                             }
                         }
@@ -1664,7 +1690,7 @@ LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             if(a->closing){if(wp)a->log("Operación cancelada al cerrar: "+*s);if(!a->polling)DestroyWindow(w);return 0;}
             if(wp){a->log("Error: "+*s);MessageBoxW(w,wide(*s).c_str(),L"Migratool — operación no completada",MB_OK|MB_ICONERROR);}else a->log("Operación terminada; consulte estados y comprobantes.");
             if(a->project){a->displayed_revision=-1;a->watcher=std::make_unique<IndexWatcher>(*a->project,900000);if((a->durable||a->page>=16)&&a->page!=13&&a->page!=14&&a->page!=20)a->scalable_view.refresh();}a->layout();a->poll_live();return 0;}
-          case WM_TIMER:if(wp==1){if(!a->capture_active)a->poll_live();}else if(wp==3){KillTimer(w,3);a->refresh_view();}else if(wp==4){KillTimer(w,4);a->prefs_dirty=false;const auto path=a->preferences_path();const int tp=ui::text_percent;const bool sh=a->sidebar_hidden;if(a->prefs_worker.joinable())a->prefs_worker.join();a->prefs_worker=std::jthread([path,tp,sh]{try{fs::create_directories(path.parent_path());write_json(path,{{"text_percent",tp},{"sidebar_hidden",sh}});}catch(...){}});}else if(wp==5&&a->capture_active){
+          case WM_TIMER:if(wp==1){if(!a->capture_active)a->poll_live();}else if(wp==3){KillTimer(w,3);a->refresh_view();}else if(wp==4){KillTimer(w,4);a->prefs_dirty=false;const auto path=a->preferences_path();const int tp=ui::text_percent;const bool sh=a->sidebar_hidden;const int tm=ui::g_theme_mode;const bool ic=ui::g_increased_contrast;if(a->prefs_worker.joinable())a->prefs_worker.join();a->prefs_worker=std::jthread([path,tp,sh,tm,ic]{try{fs::create_directories(native_path(path.parent_path()));write_json(path,{{"text_percent",tp},{"sidebar_hidden",sh},{"theme_mode",tm},{"increased_contrast",ic}});}catch(...){}});}else if(wp==5&&a->capture_active){
               const ULONGLONG now_tick=GetTickCount64();
               if(a->capture_wait_started==0)a->capture_wait_started=now_tick;
               const bool timed_out=(now_tick-a->capture_wait_started)>45000;

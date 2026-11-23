@@ -32,6 +32,7 @@ bool expect_throws(const std::function<void()>& fn, const std::string& msg) {
 } // namespace
 
 int main(int argc, char** argv) {
+    mt::set_failpoints_enabled_for_tests(true);
     try {
         (void)argc; (void)argv;
         auto base = fs::temp_directory_path() / wide("migratool_serena_lsp_test_" + unique_id());

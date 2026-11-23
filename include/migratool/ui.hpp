@@ -227,11 +227,14 @@ inline LRESULT handle_listview_customdraw(LPARAM lparam,const Palette& p){
     return CDRF_DODEFAULT;
 }
 inline void tab_order(std::span<const HWND> controls){
+    HDWP hdwp=BeginDeferWindowPos(static_cast<int>(controls.size()));
     HWND previous=HWND_TOP;
     for(auto control:controls)if(control){
-        SetWindowPos(control,previous,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_NOOWNERZORDER);
+        if(hdwp)hdwp=DeferWindowPos(hdwp,control,previous,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_NOOWNERZORDER);
+        else SetWindowPos(control,previous,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_NOOWNERZORDER);
         previous=control;
     }
+    if(hdwp)EndDeferWindowPos(hdwp);
 }
 inline std::wstring number(const std::wstring& value,UINT decimals){
     wchar_t decimal[8]=L".",separator[8]=L",",out[128]{};
@@ -252,7 +255,19 @@ inline void name(HWND hwnd,const std::wstring& value){
     }
 }
 inline void list_colors(HWND list,const Palette& p){ListView_SetBkColor(list,p.surface);ListView_SetTextBkColor(list,p.surface);ListView_SetTextColor(list,p.text);}
-inline void font_tree(HWND window,HFONT font){SendMessageW(window,WM_SETFONT,reinterpret_cast<WPARAM>(font),FALSE);EnumChildWindows(window,[](HWND child,LPARAM data)->BOOL{SendMessageW(child,WM_SETFONT,static_cast<WPARAM>(data),FALSE);return TRUE;},reinterpret_cast<LPARAM>(font));}
+inline void font_tree(HWND window,HFONT font){
+    SendMessageW(window,WM_SETFONT,reinterpret_cast<WPARAM>(font),FALSE);
+    EnumChildWindows(window,[](HWND child,LPARAM data)->BOOL{
+        const auto target_font=reinterpret_cast<HFONT>(data);
+        if(reinterpret_cast<HFONT>(SendMessageW(child,WM_GETFONT,0,0))==target_font)return TRUE;
+        wchar_t cls[32]{};GetClassNameW(child,cls,32);
+        const bool heavy=(wcscmp(cls,L"SysListView32")==0||wcscmp(cls,L"SysTreeView32")==0);
+        if(heavy)SendMessageW(child,WM_SETREDRAW,FALSE,0);
+        SendMessageW(child,WM_SETFONT,static_cast<WPARAM>(data),FALSE);
+        if(heavy)SendMessageW(child,WM_SETREDRAW,TRUE,0);
+        return TRUE;
+    },reinterpret_cast<LPARAM>(font));
+}
 inline HBRUSH color_control(HDC dc,HWND child,const Palette& p,HBRUSH background,HBRUSH surface){
     wchar_t cls[64]{};GetClassNameW(child,cls,64);const bool edit=wcscmp(cls,L"Edit")==0||wcscmp(cls,L"ComboBox")==0;
     SetTextColor(dc,p.text);SetBkColor(dc,edit?p.surface:p.background);return edit?surface:background;

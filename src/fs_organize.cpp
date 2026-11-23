@@ -204,6 +204,7 @@ struct WalkResult {
     std::vector<WalkedFile> files;
     std::vector<std::string> dirs;
     std::vector<std::string> junctions;
+    int64_t walk_errors = 0;
 };
 
 WalkResult win32_safe_walk(const fs::path& root, Cancel* cancel = nullptr) {
@@ -221,7 +222,11 @@ WalkResult win32_safe_walk(const fs::path& root, Cancel* cancel = nullptr) {
 
         WIN32_FIND_DATAW fd{};
         HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
-        if (h == INVALID_HANDLE_VALUE) continue;
+        if (h == INVALID_HANDLE_VALUE) {
+            const DWORD err = GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_NO_MORE_FILES) ++res.walk_errors;
+            continue;
+        }
         struct FindGuard { HANDLE v; ~FindGuard() { if (v != INVALID_HANDLE_VALUE) FindClose(v); } } fg{h};
 
         std::vector<std::pair<fs::path, std::string>> subdirs;
@@ -229,7 +234,7 @@ WalkResult win32_safe_walk(const fs::path& root, Cancel* cancel = nullptr) {
             std::wstring_view wname(fd.cFileName);
             if (wname == L"." || wname == L"..") continue;
             std::string name;
-            try { name = utf8(std::wstring(wname)); } catch (...) { continue; }
+            try { name = utf8(std::wstring(wname)); } catch (...) { ++res.walk_errors; continue; }
             const std::string rel = join_rel(cur_rel, name);
             const DWORD attrs = fd.dwFileAttributes;
             const DWORD rtag = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) ? fd.dwReserved0 : 0;
@@ -389,6 +394,16 @@ CmdOut run_git_fast(const fs::path& repo_dir, const std::vector<std::string>& gi
     HandleGuard rg(rpipe), wg(wpipe);
     SetHandleInformation(rpipe, HANDLE_FLAG_INHERIT, 0);
 
+    // Redirect stdin to NUL so git NEVER inherits or deadlocks on an MCP JSON-RPC stdin pipe!
+    HandleGuard nul_in(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+
+    HandleGuard job(CreateJobObjectW(nullptr, nullptr));
+    if (job.h != INVALID_HANDLE_VALUE && job.h != nullptr) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job.h, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+    }
+
     std::wstring cmdline = quote_arg(git.wstring()) + L" -C " + quote_arg(repo_dir.wstring());
     for (const auto& a : git_args) cmdline += L" " + quote_arg(wide(a));
 
@@ -398,30 +413,46 @@ CmdOut run_git_fast(const fs::path& repo_dir, const std::vector<std::string>& gi
     si.wShowWindow = SW_HIDE;
     si.hStdOutput = wpipe;
     si.hStdError = wpipe;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdInput = (nul_in.h != INVALID_HANDLE_VALUE) ? nul_in.h : nullptr;
 
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> cmd_mut(cmdline.begin(), cmdline.end());
     cmd_mut.push_back(L'\0');
-    if (!CreateProcessW(nullptr, cmd_mut.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+    if (!CreateProcessW(nullptr, cmd_mut.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
                         nullptr, nullptr, &si, &pi)) {
         return res;
     }
     CloseHandle(wpipe);
     wg.h = INVALID_HANDLE_VALUE;
     HandleGuard ph(pi.hProcess), th(pi.hThread);
-
-    std::string out;
-    std::array<char, 8192> buf{};
-    DWORD got = 0;
-    while (ReadFile(rpipe, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr) && got > 0) {
-        out.append(buf.data(), got);
-        if (out.size() > 32 * 1024 * 1024) break;
+    if (job.h != INVALID_HANDLE_VALUE && job.h != nullptr) {
+        AssignProcessToJobObject(job.h, pi.hProcess);
     }
-    if (WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_TIMEOUT) {
-        TerminateProcess(pi.hProcess, 1);
+    ResumeThread(pi.hThread);
+
+    // Drain pipe on dedicated thread so WaitForSingleObject enforces a strict hard deadline even if git keeps pipe open!
+    std::string out;
+    std::thread reader([&]() {
+        std::array<char, 8192> buf{};
+        DWORD got = 0;
+        while (ReadFile(rpipe, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr) && got > 0) {
+            if (out.size() < 32 * 1024 * 1024) {
+                const size_t take = std::min<size_t>(got, 32 * 1024 * 1024 - out.size());
+                out.append(buf.data(), take);
+            }
+        }
+    });
+
+    const DWORD wrc = WaitForSingleObject(pi.hProcess, timeout_ms);
+    if (wrc == WAIT_TIMEOUT) {
+        if (job.h != INVALID_HANDLE_VALUE && job.h != nullptr) TerminateJobObject(job.h, 1);
+        else TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 2000);
+        CancelIoEx(rpipe, nullptr);
+        if (reader.joinable()) reader.join();
         return res;
     }
+    if (reader.joinable()) reader.join();
     DWORD ec = 1;
     GetExitCodeProcess(pi.hProcess, &ec);
     res.exit_code = static_cast<int>(ec);
@@ -663,11 +694,7 @@ bool is_confined_within(const fs::path& candidate, const fs::path& base, bool al
     for (const auto& part : candidate) {
         if (part == L"..") return false;
     }
-    std::string c_str = norm_rel_fwd(lower_ascii(path_text(candidate)));
-    std::string b_str = norm_rel_fwd(lower_ascii(path_text(base)));
-    if (b_str.empty()) return false;
-    if (allow_equal && c_str == b_str) return true;
-    return c_str.size() > b_str.size() && c_str.starts_with(b_str + "/");
+    return is_path_within_dir(candidate, base, allow_equal, true);
 }
 
 std::string validate_rel_no_traversal(const std::string& raw, const char* field) {
@@ -1443,6 +1470,9 @@ Json tool_organize_plan(const Project& p, Database& db, const Json& args, Cancel
     const std::string plan_id = args.value("plan_id", "plan_" + unique_id().substr(0, 12));
     validate_safe_id(plan_id, "plan_id");
     const fs::path plan_dir = p.state_dir() / L"organize" / wide(plan_id);
+    if (win32_exists(plan_dir / L"plan_summary.json")) {
+        throw std::runtime_error("PLAN_ALREADY_EXISTS: el plan_id es inmutable y ya existe: " + plan_id);
+    }
 
     const std::string q_arg = args.value("quarantine_dir", "");
     fs::path quarantine_base;
@@ -1772,12 +1802,43 @@ std::vector<Json> load_reconciled_journal(const fs::path& journal_path,
             const fs::path src(wide(intent.at("src").get<std::string>()));
             const fs::path dst(wide(intent.at("dst").get<std::string>()));
             if (win32_exists(dst)) {
-                if (write_back_reconciled && win32_exists(src)) {
-                    win32_remove_tree_no_reparse(src);
+                if (win32_exists(src)) {
+                    // NEVER silently delete src when both src and dst exist (AUD-001 / M-16):
+                    // destination may contain unrelated or pre-existing data!
+                    throw std::runtime_error("SAFETY_CONFLICT: origen y destino coexisten durante resume en seq " +
+                                             std::to_string(seq) + " (" + path_text(src) + " -> " + path_text(dst) +
+                                             "); se conservaron ambos extremos sin eliminar el origen");
                 }
-                if (!win32_exists(src)) {
-                    completed_on_disk = true;
+                // Source is gone and destination exists: verify destination matches recorded hashes if present
+                bool hashes_ok = true;
+                if (intent.contains("manifest_entries") && intent["manifest_entries"].is_array()) {
+                    for (const auto& me : intent["manifest_entries"]) {
+                        const fs::path qp(wide(me.value("quarantine_path", "")));
+                        const std::string exp_sha = me.value("sha256", "");
+                        if (!qp.empty() && !exp_sha.empty()) {
+                            if (!win32_exists(qp) || sha256_file_bounded(qp, 0, nullptr) != exp_sha) {
+                                hashes_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                } else if (intent.contains("moved_files") && intent["moved_files"].is_array()) {
+                    for (const auto& mf : intent["moved_files"]) {
+                        const fs::path dp(wide(mf.value("dst", "")));
+                        const std::string exp_sha = mf.value("sha256", "");
+                        if (!dp.empty() && !exp_sha.empty()) {
+                            if (!win32_exists(dp) || sha256_file_bounded(dp, 0, nullptr) != exp_sha) {
+                                hashes_ok = false;
+                                break;
+                            }
+                        }
+                    }
                 }
+                if (!hashes_ok) {
+                    throw std::runtime_error("SAFETY_CONFLICT: el destino en resume no coincide con el SHA-256 esperado en seq " +
+                                             std::to_string(seq));
+                }
+                completed_on_disk = true;
             }
         } else if (op == "edit_text") {
             const fs::path target(wide(intent.at("target").get<std::string>()));
@@ -1797,20 +1858,16 @@ std::vector<Json> load_reconciled_journal(const fs::path& journal_path,
             rec["phase"] = "committed";
             if (write_back_reconciled) {
                 if (!manifest_path.empty() && rec.contains("manifest_entries") && rec["manifest_entries"].is_array()) {
-                    std::ofstream mfh(native_path(manifest_path), std::ios::binary | std::ios::app);
                     for (const auto& me : rec["manifest_entries"]) {
                         const std::string ok = lower_ascii(me.value("orig_path", ""));
                         if (!ok.empty() && !manifest_origs.contains(ok)) {
-                            mfh << me.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
+                            append_durable_line(manifest_path, me.dump(-1, ' ', false, Json::error_handler_t::replace));
                             manifest_origs.insert(ok);
                         }
                     }
-                    mfh.flush();
                 }
                 rec.erase("manifest_entries");
-                std::ofstream jfh(native_path(journal_path), std::ios::binary | std::ios::app);
-                jfh << rec.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-                jfh.flush();
+                append_durable_line(journal_path, rec.dump(-1, ' ', false, Json::error_handler_t::replace));
             } else {
                 rec.erase("manifest_entries");
             }
@@ -1841,6 +1898,9 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
 
     const bool resume = args.value("resume", false);
     const int64_t simulate_crash_after_move_seq = args.value("simulate_crash_after_move_seq", int64_t(-1));
+    if (simulate_crash_after_move_seq >= 0 && !failpoints_enabled()) {
+        throw std::runtime_error("SAFETY_VIOLATION: simulate_crash_after_move_seq está deshabilitado en producción");
+    }
     const fs::path root_path(wide(summary.at("root_path").get<std::string>()));
     const fs::path quarantine_base(wide(summary.at("quarantine_dir").get<std::string>()));
     const fs::path q_ret = quarantine_base / L"retirados";
@@ -1888,9 +1948,10 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
         }
     }
 
-    auto mode = resume ? (std::ios::binary | std::ios::app) : (std::ios::binary | std::ios::trunc);
-    std::ofstream jfh(native_path(journal_path), mode);
-    std::ofstream mfh(native_path(manifest_path), mode);
+    if (!resume) {
+        if (win32_exists(journal_path)) DeleteFileW(native_path(journal_path).c_str());
+        if (win32_exists(manifest_path)) DeleteFileW(native_path(manifest_path).c_str());
+    }
 
     int64_t executed_now = 0;
     for (const auto& op : ops) {
@@ -1904,6 +1965,9 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
             const fs::path dst(wide(op.at("dst").get<std::string>()));
             if (!is_confined_within(src, root_path, false) || !is_confined_within(dst, quarantine_base, false)) {
                 throw std::runtime_error("SAFETY_ABORT: ruta fuera de confinamiento en quarantine_dir");
+            }
+            if (win32_exists(dst)) {
+                throw std::runtime_error("Destino ya existe (sin sobrescritura): " + path_text(dst));
             }
             auto sub = win32_safe_walk(src, cancel);
             if (!sub.junctions.empty()) {
@@ -1928,12 +1992,11 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
                 op_q_bytes += f.size_bytes;
             }
             auto created = win32_ensure_dir(dst.parent_path());
-            jfh << Json{
+            append_durable_line(journal_path, Json{
                 {"seq", seq}, {"phase", "intent"}, {"op", "move"},
                 {"src", path_text(src)}, {"dst", path_text(dst)},
                 {"created_dirs", created}, {"manifest_entries", pending_manifest}
-            }.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-            jfh.flush();
+            }.dump(-1, ' ', false, Json::error_handler_t::replace));
 
             win32_move_no_overwrite(src, dst);
             if (simulate_crash_after_move_seq == seq) {
@@ -1941,23 +2004,24 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
             }
 
             for (const auto& me : pending_manifest) {
-                mfh << me.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
+                append_durable_line(manifest_path, me.dump(-1, ' ', false, Json::error_handler_t::replace));
             }
-            mfh.flush();
             q_files += op_q_files;
             q_bytes += op_q_bytes;
 
-            jfh << Json{
+            append_durable_line(journal_path, Json{
                 {"seq", seq}, {"phase", "committed"}, {"op", "move"},
                 {"src", path_text(src)}, {"dst", path_text(dst)},
                 {"created_dirs", created}
-            }.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-            jfh.flush();
+            }.dump(-1, ' ', false, Json::error_handler_t::replace));
         } else if (kind == "quarantine_file") {
             const fs::path src(wide(op.at("src").get<std::string>()));
             const fs::path dst(wide(op.at("dst").get<std::string>()));
             if (!is_confined_within(src, root_path, false) || !is_confined_within(dst, quarantine_base, false)) {
                 throw std::runtime_error("SAFETY_ABORT: ruta fuera de confinamiento en quarantine_file");
+            }
+            if (win32_exists(dst)) {
+                throw std::runtime_error("Destino ya existe (sin sobrescritura): " + path_text(dst));
             }
             std::error_code ec;
             const int64_t sz = static_cast<int64_t>(fs::file_size(native_path(src), ec));
@@ -1970,29 +2034,26 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
                 {"sha256", h}
             };
             auto created = win32_ensure_dir(dst.parent_path());
-            jfh << Json{
+            append_durable_line(journal_path, Json{
                 {"seq", seq}, {"phase", "intent"}, {"op", "move"},
                 {"src", path_text(src)}, {"dst", path_text(dst)},
                 {"created_dirs", created}, {"manifest_entries", Json::array({me})}
-            }.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-            jfh.flush();
+            }.dump(-1, ' ', false, Json::error_handler_t::replace));
 
             win32_move_no_overwrite(src, dst);
             if (simulate_crash_after_move_seq == seq) {
                 throw std::runtime_error("SIMULATED_CRASH_AFTER_MOVE");
             }
 
-            mfh << me.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-            mfh.flush();
+            append_durable_line(manifest_path, me.dump(-1, ' ', false, Json::error_handler_t::replace));
             ++q_files;
             q_bytes += sz;
 
-            jfh << Json{
+            append_durable_line(journal_path, Json{
                 {"seq", seq}, {"phase", "committed"}, {"op", "move"},
                 {"src", path_text(src)}, {"dst", path_text(dst)},
                 {"created_dirs", created}
-            }.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-            jfh.flush();
+            }.dump(-1, ' ', false, Json::error_handler_t::replace));
             try {
                 record_path_event(db, 1, query_path_frn(dst), "file", "quarantine",
                                   op.value("src_rel", path_text(src)), path_text(dst), sz,
@@ -2003,6 +2064,9 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
             const fs::path dst(wide(op.at("dst").get<std::string>()));
             if (!is_confined_within(src, root_path, false) || !is_confined_within(dst, root_path, false)) {
                 throw std::runtime_error("SAFETY_ABORT: ruta fuera de confinamiento en " + kind);
+            }
+            if (win32_exists(dst)) {
+                throw std::runtime_error("Destino ya existe (sin sobrescritura): " + path_text(dst));
             }
             Json moved_files = Json::array();
             if (kind == "move_file") {
@@ -2026,24 +2090,22 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
                 }
             }
             auto created = win32_ensure_dir(dst.parent_path());
-            jfh << Json{
+            append_durable_line(journal_path, Json{
                 {"seq", seq}, {"phase", "intent"}, {"op", "move"},
                 {"src", path_text(src)}, {"dst", path_text(dst)},
                 {"created_dirs", created}, {"moved_files", moved_files}
-            }.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-            jfh.flush();
+            }.dump(-1, ' ', false, Json::error_handler_t::replace));
 
             win32_move_no_overwrite(src, dst);
             if (simulate_crash_after_move_seq == seq) {
                 throw std::runtime_error("SIMULATED_CRASH_AFTER_MOVE");
             }
 
-            jfh << Json{
+            append_durable_line(journal_path, Json{
                 {"seq", seq}, {"phase", "committed"}, {"op", "move"},
                 {"src", path_text(src)}, {"dst", path_text(dst)},
                 {"created_dirs", created}, {"moved_files", std::move(moved_files)}
-            }.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-            jfh.flush();
+            }.dump(-1, ' ', false, Json::error_handler_t::replace));
             try {
                 record_path_event(db, 1, query_path_frn(dst), (kind == "move_dir") ? "dir" : "file", "move",
                                   op.value("src_rel", path_text(src)), op.value("dst_rel", path_text(dst)), 0,
@@ -2065,14 +2127,16 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
                 std::sort(to_rm.begin(), to_rm.end(), [](const fs::path& a, const fs::path& b) {
                     return a.wstring().size() > b.wstring().size();
                 });
+                std::vector<std::string> planned_dirs;
+                for (auto it = to_rm.rbegin(); it != to_rm.rend(); ++it) planned_dirs.push_back(path_text(*it));
+                append_durable_line(journal_path, Json{{"seq", seq}, {"phase", "intent"}, {"op", "rmdir_list"}, {"dirs", planned_dirs}}.dump(-1, ' ', false, Json::error_handler_t::replace));
                 std::vector<std::string> removed;
                 for (const auto& d : to_rm) {
                     if (!win32_rmdir_empty(d)) throw std::runtime_error("No se pudo eliminar carpeta vacía: " + path_text(d));
                     removed.push_back(path_text(d));
                 }
                 std::reverse(removed.begin(), removed.end());
-                jfh << Json{{"seq", seq}, {"phase", "committed"}, {"op", "rmdir_list"}, {"dirs", removed}}.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-                jfh.flush();
+                append_durable_line(journal_path, Json{{"seq", seq}, {"phase", "committed"}, {"op", "rmdir_list"}, {"dirs", removed}}.dump(-1, ' ', false, Json::error_handler_t::replace));
             }
         } else if (kind == "prune_empty_subdirs") {
             const fs::path src(wide(op.at("src").get<std::string>()));
@@ -2095,8 +2159,7 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
                 }
                 if (!removed.empty()) {
                     std::reverse(removed.begin(), removed.end());
-                    jfh << Json{{"seq", seq}, {"phase", "committed"}, {"op", "rmdir_list"}, {"dirs", removed}}.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-                    jfh.flush();
+                    append_durable_line(journal_path, Json{{"seq", seq}, {"phase", "committed"}, {"op", "rmdir_list"}, {"dirs", removed}}.dump(-1, ' ', false, Json::error_handler_t::replace));
                 }
             }
         } else if (kind == "edit_text_paths") {
@@ -2123,24 +2186,22 @@ Json tool_organize_apply(const Project& p, Database& db, const Json& args, Log l
                 win32_ensure_dir(bak.parent_path());
                 write_text(bak, raw);
                 const std::string new_sha = sha256(updated);
-                jfh << Json{
+                append_durable_line(journal_path, Json{
                     {"seq", seq}, {"phase", "intent"}, {"op", "edit_text"},
                     {"target", path_text(target)}, {"backup", path_text(bak)},
                     {"old_sha256", old_sha}, {"new_sha256", new_sha},
                     {"old_bytes", raw.size()}, {"new_bytes", updated.size()}
-                }.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-                jfh.flush();
+                }.dump(-1, ' ', false, Json::error_handler_t::replace));
 
                 write_text(target, updated);
                 ++edits_done;
                 edit_byte_delta += static_cast<int64_t>(updated.size()) - static_cast<int64_t>(raw.size());
-                jfh << Json{
+                append_durable_line(journal_path, Json{
                     {"seq", seq}, {"phase", "committed"}, {"op", "edit_text"},
                     {"target", path_text(target)}, {"backup", path_text(bak)},
                     {"old_sha256", old_sha}, {"new_sha256", new_sha},
                     {"old_bytes", raw.size()}, {"new_bytes", updated.size()}
-                }.dump(-1, ' ', false, Json::error_handler_t::replace) << '\n';
-                jfh.flush();
+                }.dump(-1, ' ', false, Json::error_handler_t::replace));
             }
         }
         ++executed_now;
@@ -2212,8 +2273,11 @@ Json tool_organize_undo(const Project& p, Database& db, const Json& args, Log lo
         }
     }
 
-    std::ofstream ufh(native_path(undo_journal_path), std::ios::binary | std::ios::app);
     const int64_t simulate_undo_cancel_after = args.value("simulate_undo_cancel_after", int64_t(-1));
+    if (simulate_undo_cancel_after > 0 && !failpoints_enabled()) {
+        throw std::runtime_error("SAFETY_VIOLATION: simulate_undo_cancel_after está deshabilitado en producción");
+    }
+    const bool force_undo_edits = args.value("force", false);
     int64_t moves_undone = 0, edits_undone = 0, dirs_recreated = 0, skipped_already_undone = 0, step_count = 0;
 
     for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
@@ -2231,6 +2295,12 @@ Json tool_organize_undo(const Project& p, Database& db, const Json& args, Log lo
             const std::string raw = read_text(bak);
             if (sha256(raw) != e.at("old_sha256").get<std::string>()) {
                 throw std::runtime_error("SHA-256 del respaldo pre-edición no coincide: " + path_text(bak));
+            }
+            if (!force_undo_edits && win32_exists(target) && e.contains("new_sha256")) {
+                const std::string cur_sha = sha256(read_text(target));
+                if (cur_sha != e["new_sha256"].get<std::string>() && cur_sha != e["old_sha256"].get<std::string>()) {
+                    throw std::runtime_error("CONFLICT_EXTERNAL_EDIT: el archivo fue modificado externamente tras organize_apply y no se sobrescribirá en undo sin force:true: " + path_text(target));
+                }
             }
             write_text(target, raw);
             ++edits_undone;
@@ -2257,8 +2327,7 @@ Json tool_organize_undo(const Project& p, Database& db, const Json& args, Log lo
             }
         }
         if (seq > 0) {
-            ufh << Json{{"seq", seq}, {"op", op}, {"undone", true}}.dump() << '\n';
-            ufh.flush();
+            append_durable_line(undo_journal_path, Json{{"seq", seq}, {"op", op}, {"undone", true}}.dump());
             undone_seqs.insert(seq);
         }
         ++step_count;
@@ -2423,8 +2492,10 @@ Json tool_organize_verify(const Project& p, Database& db, const Json& args, Canc
             if (missing_sample.size() < 15) missing_sample.push_back(k);
         }
     }
+    const int64_t total_walk_errors = post_root.walk_errors + post_q.walk_errors;
     const bool g1_pass = (missing_cnt == 0 && size_mismatch_cnt == 0 &&
                           unexpected_files_cnt == 0 && duplicate_mapping_cnt == 0 &&
+                          total_walk_errors == 0 &&
                           post_q.files.size() == manifest.size());
 
     // Gate 2: 100% Quarantine SHA-256 + Pre-edit backups + Moved files SHA-256 + Baseline SHA-256
@@ -2457,7 +2528,10 @@ Json tool_organize_verify(const Project& p, Database& db, const Json& args, Canc
             }
         }
     }
-    const bool g2_pass = (q_sha_fail == 0 && edit_fail == 0 && moved_sha_fail == 0 && root_sha_fail == 0);
+    const bool g2_pass = (q_sha_fail == 0 && edit_fail == 0 && moved_sha_fail == 0 && root_sha_fail == 0 && total_walk_errors == 0);
+    const bool baseline_hashed = summary.value("baseline", Json::object()).value("hashed", false);
+    const double root_hash_coverage_pct = base_files.empty() ? 100.0
+        : (100.0 * static_cast<double>(root_sha_ok + q_sha_ok + moved_sha_ok + edit_ok) / static_cast<double>(base_files.size()));
 
     // Gate 3: Git repository integrity
     Json git_diffs = Json::array();
@@ -2508,10 +2582,13 @@ Json tool_organize_verify(const Project& p, Database& db, const Json& args, Canc
                 {"manifest_entries", manifest.size()},
                 {"baseline_bytes", base_bytes},
                 {"post_root_bytes", post_root_bytes},
-                {"post_quarantine_bytes", post_q_bytes}
+                {"post_quarantine_bytes", post_q_bytes},
+                {"walk_errors", total_walk_errors}
             }},
             {"integrity", {
                 {"status", g2_pass ? "CONFIRMED" : "FAILED"},
+                {"baseline_hashed", baseline_hashed},
+                {"hash_coverage_pct", std::min(100.0, root_hash_coverage_pct)},
                 {"quarantine_sha256_verified", q_sha_ok},
                 {"quarantine_sha256_failed", q_sha_fail},
                 {"moved_sha256_verified", moved_sha_ok},

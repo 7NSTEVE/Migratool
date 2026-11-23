@@ -17,6 +17,8 @@
 #include "migratool/knowledge.hpp"
 #include "migratool/path_lineage.hpp"
 #include "migratool/workstream.hpp"
+#include "migratool/multiagent_coordinator.hpp"
+#include "migratool/code_audit.hpp"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -851,6 +853,9 @@ Json agent_batch(const Project& p,const Json& args){
             inject_failure_stage = op["inject_failure_stage"].get<std::string>();
             might_touch_files = true;
         }
+    }
+    if ((inject_failure_after_disk || !inject_failure_stage.empty()) && !failpoints_enabled()) {
+        throw std::runtime_error("SAFETY_VIOLATION: inject_failure* está deshabilitado en producción");
     }
 
     ProjectFileTxLock file_tx_lock(p, might_touch_files && !dry_run);
@@ -3310,6 +3315,14 @@ Json agent_request(const Project& p,const std::string& tool,const Json& raw_args
     else if(tool=="path_history")result=tool_path_history(p,db,args);
     else if(tool=="git_intel")result=tool_git_intel(p,db,args);
     else if(tool=="env_tools")result=tool_env_tools(std::optional<Project>(p),args);
+    else if(tool=="worktree_inventory")result=tool_worktree_inventory(p,db,args);
+    else if(tool=="project_resume")result=tool_project_resume(p,db,args);
+    else if(tool=="integrate_ready")result=tool_integrate_ready(p,db,args);
+    else if(tool=="build_canonical")result=tool_build_canonical(p,db,args);
+    else if(tool=="storage_audit")result=tool_storage_audit(p,db,args);
+    else if(tool=="discover_replicas")result=tool_discover_replicas(p,db,args);
+    else if(tool=="project_health")result=tool_project_health(p,db,args);
+    else if(tool=="code_audit")result=tool_code_audit(p,db,args,cancel);
     else if(tool=="session_bootstrap")result=build_session_bootstrap(p,db,args);
     else if(tool=="complete_task")result=run_complete_task(p,args,log,cancel);
     else if(tool=="job_status")result=scale_jobs(p,args);
@@ -3320,8 +3333,9 @@ Json agent_request(const Project& p,const std::string& tool,const Json& raw_args
     else if(tool=="project_diagnostics"){result=scale_doctor(p);result["mode"]=project_mode(p);result["fs_index"]=fs_stats_summary(p,db);result["lsp_servers"]=lsp_discover_servers(p)["servers"];result["housekeep"]=housekeep_status(p,db);}
     else if(tool=="export_inventory")result=scale_export(p,args,cancel);
     else if(tool=="backup_catalog"){
-        auto out_arg=args.value("out",args.value("destination",""));
-        fs::path dest=out_arg.empty()?(p.state_dir()/L"backups"/wide("catalog-"+std::to_string(db.revision())+".sqlite")):fs::path(wide(out_arg));
+        auto out_arg=args.value("out",args.value("output",args.value("destination",args.value("path",""))));
+        // AUD-008: Confine backup_catalog destination to state_dir or authorized project roots!
+        fs::path dest=out_arg.empty()?(p.state_dir()/L"backups"/wide("catalog-"+std::to_string(db.revision())+".sqlite")):p.resolve_confined(out_arg,true);
         result=backup_catalog(p,dest);
     }
     else if(tool=="batch_update")result=agent_batch(p,args);
@@ -3568,14 +3582,19 @@ Json agent_request(const Project& p,const std::string& tool,const Json& raw_args
         tool=="query"||tool=="explore_tree"||tool=="find_files"||tool=="changes_feed"||tool=="search_pattern"||tool=="read_file"||tool=="list_workspaces"||tool=="query_workspace"||tool=="onboard_workspace"||tool=="memory"||tool=="get_diagnostics"||tool=="find_implementations"||tool=="find_declaration"||tool=="housekeep"||
         tool=="find_duplicates"||tool=="verify_archive_vs_dir"||tool=="inspect_workspace_topology"||tool=="organize_plan"||tool=="organize_apply"||tool=="organize_undo"||tool=="organize_verify"||
         tool=="agent_wake"||tool=="delta_since"||tool=="repo_map"||tool=="read_bundle"||tool=="batch_edit"||tool=="run_verified"||tool=="impact_analysis"||tool=="workstream"||tool=="knowledge"||tool=="docs_hub"||tool=="path_history"||tool=="git_intel"||tool=="env_tools"||
+        tool=="worktree_inventory"||tool=="project_resume"||tool=="integrate_ready"||tool=="build_canonical"||tool=="storage_audit"||tool=="discover_replicas"||tool=="project_health"||tool=="code_audit"||
         tool=="next_tasks"||tool=="evidence_report"||tool=="changes_since"||tool=="history"||paginated_status)){
-        const bool wide_tool = (tool=="read_file"||tool=="memory"||tool=="explore_tree"||tool=="find_duplicates"||
+        const bool coordinator_tool = (tool=="worktree_inventory"||tool=="project_resume"||tool=="integrate_ready"||
+                                       tool=="build_canonical"||tool=="storage_audit"||tool=="discover_replicas"||
+                                       tool=="project_health"||tool=="code_audit");
+        const bool wide_tool = coordinator_tool ||
+                               (tool=="read_file"||tool=="memory"||tool=="explore_tree"||tool=="find_duplicates"||
                                 tool=="inspect_workspace_topology"||tool=="organize_plan"||tool=="organize_apply"||
                                 tool=="organize_verify"||tool=="verify_archive_vs_dir"||
                                 tool=="agent_wake"||tool=="read_bundle"||tool=="batch_edit"||tool=="run_verified"||
                                 tool=="impact_analysis"||tool=="workstream"||tool=="knowledge"||tool=="docs_hub"||
                                 tool=="path_history"||tool=="git_intel"||tool=="env_tools"||tool=="repo_map");
-        response_options["token_budget"] = wide_tool ? 16000 : 4000;
+        response_options["token_budget"] = coordinator_tool ? 64000 : (wide_tool ? 16000 : 4000);
     }
     result=bound(result,response_options);
     auto micros=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-begin).count();
@@ -3587,63 +3606,71 @@ Json agent_request(const Project& p,const std::string& tool,const Json& raw_args
 Json agent_tools(const std::string& profile){
     const std::string prof = low_str(profile.empty() ? "full" : profile);
     const std::vector<std::pair<std::string,std::string>> definitions={
-        {"agent_wake","Arranque AI Agent OS (<25ms): workstreams, verificación en vivo disco/Git, frescura del árbol, alertas de knowledge, DAG ready_tasks y BM1..BM7."},
-        {"delta_since","Delta compacto entre turnos: path_lineage, checkpoints, knowledge, verified_runs y Git HEAD."},
-        {"repo_map","Mapa del repositorio con Personalized PageRank sobre símbolos y dependencias ajustado a token_budget."},
-        {"read_bundle","Lectura en lote (hasta 25 archivos/rangos) con known_sha256, FILE_MOVED_HINT y pitfalls/métodos fallidos."},
-        {"batch_edit","Edición multi-archivo durable en 7 etapas (PREPARED..COMMITTED) con snapshot SHA-256, locks, idempotency_key y run_verified."},
-        {"run_verified","Ejecutor con toolchain (env_tools), selector de tests afectados (select_tests) y destilador de errores."},
-        {"impact_analysis","Grafo de impacto (AST/dependencias, docs_hub, tests, path_lineage y pitfalls) con nivel de certeza."},
-        {"workstream","Sesiones durables: start|checkpoint|pause|handoff|resume|takeover|status|list|close|rollback|snapshot_create|snapshot_diff|snapshot_restore|message|inbox."},
-        {"knowledge","Libro mayor con verification_status (verified_fact|test_result|agent_hypothesis|unverified|stale) e invalidación FRN/SHA-256."},
-        {"docs_hub","Documentos del proyecto: index|list|outline (TOC H1-H4)|read_section|audit|link|drift_report|search."},
-        {"path_history","Linaje de rutas por FRN y escaneos: trace|timeline|moved_since|resolve|tree_scans|gaps."},
-        {"git_intel","Inteligencia Git cacheada (<5ms): summary|log|diff|status|blame|repos."},
-        {"env_tools","Inventario de toolchains del host (D:\\DevTools + PATH): summary|query|scan|doctor|bind_project|register_root|pin_tool|export_md."},
-        {"activate_workspace","Activa o inicializa en 1 llamada un directorio (workspace, archive o migration)."},
+        {"agent_wake","Arranque Agent OS (<25ms): workstreams, disco/Git, frescura y alertas."},
+        {"delta_since","Delta entre turnos: linaje, checkpoints, knowledge, runs y Git HEAD."},
+        {"repo_map","Mapa PageRank del repositorio sobre símbolos y dependencias."},
+        {"read_bundle","Lectura en lote (hasta 25 archivos) con known_sha256."},
+        {"batch_edit","Edición multi-archivo en 7 etapas con snapshot e idempotency_key."},
+        {"run_verified","Ejecutor con toolchain, select_tests y destilador de errores."},
+        {"impact_analysis","Grafo de impacto (AST, docs, tests, linaje y pitfalls)."},
+        {"workstream","Sesiones durables: start|checkpoint|pause|handoff|resume|takeover|status|list|close|rollback."},
+        {"knowledge","Libro mayor epistemológico (verified_fact|test_result|hypothesis|stale)."},
+        {"docs_hub","Docs Hub: index|list|outline|read_section|audit|link|drift_report|search."},
+        {"path_history","Linaje FRN: trace|timeline|moved_since|resolve|tree_scans|gaps."},
+        {"git_intel","Inteligencia Git (<5ms): summary|log|diff|status|blame|repos."},
+        {"env_tools","Toolchains host: summary|query|scan|doctor|bind_project|register_root|pin_tool."},
+        {"worktree_inventory","Inventario de worktrees (IMPLEMENTED..DELIVERED): scan|register|resume."},
+        {"project_resume","Relevo multi-agente en 1 llamada: worktrees, ramas, builds y REQ-*."},
+        {"integrate_ready","Integración con git merge-tree y bloqueo de build final."},
+        {"build_canonical","Manifiestos de build y trazabilidad inversa por SHA-256."},
+        {"storage_audit","Auditoría de almacenamiento con 9 categorías y 4 niveles."},
+        {"discover_replicas","Descubre réplicas y trabajo huérfano (MAIN_PROJECT..ORPHAN_WORK)."},
+        {"project_health","Resumen ejecutivo y matriz PRODUCT_REQUIREMENTS_MASTER."},
+        {"code_audit","Auditoría incremental (AST, C vs C++23, seguridad y verify_claim)."},
+        {"activate_workspace","Activa directorio (workspace, archive o migration)."},
         {"list_workspaces","Lista o poda workspaces registrados (list|prune)."},
-        {"query_workspace","Consulta de solo lectura contra otro workspace registrado."},
-        {"onboard_workspace","Orientación automática del workspace y memoria _onboarding."},
-        {"explore_tree","Exploración jerárquica (<10ms sobre 6M+ archivos): conteos, bytes y extensiones."},
-        {"find_files","Búsqueda (<25ms) por FTS5 trigrama, glob, prefijo, extensión, tamaño y mtime."},
-        {"changes_feed","Flujo de cambios detectados por identidad NTFS FRN."},
-        {"find_duplicates","Deduplicación en 3 etapas (tamaño -> 64KiB -> SHA-256) + tree_overlap."},
-        {"verify_archive_vs_dir","Compara .zip contra carpeta en disco por tamaño y CRC32."},
-        {"inspect_workspace_topology","Mapa pre-organización: Git, junctions, cloud-only y rutas."},
-        {"organize_plan","Planificador dry-run de reorganización y cuarentena con validación Git."},
-        {"organize_apply","Ejecutor WAL 2 fases de organize_plan (execute:true, cross-volume SHA-256)."},
+        {"query_workspace","Consulta solo lectura contra otro workspace."},
+        {"onboard_workspace","Orientación del workspace y memoria _onboarding."},
+        {"explore_tree","Exploración jerárquica (<10ms): conteos y bytes."},
+        {"find_files","Búsqueda (<25ms) por FTS5, glob, prefijo y extensión."},
+        {"changes_feed","Flujo de cambios por identidad NTFS FRN."},
+        {"find_duplicates","Deduplicación en 3 etapas (tamaño, 64KiB, SHA-256)."},
+        {"verify_archive_vs_dir","Compara .zip contra carpeta por tamaño y CRC32."},
+        {"inspect_workspace_topology","Mapa pre-organización: Git, junctions y cloud-only."},
+        {"organize_plan","Planificador dry-run de reorganización."},
+        {"organize_apply","Ejecutor WAL 2 fases de organize_plan (execute:true)."},
         {"organize_undo","Reversión idempotente de organize_apply (execute:true)."},
-        {"organize_verify","Auditoría post-organización: conservación, SHA-256 y Git."},
+        {"organize_verify","Auditoría post-organización: SHA-256 y Git."},
         {"memory","Memorias FTS5 Markdown: write|read|edit|list|search|rename|delete."},
-        {"read_file","Lectura quirúrgica por líneas o símbolo con sha256 y FILE_MOVED_HINT."},
-        {"create_file","Crea archivo en raíz autorizada con rollback y linaje."},
-        {"edit_file","Edición transaccional: replace_content|replace_lines|insert_at_line|delete_lines|replace_in_files."},
-        {"search_pattern","Buscador C++23 multi-hilo (literal/regex) con contexto y globs."},
+        {"read_file","Lectura quirúrgica por líneas o símbolo con sha256."},
+        {"create_file","Crea archivo en raíz autorizada con rollback."},
+        {"edit_file","Edición transaccional: replace_content|replace_lines|insert_at_line|delete_lines."},
+        {"search_pattern","Buscador C++23 multi-hilo (literal/regex) con globs."},
         {"get_diagnostics","Diagnósticos semánticos vía LSP o índice nativo."},
-        {"find_implementations","Localiza implementaciones vía LSP o índice nativo."},
-        {"find_declaration","Localiza declaración/definición vía LSP o índice nativo."},
-        {"lsp_rename_symbol","Renombrado semántico LSP UTF-16 con validación y rollback."},
+        {"find_implementations","Localiza implementaciones vía LSP o índice."},
+        {"find_declaration","Localiza declaración/definición vía LSP o índice."},
+        {"lsp_rename_symbol","Renombrado semántico LSP UTF-16 con rollback."},
         {"restart_language_server","Reinicia servidor LSP del workspace."},
-        {"housekeep","Autoaseo: status|run|vacuum (retención P4 de snapshots y GC de blobs)."},
+        {"housekeep","Autoaseo: status|run|vacuum (retención P4 y GC)."},
         {"session_bootstrap","Arranque de sesión de migración en 1 llamada."},
-        {"complete_task","Completa tarea de migración: edita, sincroniza, mapea y verifica."},
+        {"complete_task","Completa tarea: edita, sincroniza, mapea y verifica."},
         {"job_status","Estado de trabajos persistentes."},
-        {"job_control","Pausa, reanuda, cancela o reintenta un trabajo."},
+        {"job_control","Pausa, reanuda, cancela o reintenta trabajo."},
         {"project_settings","Consulta o modifica ajustes del proyecto."},
-        {"acquire_task","Reclama atómicamente una tarea pendiente con lease."},
+        {"acquire_task","Reclama tarea pendiente con lease."},
         {"import_existing_work","Importa evidencia externa en solo lectura."},
-        {"project_diagnostics","Diagnóstico de compilación, catálogo, raíces y LSP."},
+        {"project_diagnostics","Diagnóstico de compilación, catálogo y LSP."},
         {"export_inventory","Exporta catálogo en jsonl o json."},
         {"backup_catalog","Copia consistente de catalog.sqlite."},
         {"project_context","Contexto compacto de progreso y tareas."},
         {"get_task_context","Contexto quirúrgico de tarea/símbolo."},
-        {"inventory_sync","Sincroniza raíces autorizadas (USN Journal + reconciliador)."},
-        {"query","Consulta indexada: files, symbols, references, mappings, phases, project_tasks, module_matrix."},
-        {"edit_symbol","Edición simbólica AST/LSP con backup y rollback."},
+        {"inventory_sync","Sincroniza raíces (USN Journal + reconciliador)."},
+        {"query","Consulta: files, symbols, references, mappings, phases, tasks."},
+        {"edit_symbol","Edición simbólica AST/LSP con rollback."},
         {"migration_status","Progreso por level: project|files|symbols|modules|phases|tasks|docs."},
-        {"next_tasks","Tareas pendientes con dependencias y evidencia faltante."},
+        {"next_tasks","Tareas pendientes con dependencias y evidencia."},
         {"changes_since","Deltas del historial desde since_revision."},
-        {"batch_update","Transacción atómica de mapeos, clasificación, claims, fases y tareas."},
+        {"batch_update","Transacción atómica de mapeos, claims, fases y tareas."},
         {"verify","Ejecuta build, test, scan o coverage (execute:true)."},
         {"evidence_report","Informe paginado de pruebas, builds, cobertura y mapeos."},
         {"history","Historial inmutable filtrable por entity, actor, action."},
@@ -3655,7 +3682,8 @@ Json agent_tools(const std::string& profile){
         "explore_tree", "find_files", "search_pattern", "read_bundle", "batch_edit",
         "run_verified", "impact_analysis", "workstream", "knowledge", "docs_hub",
         "path_history", "git_intel", "env_tools", "inspect_workspace_topology",
-        "find_duplicates", "organize_plan", "organize_apply"
+        "find_duplicates", "organize_plan", "organize_apply",
+        "project_resume", "project_health", "code_audit"
     };
 
     const Json s_str = {{"type","string"}};
@@ -3679,6 +3707,14 @@ Json agent_tools(const std::string& profile){
         else if (name == "path_history") { p["action"]=s_str; p["path"]=s_str; p["frn"]=s_int; p["limit"]=s_int; }
         else if (name == "git_intel") { p["action"]=s_str; p["path"]=s_str; p["limit"]=s_int; p["staged"]=s_bool; }
         else if (name == "env_tools") { p["action"]=s_str; p["query"]=s_str; p["tool_key"]=s_str; p["root_path"]=s_str; p["recipe"]=s_str; }
+        else if (name == "worktree_inventory") { p["action"]=s_str; p["worktree_path"]=s_str; p["lifecycle_state"]=s_str; }
+        else if (name == "project_resume") { p["task_query"]=s_str; }
+        else if (name == "integrate_ready") { p["action"]=s_str; p["target_branch"]=s_str; }
+        else if (name == "build_canonical") { p["action"]=s_str; p["lifecycle_state"]=s_str; p["sha256"]=s_str; }
+        else if (name == "storage_audit") { p["action"]=s_str; p["execute"]=s_bool; }
+        else if (name == "discover_replicas") { p["action"]=s_str; p["candidate_paths"]=s_arr; }
+        else if (name == "project_health") { p["action"]=s_str; p["req_id"]=s_str; p["query"]=s_str; }
+        else if (name == "code_audit") { p["action"]=s_str; p["module_or_path"]=s_str; p["claim_text"]=s_str; }
         else if (name == "activate_workspace") { p["path"]=s_str; p["mode"]=s_str; p["sync"]=s_bool; }
         else if (name == "list_workspaces") { p["available_only"]=s_bool; p["action"]=s_str; }
         else if (name == "query_workspace") { p["workspace"]=s_str; p["tool"]=s_str; p["arguments"]=s_obj; }

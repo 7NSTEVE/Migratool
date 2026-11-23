@@ -1,12 +1,12 @@
 ﻿# Protocolo de agentes de Migratool
 
-La guía operativa extensa está en el [Manual completo para agentes](docs/MANUAL_AGENTES.md). Incluye una instrucción lista para entregar a un agente, procedimientos de trabajo y recuperación, referencia de parámetros y [solicitudes JSON](examples/integration/agent-playbook.json).
+La especificación maestra de requisitos y trazabilidad está en [PRODUCT_REQUIREMENTS_MASTER.md](PRODUCT_REQUIREMENTS_MASTER.md) ([PRODUCT_REQUIREMENTS_MASTER.json](PRODUCT_REQUIREMENTS_MASTER.json)), y la guía de flujo para agentes está en [`.agents/skills/migratool/SKILL.md`](../.agents/skills/migratool/SKILL.md) junto con las [solicitudes JSON de ejemplo](../examples/integration/agent-playbook.json).
 
 La misma lógica atiende la CLI JSON y MCP stdio con ejecución local. Las consultas del catálogo leen SQLite. El inventario, el contexto con cuerpo, el registro por rutas y la comprobación de hashes pueden leer los archivos del proyecto. Las verificaciones configuradas ejecutan comandos cuando la solicitud incluye autorización explícita.
 
-### Contratos del motor durable en la compilación de validación 1.1.0
+### Contratos del motor durable y coordinación multi-agente
 
-Consulte la [guía de trabajo reanudable](docs/MANUAL_AGENTES.md#45-catálogo-durable-y-trabajo-reanudable). La GUI y la CLI deben usar la misma identidad de compilación y el mismo catálogo. Los nombres de archivo de los ejecutables conservan el sufijo 0.3 por compatibilidad.
+Consulte [PRODUCT_REQUIREMENTS_MASTER.md](PRODUCT_REQUIREMENTS_MASTER.md) para las invariantes del catálogo durable, workstreams, coordinación de worktrees y auditoría técnica incremental. La GUI y la CLI deben usar la misma identidad de compilación y el mismo catálogo. Los nombres de archivo de los ejecutables conservan el sufijo 0.3 por compatibilidad.
 
 - `inventory_sync` / `agent sync` admite `wait:false` / `--async`. El acuse incluye `job_id`. `scope` admite `root` y `subdirectory`, `file` o `files`. En el motor durable, `defer_analysis:true` conserva las tareas posteriores al censo.
 - `job_status` / `agent jobs` consulta el ID. `job_control` / `agent job` admite `pause`, `resume`, `cancel` y `retry` con actor. Consulte el mismo ID para confirmar el cambio de estado.

@@ -336,9 +336,15 @@ Json run_host_scan(EnvDb& edb, const Json& args) {
     }
     if (scan_roots.empty()) {
         std::error_code ec;
-        if (fs::exists(L"D:\\DevTools", ec)) scan_roots.emplace_back(L"D:\\DevTools");
-        else if (fs::exists(L"D:\\Lenguajes de Programación y Herramientas de Desarrollo", ec))
+        wchar_t env_root[32768]{};
+        const DWORD env_len = GetEnvironmentVariableW(L"MIGRATOOL_DEVTOOLS_ROOT", env_root, 32768);
+        if (env_len > 0 && env_len < 32768 && fs::exists(fs::path(env_root), ec)) {
+            scan_roots.emplace_back(env_root);
+        } else if (fs::exists(L"D:\\DevTools", ec)) {
+            scan_roots.emplace_back(L"D:\\DevTools");
+        } else if (fs::exists(L"D:\\Lenguajes de Programación y Herramientas de Desarrollo", ec)) {
             scan_roots.emplace_back(L"D:\\Lenguajes de Programación y Herramientas de Desarrollo");
+        }
         if (fs::exists(L"E:\\texlive", ec)) scan_roots.emplace_back(L"E:\\texlive");
     }
 

@@ -15,9 +15,23 @@ namespace {
 struct Library {
     HMODULE handle{};
     Library() {
-        // El cargador usa separadores nativos para localizar las DLL dependientes.
-        auto path=fs::path(MIGRATOOL_ZIP_DLL).make_preferred();
-        handle=LoadLibraryExW(path.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        // AUD-035: Search executable_dir()/libzip.dll first for portable deployments before compile-time MIGRATOOL_ZIP_DLL!
+        std::vector<fs::path> candidates;
+        try {
+            const auto exe_dir = executable_dir();
+            if (!exe_dir.empty()) candidates.push_back((exe_dir / L"libzip.dll").make_preferred());
+        } catch (...) {}
+        candidates.push_back(fs::path(MIGRATOOL_ZIP_DLL).make_preferred());
+        for (const auto& cand : candidates) {
+            std::error_code ec;
+            if (!cand.empty() && fs::exists(native_path(cand), ec)) {
+                handle = LoadLibraryExW(cand.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+                if (handle) break;
+            }
+        }
+        if (!handle) {
+            handle = LoadLibraryExW(L"libzip.dll", nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        }
         if (!handle) throw std::runtime_error("No se pudo cargar libzip (Win32 " + std::to_string(GetLastError()) + ")");
     }
     ~Library() { FreeLibrary(handle); }

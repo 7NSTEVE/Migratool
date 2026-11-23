@@ -159,6 +159,7 @@ void create_zip_from_map(const fs::path& zip_path, const std::vector<std::pair<s
 
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
+    mt::set_failpoints_enabled_for_tests(true);
     try {
         auto base = fs::temp_directory_path() / wide("migratool_v21_test_" + unique_id());
         fs::create_directories(base);

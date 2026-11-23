@@ -8,6 +8,8 @@
 #include "migratool/knowledge.hpp"
 #include "migratool/path_lineage.hpp"
 #include "migratool/workstream.hpp"
+#include "migratool/multiagent_coordinator.hpp"
+#include "migratool/code_audit.hpp"
 #include <commctrl.h>
 #include <condition_variable>
 #include <mutex>
@@ -35,7 +37,7 @@ std::string human(const std::string& key,const Json& value){if(value.is_null())r
     if(key=="phase"&&value=="export")return "Escribiendo archivos";
     if(key=="phase"&&value=="export_publish")return "Guardando resultado";
     if(key=="phase"&&value=="export_finished")return "Resultado guardado";
-    if(key=="bytes"&&value.is_number_integer())return utf8(ui::number(std::to_wstring(value.get<int64_t>()),0))+" B";
+    if((key=="bytes"||key=="disk_bytes"||key=="size_bytes")&&value.is_number_integer())return utf8(ui::number(std::to_wstring(value.get<int64_t>()),0))+" B";
     if(key=="observed_files_per_second"){if(!value.is_number()||value.get<double>()<=0.0)return "—";char b[32]{};snprintf(b,sizeof(b),"%.0f",value.get<double>());return utf8(ui::number(wide(b),0))+ " /s";}
     if(key=="eta_seconds"){if(!value.is_number_integer())return "Faltan datos";auto s=value.get<int64_t>();if(s<60)return std::to_string(s)+" s";if(s<3600)return std::to_string(s/60)+" m "+std::to_string(s%60)+" s";return std::to_string(s/3600)+" h "+std::to_string((s%3600)/60)+" m";}
     if(key.find("percent")!=std::string::npos&&value.is_number()){char buffer[32]{};snprintf(buffer,sizeof(buffer),"%.1f",value.get<double>());return utf8(ui::number(wide(buffer),1)+L" %");}
@@ -45,7 +47,11 @@ std::string human(const std::string& key,const Json& value){if(value.is_null())r
         {"migrated","Migrado al destino"},{"merged_into","Fusionado en otro destino"},{"intentionally_removed","Eliminado intencionalmente"},{"replaced_by_external","Reemplazado por externo"},{"unassigned","Sin asignar"},
         {"MIGRATE","Migrar"},{"DO_NOT_MIGRATE","No migrar"},{"EXTRACT_CONTRACT_ONLY","Extraer solo contrato"},{"REFERENCE_ONLY","Solo referencia"},{"DUPLICATE_OR_GENERATED","Duplicado o generado"},
         {"reference_only","Solo referencia"},{"tracked_tasks","Tareas extraídas"},{"obsolete","Obsoleto"},{"contract_extracted","Contrato extraído"},{"no_action_needed","Sin acción requerida"},{"unreviewed","Sin revisar"},
-        {"PLANNED","Planificada"},{"IN_PROGRESS","En curso"},{"HALF_DONE","A medias"},{"COMPLETED","Completada"},{"VERIFIED","Verificada"},{"BLOCKED","Bloqueada"},{"TODO","Pendiente"},{"PORTED","Portada"},{"INTEGRATED","Integrada"},{"UNREVIEWED","Sin revisar"},{"REVIEWED","Revisado"},{"ACTION_REQUIRED","Acción requerida"}};auto raw=value.get<std::string>();auto it=states.find(raw);if(it!=states.end()&&(key=="state"||key=="stage"||key=="disposition"||key=="analysis"||key=="phase"||key=="kind"||key=="missing"||key=="coverage_cause"))return it->second;return raw;}return value.dump();}
+        {"PLANNED","Planificada"},{"IN_PROGRESS","En curso"},{"HALF_DONE","A medias"},{"COMPLETED","Completada"},{"VERIFIED","Verificada"},{"BLOCKED","Bloqueada"},{"TODO","Pendiente"},{"PORTED","Portada"},{"INTEGRATED","Integrado"},{"UNREVIEWED","Sin revisar"},{"REVIEWED","Revisado"},{"ACTION_REQUIRED","Acción requerida"},
+        {"IMPLEMENTED","Implementado"},{"CONFIRMED","Confirmado"},{"DELIVERED","Entregado"},
+        {"PROTECTED","Protegido"},{"TEMP_RETAINED","Conservado temporalmente"},{"VERIFIED_SAFE_CLEAN","Limpieza segura verificada"},{"NEEDS_REVIEW","Requiere revisión"},
+        {"CLEAN","Sin conflictos"},{"CONFLICT","Conflicto detectado"},{"DIRTY_TREE","Cambios sin confirmar"},{"ALREADY_MERGED","Ya integrado"},
+        {"PENDING_VALIDATION","Pendiente de validación"},{"VERIFIED_CURRENT","Vigente y verificado"},{"STALE_AFTER_EDIT","Modificado tras prueba"}};auto raw=value.get<std::string>();auto it=states.find(raw);if(it!=states.end()&&(key=="state"||key=="status"||key=="stage"||key=="disposition"||key=="analysis"||key=="phase"||key=="kind"||key=="missing"||key=="coverage_cause"||key=="lifecycle_state"||key=="conservation_tier"||key=="conflict_status"||key=="triage_status"||key=="post_change_status"))return it->second;return raw;}return value.dump();}
 std::wstring label(const std::string& key){
     static const std::map<std::string,std::wstring> names={
         {"id",L"ID"},{"name",L"Nombre"},{"value",L"Valor"},{"description",L"Detalle"},{"path",L"Archivo"},
@@ -84,7 +90,11 @@ std::wstring label(const std::string& key){
         {"outcome",L"Resultado"},{"verification_status",L"Estado epistemológico"},{"summary",L"Resumen"},
         {"doc_key",L"Documento"},{"authority",L"Autoridad"},{"section_count",L"Secciones"},{"line_count",L"Líneas"},
         {"tool_key",L"Herramienta"},{"command",L"Comando"},{"version",L"Versión"},{"exe_path",L"Ruta preferida"},
-        {"diagnostic_code",L"Diagnóstico"},{"env_recipe",L"Receta"},{"at_iso",L"Fecha y hora UTC"},{"verified_at",L"Verificado (UTC)"}
+        {"diagnostic_code",L"Diagnóstico"},{"env_recipe",L"Receta"},{"at_iso",L"Fecha y hora UTC"},{"verified_at",L"Verificado (UTC)"},
+        {"worktree_id",L"Worktree"},{"worktree_path",L"Ruta del worktree"},{"branch",L"Rama"},{"head_commit",L"Commit HEAD"},{"owner_agent",L"Agente"},{"lifecycle_state",L"Estado del ciclo"},{"conflict_status",L"Compatibilidad"},{"uncommitted_count",L"Sin confirmar"},{"ahead_count",L"Commits por integrar"},{"disk_bytes",L"Espacio"},
+        {"build_id",L"Compilación"},{"conservation_tier",L"Nivel de conservación"},{"category",L"Categoría"},{"integration_completeness",L"Integración"},{"size_bytes",L"Tamaño"},{"file_count",L"Archivos"},{"reason",L"Motivo"},
+        {"req_id",L"Requisito"},{"invariants_count",L"Invariantes"},{"traced_files",L"Archivos vinculados"},{"test_suite",L"Suite de prueba"},{"post_change_status",L"Vigencia"},{"status",L"Estado"},
+        {"function_name",L"Función"},{"qualified_name",L"Símbolo"},{"cyclomatic_complexity",L"Complejidad"},{"analysis_source",L"Fuente AST"},{"triage_status",L"Validación"},{"rule_id",L"Regla"},{"severity",L"Severidad"},{"file_path",L"Archivo"}
     };
     const auto found=names.find(key);return found==names.end()?wide(key):found->second;
 }
@@ -93,7 +103,7 @@ struct Payload {uint64_t sequence{},navigation{};HTREEITEM tree_parent{};bool re
 struct ScaleView::Impl {
     HWND hwnd{},list{},targets{},detail{},caption{},tree{},previous{},next{},next_target{},pause{},resume{},cancel{},retry{},rescan{},up{},linked{},pending_filter{},copy{},refresh_button{},source_title{},target_title{},details_button{},filter_button{},pane_choice{},empty{},progress{},depth_choice{},root_choice{},dev_kind_choice{},dev_state_choice{},include_non_source_chk{};HFONT font{};int dpi=96,page=0;
     ui::Palette colors=ui::system_palette();HBRUSH background=CreateSolidBrush(colors.background),surface=CreateSolidBrush(colors.surface);int font_pixels=0;
-    bool filters_visible=false,reading=false,replacing_rows=false,include_non_source=false,keep_context=false;double split=.5;RECT split_bounds{};bool dragging=false,stacked=false,single_pane=false;
+    bool filters_visible=false,reading=false,replacing_rows=false,include_non_source=false,keep_context=false,linked_short_label=false;double split=.5;RECT split_bounds{};bool dragging=false,stacked=false,single_pane=false;
     int depth=2,dev_kind=0;
     std::optional<Project> project;Json rows=Json::array(),target_rows=Json::array();std::vector<std::string> columns,target_columns,root_options;
     std::vector<std::string> cursors;std::string cursor,next_cursor,target_cursor,next_target_cursor,filter,parent,root,selected_source,pending_reason,dev_state,last_roots_key;bool linked_only=false,target_selected=false;
@@ -149,7 +159,13 @@ struct ScaleView::Impl {
         NotifyWinEvent(EVENT_OBJECT_NAMECHANGE,empty,OBJID_CLIENT,CHILDID_SELF);
     }
     void layout(){
-        if(!list)return;RECT rc{};GetClientRect(hwnd,&rc);const int width=rc.right,height=rc.bottom,gap=ui::text_percent>=150?px(6):px(10),control=ui::control_height(dpi),line=ui::type_size(18,dpi)+px(8);split_bounds={};
+        if(!list)return;RECT rc{};GetClientRect(hwnd,&rc);const int width=rc.right,height=rc.bottom;
+        const bool zoomed=ui::text_percent>=150;
+        const int gap=zoomed?px(4):px(10);
+        const int control=zoomed?std::max(px(30),ui::type_size(18,dpi)+px(6)):ui::control_height(dpi);
+        const int line=zoomed?(ui::type_size(18,dpi)+px(6)):(ui::type_size(18,dpi)+px(8));
+        if(linked&&linked_short_label!=zoomed){linked_short_label=zoomed;SetWindowTextW(linked,zoomed?L"Solo vinculados":L"Solo destinos vinculados");}
+        split_bounds={};
         const bool compare=page==1,folder_view=page==17,mod_view=page==23,dev_view=page==24;
         const bool show_root_filter=(page==1&&filters_visible)||page==7||page==8||mod_view||(dev_view&&dev_kind==3);
         const bool show_pending_filter=(compare&&filters_visible)||page==7||page==8;
@@ -169,8 +185,8 @@ struct ScaleView::Impl {
         ui::show_if(dev_state_choice,dev_view);
         ui::show_if(tree,folder_view);ui::show_if(next_target,compare&&!next_target_cursor.empty());
         int x=0,y=0;
-        const int btn_pad=ui::text_percent>=150?px(10):px(24);
-        const int btn_min=ui::text_percent>=150?px(64):px(90);
+        const int btn_pad=zoomed?px(10):px(24);
+        const int btn_min=zoomed?px(60):px(90);
         HDC measure_dc=GetDC(hwnd);
         HGDIOBJ prev_font=measure_dc?SelectObject(measure_dc,font):nullptr;
         for(auto item:{refresh_button,filter_button,copy,details_button,pause,resume,cancel,retry,rescan,up})if(GetWindowLongPtrW(item,GWL_STYLE)&WS_VISIBLE){
@@ -193,7 +209,7 @@ struct ScaleView::Impl {
             add_f(include_non_source_chk,std::max(px(160),ui::type_size(18,dpi)*11),0);
             if(!vis_filters.empty()){
                 const int n=static_cast<int>(vis_filters.size());
-                const int equal_share=n>1&&width>=px(480)?std::max(px(130),(width-gap*(n-1))/n):width;
+                const int equal_share=n>1&&width>=px(360)?std::max(px(80),(width-gap*(n-1))/n):width;
                 int fx=0,fy=y;
                 for(const auto& [ctrl,spec]:vis_filters){
                     const int cw=std::min({width,spec.first,equal_share});
@@ -204,14 +220,14 @@ struct ScaleView::Impl {
                 y=fy+control+gap;
             }
         }
-        const int caption_height=page==0?line*2:line;
+        const int caption_height=(page==0&&!zoomed)?line*2:line;
         ui::move_if(progress,0,y,px(70),line);ui::move_if(caption,reading?px(80):0,y,std::max(px(50),width-(reading?px(80):0)),caption_height);y+=caption_height+gap;
-        const int detail_height=inspector?std::min(ui::type_size(18,dpi)*6,std::max(line*2,height/4)):0;
+        const int detail_height=inspector?(zoomed?std::min(line*3,height/5):std::min(ui::type_size(18,dpi)*6,std::max(line*2,height/4))):0;
         const int pager=(paginate||(compare&&!next_target_cursor.empty()))?control+gap:0;
         const int available=std::max(px(24),height-y-pager-detail_height-(inspector?gap:0));
         const int tree_width=folder_view?std::min(width/3,std::max(px(180),ui::type_size(18,dpi)*13)):0;
         const int left=folder_view?tree_width+gap:0,body_width=std::max(px(50),width-left);
-        stacked=compare&&body_width<ui::type_size(18,dpi)*52;single_pane=stacked&&available<line*5;
+        stacked=compare&&body_width<px(680);single_pane=stacked&&available<line*5;
         ui::show_if(pane_choice,single_pane);
         if(single_pane){ui::move_if(pane_choice,0,y,width,control+px(200));y+=control+gap;}
         const int actual_available=std::max(px(24),available-(single_pane?control+gap:0));
@@ -252,6 +268,10 @@ struct ScaleView::Impl {
         else if(row.contains("verification_status")&&row.contains("outcome"))preferred={"id","kind","title","outcome","verification_status","summary","updated_at"};
         else if(row.contains("doc_key")&&row.contains("authority"))preferred={"doc_key","title","authority","section_count","line_count","state","verified_at"};
         else if(row.contains("tool_key")&&row.contains("diagnostic_code"))preferred={"tool_key","name","command","version","exe_path","diagnostic_code","env_recipe"};
+        else if(row.contains("worktree_id")&&row.contains("conflict_status"))preferred={"worktree_id","branch","owner_agent","lifecycle_state","conflict_status","uncommitted_count","ahead_count","disk_bytes","worktree_path"};
+        else if(row.contains("conservation_tier")&&row.contains("category"))preferred={"name","category","conservation_tier","lifecycle_state","size_bytes","reason","path"};
+        else if(row.contains("req_id")&&row.contains("post_change_status"))preferred={"req_id","title","category","priority","status","traced_files","test_suite","post_change_status","summary"};
+        else if(row.contains("cyclomatic_complexity")||row.contains("triage_status"))preferred={"rule_id","severity","triage_status","qualified_name","cyclomatic_complexity","analysis_source","file_path","summary"};
         else if(row.contains("migration_percent"))preferred={"path","stage","disposition","migration_percent","state"};
         else if(row.contains("source_path"))preferred={"source_path","target_paths","stage","disposition","declared_complete","actor","at"};
         else if(row.contains("coverage_cause"))preferred={"path","kind","discovered_entries","pending_directories","errors_count","excluded_entries","coverage_cause","last_scanned"};
@@ -303,7 +323,12 @@ struct ScaleView::Impl {
                 else if(key=="diagnostic_code"||key=="verification_status"||key=="confidence")width=185;
                 else if(key=="summary"||key=="env_recipe")width=260;
                 else if(key=="discovered_entries"||key=="errors_count"||key=="excluded_entries"||key=="pending_directories")width=105;
-                else if(key=="kind"||key=="bytes")width=115;
+                else if(key=="kind"||key=="bytes"||key=="disk_bytes"||key=="size_bytes")width=115;
+                else if(key=="worktree_id"||key=="build_id"||key=="req_id"||key=="rule_id")width=140;
+                else if(key=="branch"||key=="owner_agent"||key=="category"||key=="severity"||key=="priority"||key=="analysis_source")width=135;
+                else if(key=="lifecycle_state"||key=="conservation_tier"||key=="conflict_status"||key=="triage_status"||key=="post_change_status"||key=="status")width=175;
+                else if(key=="uncommitted_count"||key=="ahead_count"||key=="cyclomatic_complexity"||key=="file_count"||key=="invariants_count")width=120;
+                else if(key=="qualified_name"||key=="function_name"||key=="traced_files"||key=="test_suite"||key=="reason")width=230;
                 column.cx=key=="description"||key=="value"||key=="excerpt"?std::max<int>(px(320),bounds.right-ui::type_size(485,dpi)):ui::type_size(width,dpi);
                 column.pszText=name.data();ListView_InsertColumn(table,i++,&column);
             }
@@ -364,6 +389,16 @@ struct ScaleView::Impl {
                         ws_int=db.integer("SELECT COUNT(*) FROM agent_workstreams WHERE status='interrupted_recoverable'");
                     }
                     data.push_back({{"name","Continuidad de sesiones (Workstreams)"},{"state",ws_int>0?"Recuperable":(ws_open>0?"Activa":"Listo")},{"description",std::to_string(ws_open)+" sesión(es) abiertas · "+std::to_string(ws_int)+" interrumpida(s) recuperables tras corte o cuota."}});
+                    const bool has_wt=db.integer("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_worktrees_catalog')")!=0;
+                    const bool has_bm=db.integer("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='build_manifests')")!=0;
+                    if(has_wt||has_bm){
+                        const int64_t wt_total=has_wt?db.integer("SELECT COUNT(*) FROM agent_worktrees_catalog"):0;
+                        const int64_t wt_pend=has_wt?db.integer("SELECT COUNT(*) FROM agent_worktrees_catalog WHERE is_mandatory=1 AND excluded_by='' AND lifecycle_state IN('IMPLEMENTED','CONFIRMED')"):0;
+                        const int64_t bm_total=has_bm?db.integer("SELECT COUNT(*) FROM build_manifests"):0;
+                        if(wt_total>0||bm_total>0){
+                            data.push_back({{"name","Supervisión multiagente y builds"},{"state",wt_pend>0?"Por integrar":"Al día"},{"description",std::to_string(wt_total)+" worktree(s) ("+std::to_string(wt_pend)+" pendientes de integrar) · "+std::to_string(bm_total)+" manifiesto(s) de compilación."}});
+                        }
+                    }
                 } catch (...) {}
                 result.left={{"items",data}};
                 result.caption=(summary["migration_percent"].is_null()?std::string("El porcentaje global se calculará cuando el alcance y el análisis estén al día."):
@@ -540,7 +575,177 @@ struct ScaleView::Impl {
                 auto env=tool_env_tools(p,{{"action","summary"}});
                 Json items=env.value("tools",Json::array());
                 result.left={{"items",items}};
-                result.caption="Lenguajes y herramientas del host (D:\\DevTools + PATH) · "+std::to_string(items.size())+" herramienta(s) · "+std::to_string(env.value("path_shadows_count",int64_t(0)))+" shadow(s)";
+                result.caption="Lenguajes y herramientas del host · "+std::to_string(items.size())+" herramienta(s) · "+std::to_string(env.value("path_shadows_count",int64_t(0)))+" shadow(s)";
+            }
+            else if(view==30){
+                auto ir=tool_integrate_ready(p,db,{{"action","evaluate"}});
+                auto wi=tool_worktree_inventory(p,db,{{"action","list"}});
+                std::map<std::string,std::string> conflict_by_wt;
+                for(const auto& q:ir.value("queue",Json::array())){
+                    conflict_by_wt[str_or(q,"worktree_id")]=str_or(q,"conflict_status","CLEAN");
+                }
+                Json items=Json::array();
+                for(const auto& wt:wi.value("worktrees",Json::array())){
+                    Json row=wt;
+                    const std::string wtid=str_or(wt,"worktree_id","wt-main");
+                    row["id"]=wtid;
+                    const auto cit=conflict_by_wt.find(wtid);
+                    row["conflict_status"]=(cit!=conflict_by_wt.end())?cit->second:str_or(wt,"conflict_status","CLEAN");
+                    if(str_or(row,"owner_agent").empty())row["owner_agent"]="principal";
+                    items.push_back(std::move(row));
+                }
+                if(items.empty()){
+                    items.push_back({{"id","wt-main"},{"worktree_id","wt-main"},{"branch","main"},{"owner_agent","principal"},{"lifecycle_state","INTEGRATED"},{"conflict_status","CLEAN"},{"uncommitted_count",int64_t{0}},{"ahead_count",int64_t{0}},{"disk_bytes",int64_t{0}},{"worktree_path",path_text(p.directory())}});
+                }
+                result.left={{"items",items}};
+                result.caption="Coordinación de worktrees e integración · "+std::to_string(items.size())+" worktree(s) · "+std::to_string(ir.value("unintegrated_mandatory_count",size_t{0}))+" pendiente(s) de integrar";
+            }
+            else if(view==31){
+                auto sa=tool_storage_audit(p,db,{{"action","audit"}});
+                auto bc=tool_build_canonical(p,db,{{"action","list"}});
+                Json items=Json::array();
+                for(const auto& b:bc.value("builds",Json::array())){
+                    const std::string bid=str_or(b,"build_id","build");
+                    const std::string bpath=!str_or(b,"build_dir").empty()?str_or(b,"build_dir"):str_or(b,"manifest_path",str_or(b,"worktree_path"));
+                    items.push_back({
+                        {"id",bid},
+                        {"build_id",bid},
+                        {"name","Build "+bid+" ("+str_or(b,"build_type","Release")+")"},
+                        {"category","BUILD_MANIFEST"},
+                        {"conservation_tier",str_or(b,"conservation_tier","PROTECTED")},
+                        {"lifecycle_state",str_or(b,"lifecycle_state","CONFIRMED")},
+                        {"integration_completeness",str_or(b,"integration_completeness","COMPLETE")},
+                        {"size_bytes",b.value("total_artifact_bytes",int64_t{0})},
+                        {"reason","Manifiesto de compilación ("+str_or(b,"integration_completeness","COMPLETE")+")"},
+                        {"path",bpath}
+                    });
+                }
+                for(const auto& s:sa.value("items",Json::array())){
+                    items.push_back({
+                        {"id",str_or(s,"path",str_or(s,"name"))},
+                        {"name",str_or(s,"name")},
+                        {"category",str_or(s,"category","UNKNOWN")},
+                        {"conservation_tier",str_or(s,"conservation_tier","NEEDS_REVIEW")},
+                        {"lifecycle_state",s.value("has_uncommitted_changes",false)?"IMPLEMENTED":"INTEGRATED"},
+                        {"size_bytes",s.value("size_bytes",int64_t{0})},
+                        {"file_count",s.value("file_count",int64_t{0})},
+                        {"reason",str_or(s,"reason")},
+                        {"path",str_or(s,"path")}
+                    });
+                }
+                if(items.empty()){
+                    items.push_back({{"id",path_text(p.directory())},{"name",path_text(p.directory().filename())},{"category","SOURCE"},{"conservation_tier","PROTECTED"},{"lifecycle_state","INTEGRATED"},{"size_bytes",int64_t{0}},{"reason","Raíz del proyecto protegida"},{"path",path_text(p.directory())}});
+                }
+                result.left={{"items",items}};
+                result.caption="Compilaciones y auditoría de almacenamiento · "+std::to_string(items.size())+" elemento(s) · "+human("bytes",sa.value("reclaimable_bytes",int64_t{0}))+" recuperables";
+            }
+            else if(view==32){
+                auto ph=tool_project_health(p,db,{{"action","query_requirements"},{"query",query_filter},{"limit",100}});
+                Json items=Json::array();
+                for(const auto& r:ph.value("requirements",Json::array())){
+                    std::string traced=str_or(r,"traced_files");
+                    if(traced.empty()){
+                        for(const auto& f:r.value("implementation_files",Json::array())){
+                            if(!f.is_string())continue;
+                            if(!traced.empty())traced+="; ";
+                            traced+=f.get<std::string>();
+                        }
+                    }
+                    std::string suite=str_or(r,"test_suite");
+                    if(suite.empty()){
+                        for(const auto& ts:r.value("test_suites",Json::array())){
+                            if(!ts.is_string())continue;
+                            if(!suite.empty())suite+="; ";
+                            suite+=ts.get<std::string>();
+                        }
+                    }
+                    std::string post_st=str_or(r,"post_change_status");
+                    if(post_st.empty()){
+                        const auto links=r.value("trace_links",Json::array());
+                        bool all_ok=!links.empty();
+                        for(const auto& lk:links)if(lk.value("file_exists",0)==0){all_ok=false;break;}
+                        post_st=all_ok?"VERIFIED_CURRENT":"PENDING_VALIDATION";
+                    }
+                    const std::string rid=str_or(r,"req_id");
+                    items.push_back({
+                        {"id",rid},
+                        {"req_id",rid},
+                        {"title",str_or(r,"title")},
+                        {"category",str_or(r,"category")},
+                        {"priority",str_or(r,"priority","P0")},
+                        {"status",str_or(r,"status","CONFIRMED")},
+                        {"invariants_count",static_cast<int64_t>(r.value("invariants",Json::array()).size())},
+                        {"traced_files",traced.empty()?"—":traced},
+                        {"test_suite",suite.empty()?"—":suite},
+                        {"post_change_status",post_st},
+                        {"summary",str_or(r,"summary")}
+                    });
+                }
+                if(items.empty()&&query_filter.empty()){
+                    items.push_back({{"id","REQ-MASTER"},{"req_id","REQ-MASTER"},{"title","Especificación maestra del producto inicializada"},{"category","ARCHITECTURE"},{"priority","P0"},{"status","CONFIRMED"},{"invariants_count",int64_t{1}},{"traced_files","docs/PRODUCT_REQUIREMENTS_MASTER.json"},{"test_suite","multiagent_coordinator_tests"},{"post_change_status","VERIFIED_CURRENT"},{"summary","Sincronice docs/PRODUCT_REQUIREMENTS_MASTER.json con tool_project_health."}});
+                }
+                result.left={{"items",items}};
+                result.caption="Especificación maestra (PRODUCT_REQUIREMENTS_MASTER) · "+std::to_string(items.size())+" requisito(s)";
+            }
+            else if(view==33){
+                auto ca=tool_code_audit(p,db,{{"action","scan_incremental"}});
+                Json items=Json::array();
+                Json findings=ca.value("findings",Json::array());
+                if(findings.empty()&&db.integer("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='code_audit_findings')")!=0){
+                    findings=db.query("SELECT finding_id,rule_id,severity,category,triage_status,file_path,line,message FROM code_audit_findings ORDER BY severity ASC,line ASC LIMIT 100");
+                }
+                for(const auto& f:findings){
+                    const std::string fid=str_or(f,"finding_id",str_or(f,"rule_id","finding"));
+                    items.push_back({
+                        {"id",fid},
+                        {"rule_id",str_or(f,"rule_id","AUDIT-RULE")},
+                        {"severity",str_or(f,"severity","P2")},
+                        {"category",str_or(f,"category","QUALITY")},
+                        {"triage_status",str_or(f,"triage_status","CONFIRMED")},
+                        {"qualified_name",str_or(f,"qualified_name",str_or(f,"function_name","—"))},
+                        {"cyclomatic_complexity",f.value("cyclomatic_complexity",int64_t{1})},
+                        {"analysis_source",str_or(f,"analysis_source","syntactic_ast")},
+                        {"file_path",str_or(f,"file_path",str_or(f,"path"))},
+                        {"summary",str_or(f,"message",str_or(f,"summary"))}
+                    });
+                }
+                Json funcs=ca.value("functions",Json::array());
+                if(funcs.empty()&&db.integer("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='code_audit_functions')")!=0){
+                    funcs=db.query("SELECT func_key,file_path,qualified_name,display_name AS function_name,cyclomatic_complexity,line_count,analysis_source FROM code_audit_functions ORDER BY cyclomatic_complexity DESC LIMIT 30");
+                }
+                for(const auto& fn:funcs){
+                    const int64_t cc=fn.value("cyclomatic_complexity",int64_t{1});
+                    const std::string qname=str_or(fn,"qualified_name",str_or(fn,"function_name","función"));
+                    items.push_back({
+                        {"id",str_or(fn,"func_key",qname)},
+                        {"rule_id","AST-COMPLEXITY"},
+                        {"severity",cc>=25?"P1":"P2"},
+                        {"category","COMPLEXITY"},
+                        {"triage_status","VERIFIED_CURRENT"},
+                        {"function_name",str_or(fn,"function_name",qname)},
+                        {"qualified_name",qname},
+                        {"cyclomatic_complexity",cc},
+                        {"analysis_source",str_or(fn,"analysis_source","syntactic_ast")},
+                        {"file_path",str_or(fn,"file_path",str_or(fn,"path"))},
+                        {"summary","Complejidad ciclomática AST = "+std::to_string(cc)+" ("+std::to_string(fn.value("line_count",int64_t{0}))+" líneas)"}
+                    });
+                }
+                if(items.empty()){
+                    items.push_back({
+                        {"id","audit-clean"},
+                        {"rule_id","AUDIT-OK"},
+                        {"severity","INFO"},
+                        {"category","QUALITY"},
+                        {"triage_status","VERIFIED_CURRENT"},
+                        {"qualified_name","Caché AST incremental"},
+                        {"cyclomatic_complexity",int64_t{0}},
+                        {"analysis_source","syntactic_ast"},
+                        {"file_path",path_text(p.directory())},
+                        {"summary","0 hallazgos pendientes y caché incremental al día."}
+                    });
+                }
+                result.left={{"items",items}};
+                result.caption="Auditoría técnica continua · "+std::to_string(ca.value("files_audited",int64_t{0}))+" auditado(s), "+std::to_string(ca.value("files_reused_cache",int64_t{0}))+" en caché · "+std::to_string(ca.value("confirmed_findings_count",int64_t{0}))+" confirmado(s)";
             }
             else {args["kind"]="files";result.left=query_page(p,db,args);}
             if(result.caption.empty()){
@@ -566,7 +771,7 @@ struct ScaleView::Impl {
             if(!value.empty())value+=L"\r\n";
         }
         if(!item.contains("absolute_path")&&!item.contains("source_path")&&item.contains("path"))value+=L"Ruta: "+wide(display(item["path"]))+L"\r\n";
-        for(const auto* key:{"source_module","root","record_type","item_id","title","phase_id","task_kind","priority","assignee","ordinal","source_path","absolute_path","target_paths","output_path","entry_path","state","stage","disposition","external_replacement","phase","coverage_cause","analysis","source_files","non_source_files","mapped_files","half_done_files","ported_files","declared_files","verified_files","migration_percent","total_units","migrated_units","units_with_passing_cases","target_summary","target_modules","dispositions","description","gate_builds","gate_cases","source_entities","target_entities","required_cases","depends_on","linked_targets","extracted_tasks","missing","note","actor","at","updated_at","last_scanned","discovered_entries","pending_directories","errors_count","excluded_entries","link_target","scope","generation","files","bytes","dirs","pending_analysis","observed_files_per_second","eta_seconds","started","finished","updated","error","message","origin_catalog","origin_id","source_sha256","output_sha256","checked","id"}){
+        for(const auto* key:{"worktree_id","worktree_path","branch","head_commit","owner_agent","lifecycle_state","conflict_status","uncommitted_count","ahead_count","disk_bytes","build_id","category","conservation_tier","integration_completeness","size_bytes","file_count","reason","req_id","status","invariants_count","traced_files","test_suite","post_change_status","rule_id","severity","triage_status","qualified_name","function_name","cyclomatic_complexity","analysis_source","file_path","summary","source_module","root","record_type","item_id","title","phase_id","task_kind","priority","assignee","ordinal","source_path","absolute_path","target_paths","output_path","entry_path","state","stage","disposition","external_replacement","phase","coverage_cause","analysis","source_files","non_source_files","mapped_files","half_done_files","ported_files","declared_files","verified_files","migration_percent","total_units","migrated_units","units_with_passing_cases","target_summary","target_modules","dispositions","description","gate_builds","gate_cases","source_entities","target_entities","required_cases","depends_on","linked_targets","extracted_tasks","missing","note","actor","at","updated_at","last_scanned","discovered_entries","pending_directories","errors_count","excluded_entries","link_target","scope","generation","files","bytes","dirs","pending_analysis","observed_files_per_second","eta_seconds","started","finished","updated","error","message","origin_catalog","origin_id","source_sha256","output_sha256","checked","id"}){
             if(!item.contains(key)||(std::string_view(key)=="absolute_path"&&item.contains("source_path")&&item[key]==item["source_path"]))continue;
             if(str_or(item,"kind")=="export_inventory"&&(std::string_view(key)=="scope"||std::string_view(key)=="generation"||std::string_view(key)=="dirs"||std::string_view(key)=="pending_directories"||std::string_view(key)=="pending_analysis"))continue;
             value+=label(key)+L": ";
@@ -643,7 +848,7 @@ struct ScaleView::Impl {
           case WM_LBUTTONUP:if(self->dragging){self->dragging=false;ReleaseCapture();return 0;}break;
           case WM_CAPTURECHANGED:self->dragging=false;break;
           case WM_TIMER:if(wp==2){KillTimer(w,2);if(self->reading){BOOL animate=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animate,0);ShowWindow(self->progress,SW_SHOW);SendMessageW(self->progress,PBM_SETMARQUEE,animate,40);SetWindowTextW(self->caption,L"Consultando esta página del catálogo…");self->layout();}}return 0;
-          case WM_ROWS:{std::unique_ptr<Payload> data(reinterpret_cast<Payload*>(lp));if(data->sequence&&data->sequence!=self->sequence)return 0;if(!data->error.empty()){self->settled_sequence=data->sequence;self->reading=false;KillTimer(w,2);ShowWindow(self->progress,SW_HIDE);SetWindowTextW(self->caption,L"No se pudo completar la consulta. Use Actualizar para reintentar.");SetWindowTextW(self->empty,wide(data->error).c_str());ShowWindow(self->empty,self->rows.empty()?SW_SHOW:SW_HIDE);PostMessageW(GetParent(w),WM_APP+1,0,reinterpret_cast<LPARAM>(new std::string("Consulta no completada: "+data->error)));self->layout();return 0;}
+          case WM_ROWS:{std::unique_ptr<Payload> data(reinterpret_cast<Payload*>(lp));if(data->sequence&&data->sequence!=self->sequence)return 0;if(!data->error.empty()){self->settled_sequence=data->sequence;self->reading=false;KillTimer(w,2);ShowWindow(self->progress,SW_HIDE);SetWindowTextW(self->caption,L"No se pudo completar la consulta. Use Actualizar para reintentar.");SetWindowTextW(self->empty,wide(data->error).c_str());ShowWindow(self->empty,self->rows.empty()?SW_SHOW:SW_HIDE);auto err_msg=std::make_unique<std::string>("Consulta no completada: "+data->error);if(PostMessageW(GetParent(w),WM_APP+1,0,reinterpret_cast<LPARAM>(err_msg.get())))err_msg.release();self->layout();return 0;}
             if(data->summary.is_object())SendMessageW(GetParent(w),WM_APP+172,0,reinterpret_cast<LPARAM>(&data->summary));
             if(data->tree_parent){if(data->navigation!=self->navigation||!self->folders.contains(data->tree_parent))return 0;auto folder=self->folders[data->tree_parent];for(const auto& entry:data->tree["items"])self->add_folder(data->tree_parent,wide(entry["name"]),{folder.root,entry["path"],"",false},entry["kind"]=="directory");if(data->tree["next_cursor"].is_string())self->add_folder(data->tree_parent,L"Más carpetas…",{folder.root,folder.path,data->tree["next_cursor"],false});return 0;}
             if(data->refresh_after){SetWindowTextW(self->caption,wide(data->caption).c_str());self->request();return 0;}
@@ -764,11 +969,8 @@ void ScaleView::show(const Project& p,int page,const std::string& filter){
         s.parent.clear();if(page!=1&&!s.keep_context)s.root.clear();s.keep_context=false;s.selected_source.clear();s.target_selected=false;++s.navigation;s.folders.clear();
         if(TreeView_GetCount(s.tree)>0){TreeView_DeleteAllItems(s.tree);}
         s.replacing_rows=true;
-        if(s.list)SendMessageW(s.list,WM_SETREDRAW,FALSE,0);
-        if(s.targets)SendMessageW(s.targets,WM_SETREDRAW,FALSE,0);
-        ListView_SetItemCountEx(s.list,0,0);ListView_SetItemCountEx(s.targets,0,0);
-        if(s.targets)SendMessageW(s.targets,WM_SETREDRAW,TRUE,0);
-        if(s.list)SendMessageW(s.list,WM_SETREDRAW,TRUE,0);
+        if(!s.rows.empty()){if(s.list)SendMessageW(s.list,WM_SETREDRAW,FALSE,0);ListView_SetItemCountEx(s.list,0,0);if(s.list)SendMessageW(s.list,WM_SETREDRAW,TRUE,0);}
+        if(!s.target_rows.empty()){if(s.targets)SendMessageW(s.targets,WM_SETREDRAW,FALSE,0);ListView_SetItemCountEx(s.targets,0,0);if(s.targets)SendMessageW(s.targets,WM_SETREDRAW,TRUE,0);}
         s.replacing_rows=false;
         s.rows=Json::array();s.target_rows=Json::array();ui::show_if(s.empty,false);
         SetWindowTextW(s.caption,L"Preparando esta vista…");

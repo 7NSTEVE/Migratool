@@ -70,6 +70,7 @@ int run_child_crash_mode(const fs::path& proj_file, const std::string& stage) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    mt::set_failpoints_enabled_for_tests(true);
     try {
         if (argc >= 4 && std::wstring_view(argv[1]) == L"--child-crash") {
             return run_child_crash_mode(fs::path(argv[2]), utf8(argv[3]));
