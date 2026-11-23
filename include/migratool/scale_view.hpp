@@ -20,5 +20,7 @@ public:
     bool busy() const;
     bool settled() const;
     void set_filter_context(const std::string& root,const std::string& filter_text);
+    void request_stop();
+    void stop();
 };
 }

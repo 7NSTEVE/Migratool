@@ -134,10 +134,27 @@ fs::path find_git_for_test() {
     return {};
 }
 
-// Create a small real ZIP file using libzip dynamically
+// Create a small real ZIP file using libzip dynamically (checking executable_dir() first for portable/vcpkg CI!)
 void create_zip_from_map(const fs::path& zip_path, const std::vector<std::pair<std::string, std::string>>& entries) {
-    auto dll_path = fs::path(MIGRATOOL_ZIP_DLL).make_preferred();
-    HMODULE h = LoadLibraryExW(dll_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE h = nullptr;
+    std::vector<fs::path> candidates;
+    try {
+        const auto exe_dir = executable_dir();
+        if (!exe_dir.empty()) {
+            candidates.push_back((exe_dir / L"libzip.dll").make_preferred());
+            candidates.push_back((exe_dir / L"zip.dll").make_preferred());
+        }
+    } catch (...) {}
+    candidates.push_back(fs::path(MIGRATOOL_ZIP_DLL).make_preferred());
+    for (const auto& cand : candidates) {
+        std::error_code ec;
+        if (!cand.empty() && fs::exists(native_path(cand), ec)) {
+            h = LoadLibraryExW(cand.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+            if (h) break;
+        }
+    }
+    if (!h) h = LoadLibraryExW(L"libzip.dll", nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!h) h = LoadLibraryExW(L"zip.dll", nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     check(h != nullptr, "libzip loaded for test");
     auto z_open = reinterpret_cast<decltype(&::zip_open)>(GetProcAddress(h, "zip_open"));
     auto z_sbuf = reinterpret_cast<decltype(&::zip_source_buffer)>(GetProcAddress(h, "zip_source_buffer"));

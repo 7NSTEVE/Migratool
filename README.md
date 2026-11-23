@@ -1,8 +1,8 @@
-# Migratool v3.0 — AI Agent Project OS
+# Migratool v3.1.0 — AI Agent Project OS & Multi-Agent Coordinator
 
-**Native Windows C++23 Project OS, Ultra-Scale Filesystem & Code Intelligence Engine (MCP + CLI + Win32 GUI)**
+**Native Windows C++23 Project OS, Multi-Agent Worktree/Build/Audit Coordinator, Ultra-Scale Filesystem & Code Intelligence Engine (MCP + CLI + Win32 GUI)**
 
-Migratool v3.0 is a local-first, zero-cloud, native Windows C++23 platform engineered specifically to give AI coding agents and software engineers durable memory, crash-proof continuity, epistemic knowledge provenance, and massive token/latency savings. It unifies five workloads in a single SQLite/WAL + FTS5 engine:
+Migratool v3.1.0 is a local-first, zero-cloud, native Windows C++23 platform engineered specifically to give AI coding agents and software engineers durable memory, crash-proof continuity, fail-closed multi-agent worktree/build governance, real `libclang` continuous technical audit, epistemic knowledge provenance, and massive token/latency savings. It unifies five workloads in a single SQLite/WAL + FTS5 engine:
 
 1. **AI Agent Project OS (`v3.0.0` — 13 Super-Tools & 2 MCP Profiles)** —
    - **`agent_wake` & `delta_since`**: Single-call orientation (`< 25 ms`) that reconciles workstreams after crashes/power cuts/quota resets, verifies live disk SHA-256 and Git HEAD (`CONFIRMED` / `STALE` / `MODIFIED_EXTERNALLY`), surfaces tree-scan freshness, proactive knowledge warnings, Task DAG `ready_tasks`, and 7 telemetry metrics (`BM1..BM7`).
@@ -15,11 +15,11 @@ Migratool v3.0 is a local-first, zero-cloud, native Windows C++23 platform engin
 2. **Ultra-Scale Filesystem & Archive Engine (6,000,000+ entries)** — Real-time and offline NTFS File Reference Number (`FRN`) tracking, instant hierarchical tree rollups (`< 10 ms`), trigram FTS5 filename/path search (`< 25 ms`), OneDrive/WOF cloud-placeholder discrimination, Win32 `\\?\` support for trailing-space/long paths, and 4-phase topological USN Journal replay without full rescans.
 3. **Universal Deduplication & Reversible Organization Suite (`fs_organize`, M0 Hardened)** — Content deduplication (`size -> 64 KiB -> SHA-256`), libzip CRC32 archive verification, Git fail-closed topology inspection, strict root confinement (`A01`), 2-phase WAL journal (`intent`/`committed`), cross-volume verified SHA-256 moves, idempotent undo, and 3-gate verification.
 4. **General Workspace & Super-Serena Agent Toolkit** — Zero-config external workspace activation (`workspace_kind: production | scratch | test_fixture`), projectless MCP startup, federated read-only queries, persistent FTS5 memories, structural AST search/rewrite, and lazy hybrid LSP bridge wired to `env_registry` with UTF-16 safety and Win32 Job Objects.
-5. **Auditable Cross-Language Migration Control & Apple HIG Win32 GUI (30 Views)** — Semantic indexing (`libclang` + Roslyn), symbol-level SHA-256 tracking, differential verification cases, immutable SQLite audit history, and 5 new Agent OS views (`25: Workstreams`, `26: Linaje de rutas`, `27: Conocimiento`, `28: Docs Hub`, `29: Lenguajes y herramientas`) under WCAG AAA contrast.
+5. **Auditable Cross-Language Migration Control & Apple HIG Win32 GUI (34 Views)** — Semantic indexing (`libclang` + Roslyn), symbol-level SHA-256 tracking, differential verification cases, immutable SQLite audit history, 5 Agent OS views (`25: Workstreams`, `26: Linaje de rutas`, `27: Conocimiento`, `28: Docs Hub`, `29: Lenguajes y herramientas`), and 4 Multi-Agent Coordinator & Audit views (`30: Worktrees`, `31: Compilaciones`, `32: Almacenamiento`, `33: Auditoría Técnica`) under WCAG AAA contrast.
 
 ---
 
-## Key Capabilities (v3.0.0)
+## Key Capabilities (v3.1.0)
 
 ### 1. Ultra-Scale 6M+ Filesystem & Archive Index (`archive` / `workspace` modes)
 - **Compact Normalized FRN Schema (v2)**: `fs_roots`, `fs_extensions`, `fs_nodes` keyed by `(root_id, frn)`, `fs_dirs` (`WITHOUT ROWID`) with precomputed bottom-up recursive counts/bytes/top extensions, `fs_hashes` (persistent partial + full SHA-256 cache invalidated by `size`/`mtime_ns`), external-content `fs_name_fts` + `fs_dir_fts` (`tokenize='trigram'`), and bounded `fs_change_log` ring table (100,000 events).
@@ -62,7 +62,7 @@ Migratool v3.0 is a local-first, zero-cloud, native Windows C++23 platform engin
   - Auto-trims the global registry (`sessions` and `activity`).
 - **On-Demand Tool**: `housekeep(action: "status" | "run" | "vacuum", dry_run, deep, compact_full, prune_missing_projects)`.
 
-### 5. Concurrent Projectless MCP Server (49 Tools)
+### 5. Concurrent Projectless MCP Server (70 Tools / 2 Profiles)
 - Supports MCP protocol versions `2024-11-05`, `2025-03-26`, `2025-06-18`, and `2025-11-25` over stdio.
 - **Projectless Startup**: `migratool-cli-0.3.exe mcp` launches cleanly without `--project`; agents can immediately call `list_workspaces`, `activate_workspace`, or `query_workspace` (or pass explicit `project` per call).
 - **Compact Per-Tool Schemas**: Each tool advertises only its relevant input properties (`additionalProperties: true`), saving MCP context tokens on `tools/list`.
@@ -178,7 +178,7 @@ Add Migratool to your MCP client configuration (see [examples/integration/mcp-cl
 ```
 
 ### 3. Documentation & AI Agent Skill
-- [AI Agent Skill (`.agents/skills/migratool/SKILL.md`)](.agents/skills/migratool/SKILL.md) — Drop-in skill file teaching AI agents the zero-shell workflow for all 69 MCP tools.
+- [AI Agent Skill (`.agents/skills/migratool/SKILL.md`)](.agents/skills/migratool/SKILL.md) — Drop-in skill file teaching AI agents the zero-shell workflow for all 70 MCP tools (`25` in `--profile agent-os`).
 - [Master Product Requirements & Traceability (`docs/PRODUCT_REQUIREMENTS_MASTER.md`)](docs/PRODUCT_REQUIREMENTS_MASTER.md) — Authoritative specification and machine-readable traceability catalog ([`docs/PRODUCT_REQUIREMENTS_MASTER.json`](docs/PRODUCT_REQUIREMENTS_MASTER.json)).
 - [Agent Protocol Reference (`docs/AGENT_PROTOCOL.md`)](docs/AGENT_PROTOCOL.md)
 - [GUI Navigation Guide (`docs/INTERFAZ_NAVEGACION_Y_USO.md`)](docs/INTERFAZ_NAVEGACION_Y_USO.md)

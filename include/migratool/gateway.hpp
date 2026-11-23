@@ -56,6 +56,7 @@ class IndexWatcher {
 public:
     explicit IndexWatcher(const Project&,unsigned reconcile_ms=900000,Log={},bool catch_up=false);
     ~IndexWatcher();
+    void request_stop();
     IndexWatcher(const IndexWatcher&)=delete;
 };
 }

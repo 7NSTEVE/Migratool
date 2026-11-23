@@ -355,8 +355,11 @@ Json index_sync(const Project& p,bool full,Log log,Cancel* cancel,const Json& sc
     Json tool_digests=Json::object();
     {
         std::error_code tec;
-        const fs::path clang_dll(MIGRATOOL_CLANG_DLL);
-        if(fs::exists(clang_dll,tec)&&fs::is_regular_file(clang_dll,tec))tool_digests["clang"]=hash_file(clang_dll);
+        fs::path clang_dll = executable_dir() / L"libclang.dll";
+        if (!fs::exists(native_path(clang_dll), tec)) clang_dll = fs::path(MIGRATOOL_CLANG_DLL);
+        if (fs::exists(native_path(clang_dll), tec) && fs::is_regular_file(native_path(clang_dll), tec)) {
+            tool_digests["clang"] = hash_file(clang_dll);
+        }
         const fs::path roslyn_dll=executable_dir()/L"adapters/roslyn/RoslynAdapter.dll";
         if(fs::exists(roslyn_dll,tec)&&fs::is_regular_file(roslyn_dll,tec))tool_digests["roslyn"]=hash_file(roslyn_dll);
         for(const auto& item:p.config.value("analyzers",Json::array())){

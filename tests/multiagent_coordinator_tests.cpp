@@ -1,8 +1,10 @@
 #include "migratool/multiagent_coordinator.hpp"
+#include "migratool/agent_supertools.hpp"
 #include "migratool/core.hpp"
 #include "migratool/gateway.hpp"
 #include "migratool/git_intel.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -353,7 +355,36 @@ int wmain(int argc, wchar_t** argv) {
         check(excl_res.value("ok", true) == true,
               "Excluded wt_agent_conflict with explicit excluded_by and exclusion_reason");
 
-        // Merge feat/codex-module into main and mark wt_agent_codex as INTEGRATED
+        // Adversarial AUD-MIG-P0-001: mark_integrated MUST refuse unmerged branch & unknown worktree
+        bool threw_unmerged_mark = false;
+        try {
+            agent_request(p, "integrate_ready", {
+                {"action", "mark_integrated"},
+                {"worktree_path", path_text(wt_codex)},
+                {"branch", "feat/codex-module"},
+                {"target_branch", "main"},
+                {"integrated_by", "Antigravity"}
+            });
+        } catch (const std::exception& ex) {
+            threw_unmerged_mark = (std::string(ex.what()).find("MARK_INTEGRATED_REFUSED_UNMERGED") != std::string::npos);
+        }
+        check(threw_unmerged_mark,
+              "AUD-MIG-P0-001: integrate_ready(mark_integrated) refuses unmerged branch with MARK_INTEGRATED_REFUSED_UNMERGED");
+
+        bool threw_unknown_mark = false;
+        try {
+            agent_request(p, "integrate_ready", {
+                {"action", "mark_integrated"},
+                {"worktree_path", path_text(temp_base / L"wt_does_not_exist")},
+                {"target_branch", "main"}
+            });
+        } catch (const std::exception& ex) {
+            threw_unknown_mark = (std::string(ex.what()).find("WORKTREE_NOT_FOUND") != std::string::npos);
+        }
+        check(threw_unknown_mark,
+              "AUD-MIG-P0-001: integrate_ready(mark_integrated) refuses unknown worktree with WORKTREE_NOT_FOUND");
+
+        // Merge feat/codex-module into main and mark wt_agent_codex as INTEGRATED (now verified via git merge-base --is-ancestor)
         run_git_checked(git_exe, repo_dir, {"merge", "--no-edit", "feat/codex-module"}, git_logs);
         auto mark_int = agent_request(p, "integrate_ready", {
             {"action", "mark_integrated"},
@@ -362,17 +393,58 @@ int wmain(int argc, wchar_t** argv) {
             {"target_branch", "main"},
             {"integrated_by", "Antigravity"}
         });
-        check(mark_int.value("ok", true) == true,
-              "integrate_ready(mark_integrated) marked wt_agent_codex as INTEGRATED: " + mark_int.dump());
+        check(mark_int.value("ok", true) == true &&
+              mark_int.value("verification_mode", "") == "VERIFIED_GIT_ANCESTOR",
+              "integrate_ready(mark_integrated) verified ancestry via Git and marked wt_agent_codex INTEGRATED: " + mark_int.dump());
 
-        // Create mock binary artifact build_release/Migratool-final.exe and record DELIVERED canonical build
+        // Adversarial AUD-MIG-P1-003: Missing artifact rejected (zero synthetic hashes)
+        bool threw_missing_art = false;
+        try {
+            agent_request(p, "build_canonical", {
+                {"action", "record"},
+                {"build_id", "bld-missing-artifact-adv"},
+                {"lifecycle_state", "CONFIRMED"},
+                {"requesting_agent", "Antigravity"},
+                {"artifacts", Json::array({
+                    {{"name", "ghost.exe"}, {"path", path_text(repo_dir / L"build_release" / L"ghost.exe")}, {"kind", "executable"}}
+                })}
+            });
+        } catch (const std::exception& ex) {
+            threw_missing_art = (std::string(ex.what()).find("BUILD_ARTIFACT_MISSING") != std::string::npos);
+        }
+        check(threw_missing_art,
+              "AUD-MIG-P1-003: build_canonical refuses missing artifact with BUILD_ARTIFACT_MISSING (zero fake SHA-256)");
+
+        // Create mock binary artifact build_release/Migratool-final.exe
         fs::create_directories(repo_dir / L"build_release");
         const fs::path final_exe = repo_dir / L"build_release" / L"Migratool-final.exe";
         write_text(final_exe, "MZ_CANONICAL_RELEASE_BINARY_V3_1_0_PAYLOAD");
         const std::string artifact_sha = hash_file(final_exe);
 
+        // Adversarial AUD-MIG-P1-008: action="record" cannot claim DELIVERED without observed build execution
+        bool threw_rec_deliv = false;
+        try {
+            agent_request(p, "build_canonical", {
+                {"action", "record"},
+                {"build_id", "bld-unobserved-deliv-adv"},
+                {"lifecycle_state", "DELIVERED"},
+                {"requesting_agent", "Antigravity"},
+                {"artifacts", Json::array({
+                    {{"name", "Migratool-final.exe"}, {"path", path_text(final_exe)}, {"kind", "executable"}, {"sha256", artifact_sha}}
+                })}
+            });
+        } catch (const std::exception& ex) {
+            threw_rec_deliv = (std::string(ex.what()).find("DELIVERED_REQUIRES_OBSERVED_BUILD") != std::string::npos);
+        }
+        check(threw_rec_deliv,
+              "AUD-MIG-P1-008: build_canonical(record, DELIVERED) rejected with DELIVERED_REQUIRES_OBSERVED_BUILD");
+
+        // Record genuine OBSERVED_BUILD DELIVERED canonical build via build_and_record(execute=true)
         auto build_rec = agent_request(p, "build_canonical", {
-            {"action", "record"},
+            {"action", "build_and_record"},
+            {"execute", true},
+            {"enforce_audit_gates", false},
+            {"command", Json::array({"cmd.exe", "/c", "echo canonical-build-ok"})},
             {"lifecycle_state", "DELIVERED"},
             {"requesting_agent", "Antigravity"},
             {"build_dir", path_text(repo_dir / L"build_release")},
@@ -389,13 +461,36 @@ int wmain(int argc, wchar_t** argv) {
             })}
         });
         const std::string build_id = build_rec.value("build_id", "");
-        check(!build_id.empty(), "build_canonical(record) returned non-empty build_id: " + build_rec.dump());
+        check(!build_id.empty(), "build_canonical(build_and_record) returned non-empty build_id: " + build_rec.dump());
+        check(build_rec.value("provenance_mode", "") == "OBSERVED_BUILD",
+              "AUD-MIG-P1-008: build_canonical(build_and_record, execute=true) recorded provenance_mode == 'OBSERVED_BUILD': " + build_rec.dump());
         check(build_rec.value("conservation_tier", "") == "PROTECTED",
-              "build_canonical(record, DELIVERED) assigned conservation_tier == 'PROTECTED': " + build_rec.dump());
+              "build_canonical(DELIVERED) assigned conservation_tier == 'PROTECTED': " + build_rec.dump());
+        check(!build_rec.value("manifest_sha256", "").empty(),
+              "AUD-MIG-P1-004: build_canonical returned non-empty manifest_sha256");
 
         const fs::path manifest_path = p.state_dir() / L"builds" / wide(build_id) / L"manifest.json";
         check(fs::is_regular_file(manifest_path),
               "build_canonical wrote immutable manifest on disk at " + path_text(manifest_path));
+        const std::string original_manifest_bytes = read_text(manifest_path);
+
+        // Adversarial AUD-MIG-P1-004: Re-using an existing build_id MUST fail with BUILD_MANIFEST_IMMUTABLE_COLLISION
+        bool threw_immutable_collision = false;
+        try {
+            agent_request(p, "build_canonical", {
+                {"action", "record"},
+                {"build_id", build_id},
+                {"lifecycle_state", "CONFIRMED"},
+                {"requesting_agent", "TamperAgent"},
+                {"artifacts", Json::array({
+                    {{"name", "Migratool-final.exe"}, {"path", path_text(final_exe)}, {"kind", "executable"}}
+                })}
+            });
+        } catch (const std::exception& ex) {
+            threw_immutable_collision = (std::string(ex.what()).find("BUILD_MANIFEST_IMMUTABLE_COLLISION") != std::string::npos);
+        }
+        check(threw_immutable_collision && read_text(manifest_path) == original_manifest_bytes,
+              "AUD-MIG-P1-004: duplicate build_id rejected with BUILD_MANIFEST_IMMUTABLE_COLLISION and manifest bytes untouched");
 
         // Reverse Binary Traceability Test (trace_binary)
         auto trace_res = agent_request(p, "build_canonical", {
@@ -527,10 +622,11 @@ int wmain(int argc, wchar_t** argv) {
 
         std::string cls_main, cls_wt, cls_orphan;
         int64_t orphan_unique_cnt = 0;
+        const std::string main_canon_str = path_text(canonical_win32_path(p.directory()));
         for (const auto& r : replicas) {
             const std::string rp = r.value("replica_path", r.value("path", ""));
             const std::string cls = r.value("classification", "");
-            if (path_ends_with_or_matches(rp, path_text(p.directory()))) {
+            if (path_ends_with_or_matches(rp, main_canon_str) || path_ends_with_or_matches(rp, path_text(p.directory()))) {
                 cls_main = cls;
             } else if (path_ends_with_or_matches(rp, "wt_agent_codex")) {
                 cls_wt = cls;
@@ -711,12 +807,184 @@ int wmain(int argc, wchar_t** argv) {
         check(has_post_change_status,
               "project_health(query_requirements) trace_links includes post_change_status and included_builds_json: " + q_req_trace.dump());
 
+        // =====================================================================
+        // 8. TEST 7 — ADVERSARIAL PRODUCTION HARDENING REGRESSIONS
+        //    (AUD-MIG-P0-019, P0-002, P1-007, P1-010, P1-011, P2-013, P2-014)
+        // =====================================================================
+        // 7.1 AUD-MIG-P0-019: merge_execute rejects dirty source worktree & wrong checked-out target branch
+        const fs::path wt_adv_merge = temp_base / L"wt_adv_merge";
+        run_git_checked(git_exe, repo_dir, {"worktree", "add", "-b", "feat/adv-merge", path_text(wt_adv_merge)}, git_logs);
+        write_text(wt_adv_merge / L"src" / L"adv_feat.cpp", "int adv_feat() { return 11; }\n");
+        run_git_checked(git_exe, wt_adv_merge, {"add", "src/adv_feat.cpp"}, git_logs);
+        run_git_checked(git_exe, wt_adv_merge, {"commit", "-m", "Add adv_feat.cpp"}, git_logs);
+        agent_request(p, "worktree_inventory", {
+            {"action", "register"},
+            {"worktree_path", path_text(wt_adv_merge)},
+            {"owner_agent", "Codex"},
+            {"task_id", "TASK-ADV-019"},
+            {"lifecycle_state", "CONFIRMED"},
+            {"is_mandatory", false}
+        });
+        // 7.1a Dirty source worktree -> MERGE_BLOCKED_DIRTY_SOURCE_WORKTREE
+        const fs::path dirty_untracked = wt_adv_merge / L"src" / L"uncommitted_draft.cpp";
+        write_text(dirty_untracked, "int draft() { return 0; }\n");
+        bool threw_dirty_src = false;
+        try {
+            agent_request(p, "integrate_ready", {
+                {"action", "merge_execute"},
+                {"worktree_path", path_text(wt_adv_merge)},
+                {"target_branch", "main"},
+                {"execute", true}
+            });
+        } catch (const std::exception& ex) {
+            threw_dirty_src = (std::string(ex.what()).find("MERGE_BLOCKED_DIRTY_SOURCE_WORKTREE") != std::string::npos);
+        }
+        DeleteFileW(native_path(dirty_untracked).c_str());
+        check(threw_dirty_src,
+              "AUD-MIG-P0-019: merge_execute rejects dirty source worktree with MERGE_BLOCKED_DIRTY_SOURCE_WORKTREE");
+
+        // 7.1b Wrong checked-out branch in repo_dir ('wrong-branch' != 'main') -> MERGE_BLOCKED_WRONG_TARGET_BRANCH
+        run_git_checked(git_exe, repo_dir, {"checkout", "-b", "wrong-branch"}, git_logs);
+        bool threw_wrong_branch = false;
+        try {
+            agent_request(p, "integrate_ready", {
+                {"action", "merge_execute"},
+                {"worktree_path", path_text(wt_adv_merge)},
+                {"target_branch", "main"},
+                {"execute", true}
+            });
+        } catch (const std::exception& ex) {
+            threw_wrong_branch = (std::string(ex.what()).find("MERGE_BLOCKED_WRONG_TARGET_BRANCH") != std::string::npos);
+        }
+        run_git_checked(git_exe, repo_dir, {"checkout", "main"}, git_logs);
+        run_git_checked(git_exe, repo_dir, {"branch", "-D", "wrong-branch"}, git_logs);
+        check(threw_wrong_branch,
+              "AUD-MIG-P0-019: merge_execute rejects wrong checked-out target branch with MERGE_BLOCKED_WRONG_TARGET_BRANCH");
+
+        // 7.2 AUD-MIG-P0-002: remove_worktree preserves catalog & directory when file handle is locked (no remove_all!)
+        const fs::path wt_locked = temp_base / L"wt_adv_locked";
+        run_git_checked(git_exe, repo_dir, {"worktree", "add", "-b", "feat/adv-locked", path_text(wt_locked)}, git_logs);
+        agent_request(p, "worktree_inventory", {
+            {"action", "register"},
+            {"worktree_path", path_text(wt_locked)},
+            {"owner_agent", "Codex"},
+            {"task_id", "TASK-ADV-002"},
+            {"lifecycle_state", "INTEGRATED"},
+            {"is_mandatory", false}
+        });
+        const fs::path locked_file = wt_locked / L"src" / L"main.cpp";
+        // Share READ so git status can hash the racy-git file cleanly (uncommitted == 0),
+        // while omitting FILE_SHARE_DELETE so neither git worktree remove, Recycle Bin, nor MoveFileExW can delete/move it!
+        HANDLE h_lock = CreateFileW(native_path(locked_file).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        check(h_lock != INVALID_HANDLE_VALUE, "Opened non-deletable Win32 lock on wt_adv_locked/src/main.cpp");
+        bool threw_rm_locked = false;
+        std::string rm_locked_err;
+        try {
+            agent_request(p, "worktree_inventory", {
+                {"action", "remove_worktree"},
+                {"worktree_path", path_text(wt_locked)},
+                {"execute", true}
+            });
+        } catch (const std::exception& ex) {
+            rm_locked_err = ex.what();
+            threw_rm_locked = (rm_locked_err.find("WORKTREE_REMOVE_FAILED") != std::string::npos);
+        }
+        const bool locked_dir_intact = fs::is_directory(native_path(wt_locked)) && fs::is_regular_file(native_path(locked_file));
+        const Json inv_after_lock = agent_request(p, "worktree_inventory", {{"action", "list"}});
+        bool locked_row_preserved = false;
+        for (const auto& w : find_first_array(inv_after_lock, {"worktrees", "items"})) {
+            if (path_ends_with_or_matches(w.value("worktree_path", ""), "wt_adv_locked")) {
+                locked_row_preserved = true;
+                break;
+            }
+        }
+        CloseHandle(h_lock);
+        check(threw_rm_locked && locked_dir_intact && locked_row_preserved,
+              "AUD-MIG-P0-002: remove_worktree failed closed with WORKTREE_REMOVE_FAILED, keeping directory & catalog intact (threw=" +
+              std::to_string(threw_rm_locked) + ", intact=" + std::to_string(locked_dir_intact) +
+              ", row=" + std::to_string(locked_row_preserved) + ", err='" + rm_locked_err + "')");
+
+        // 7.3 AUD-MIG-P1-007 & P2-014: >1500 generated files + hidden .cpp at end -> NEEDS_REVIEW (never VERIFIED_SAFE_CLEAN)
+        const fs::path big_build = repo_dir / L"build_overflow_adv";
+        fs::create_directories(big_build);
+        for (int idx = 0; idx < 1550; ++idx) {
+            char fname[32];
+            snprintf(fname, sizeof(fname), "a_%04d.obj", idx);
+            write_text(big_build / wide(fname), "obj");
+        }
+        write_text(big_build / L"zzzz_hidden_source.cpp", "int must_never_be_deleted() { return 999; }\n");
+        const Json big_audit = agent_request(p, "storage_audit", {{"action", "audit"}});
+        Json big_entry = Json::object();
+        for (const auto& d : find_first_array(big_audit, {"directories", "items", "entries"})) {
+            if (path_ends_with_or_matches(d.value("rel_path", d.value("path", "")), "build_overflow_adv")) {
+                big_entry = d;
+                break;
+            }
+        }
+        check(!big_entry.empty() &&
+              big_entry.value("conservation_tier", "") == "NEEDS_REVIEW" &&
+              big_entry.value("auto_clean_allowed", true) == false &&
+              big_entry.value("source_scan_complete", true) == false,
+              "AUD-MIG-P1-007/P2-014: >1500-entry build dir with truncated source scan forced to NEEDS_REVIEW: " + big_entry.dump());
+
+        // 7.4 AUD-MIG-P2-013: discover_replicas depth-2 recursion in search_roots + sample_complete field
+        const fs::path search_pool = temp_base / L"search_pool_adv";
+        const fs::path nested_clone = search_pool / L"org_sub" / L"nested_replica_adv";
+        fs::create_directories(nested_clone / L"src");
+        write_text(nested_clone / L"src" / L"main.cpp", read_text(repo_dir / L"src" / L"main.cpp"));
+        write_text(nested_clone / L"src" / L"nested_unique.cpp", "int nested_unique() { return 1; }\n");
+        const Json depth_disc = agent_request(p, "discover_replicas", {
+            {"action", "discover"},
+            {"search_roots", Json::array({path_text(search_pool)})},
+            {"max_depth", 2}
+        });
+        bool found_nested = false;
+        bool has_sample_complete = false;
+        for (const auto& r : find_first_array(depth_disc, {"replicas", "items"})) {
+            if (path_ends_with_or_matches(r.value("replica_path", r.value("path", "")), "nested_replica_adv")) {
+                found_nested = true;
+                has_sample_complete = r.contains("sample_complete") && r.contains("visited_entries");
+                break;
+            }
+        }
+        check(found_nested && has_sample_complete,
+              "AUD-MIG-P2-013: discover_replicas discovered depth-2 nested replica and reported sample_complete/visited_entries: " + depth_disc.dump());
+
+        // 7.5 AUD-MIG-P1-010 & P1-011: Honest verified_coverage_pct vs file_presence_pct + decoy cwd rejection
+        {
+            Database db(p);
+            runs_telemetry_schema(db);
+            // Decoy run whose cwd mentions 'multiagent_coordinator' while targeting an unrelated suite!
+            db.exec(
+                "INSERT INTO verified_runs("
+                "id,at_iso,actor,workstream_id,selection_mode,selected_targets_json,command_json,env_profile,cwd,"
+                "exit_code,duration_ms,status,passed_count,failed_count,errors_json,raw_bytes,distilled_bytes,log_path,git_head)"
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                {"run-decoy-substr", now(), "DecoyAgent", "", "explicit",
+                 "[\"totally_unrelated_suite\"]", "[\"ctest\",\"-R\",\"totally_unrelated_suite\"]",
+                 "", path_text(repo_dir) + "/multiagent_coordinator/decoy",
+                 0, 50, "PASSED", 5, 0, "[]", 64, 16, "", "deadbeef"});
+        }
+        agent_request(p, "project_health", {{"action", "sync_prd"}});
+        const Json honest_health = agent_request(p, "project_health", {{"action", "summary"}});
+        const Json& cov = honest_health.at("requirements_coverage");
+        check(cov.contains("file_presence_pct") &&
+              cov.contains("verified_coverage_pct") &&
+              cov.contains("test_verified_links_count") &&
+              cov.value("test_verified_links_count", int64_t(-1)) == 0 &&
+              cov.value("verified_coverage_pct", -1.0) == 0.0,
+              "AUD-MIG-P1-010/P1-011: decoy cwd substring did not fabricate verified_coverage_pct (must be 0.0): " + cov.dump());
+
         // Cleanly detach Git worktrees before TempDirGuard removes the temp directory
         {
             std::vector<std::string> rm1 = {path_text(git_exe), "worktree", "remove", "--force", path_text(wt_codex)};
             std::vector<std::string> rm2 = {path_text(git_exe), "worktree", "remove", "--force", path_text(wt_conflict)};
+            std::vector<std::string> rm3 = {path_text(git_exe), "worktree", "remove", "--force", path_text(wt_adv_merge)};
+            std::vector<std::string> rm4 = {path_text(git_exe), "worktree", "remove", "--force", path_text(wt_locked)};
             run_process(rm1, repo_dir, "", git_logs / L"rm1.log", 15000);
             run_process(rm2, repo_dir, "", git_logs / L"rm2.log", 15000);
+            run_process(rm3, repo_dir, "", git_logs / L"rm3.log", 15000);
+            run_process(rm4, repo_dir, "", git_logs / L"rm4.log", 15000);
         }
 
         std::cout << "multiagent_coordinator_tests PASSED (" << g_checks << " checks)\n";

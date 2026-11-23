@@ -1,7 +1,7 @@
 ---
 name: migratool
 description: >
-  Flujo de trabajo óptimo para agentes de IA usando las 69 herramientas MCP y CLI de
+  Flujo de trabajo óptimo para agentes de IA usando las 70 herramientas MCP y CLI de
   Migratool v3.1.0 (AI Agent Project OS & Multi-Agent Coordinator): Arranque y orientación en 1 llamada
   (`agent_wake` y `project_resume` con verificación en vivo disco/Git), Coordinación Multi-Agente de
   Worktrees (`worktree_inventory` con 4 estados `IMPLEMENTED..DELIVERED`), Gestor de Integración sin
@@ -14,11 +14,11 @@ description: >
   `batch_edit`, `run_verified`, Motor Ultra-Escala 6M+ archivos y `fs_organize`.
 ---
 
-# Migratool v3.0 — AI Agent Project OS (Guía de Superpoderes para Agentes)
+# Migratool v3.1.0 — AI Agent Project OS & Multi-Agent Coordinator
 
-## Regla de Oro: Arranque en 1 Llamada (`agent_wake`) y Política Zero-Shell
+## Regla de Oro: Arranque en 1 Llamada (`agent_wake` / `project_resume`) y Política Zero-Shell
 
-Cuando el servidor MCP `migratool` esté activo (`--profile agent-os` con 22 super-herramientas en `<= 9 KB` de esquema, o `--profile full` con las 62 herramientas en `<= 22 KB`):
+Cuando el servidor MCP `migratool` esté activo (`--profile agent-os` con 25 super-herramientas en `<= 9 KB` de esquema, o `--profile full` con las 70 herramientas en `<= 22 KB`):
 1. **Despertar o retomar cualquier proyecto en 1 sola llamada (`agent_wake`)**:
    - Reconcilia workstreams interrumpidos por cortes de energía, cierres o límites de cuota (`INTERRUPTED_RECOVERABLE`) y operaciones de 7 etapas (`PREPARED..RECOVERY`).
    - Verifica en vivo (`< 3 ms`) el `SHA-256` en disco y `.git/HEAD` (`CONFIRMED`, `STALE`, `MODIFIED_EXTERNALLY`).

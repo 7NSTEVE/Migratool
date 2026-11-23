@@ -1,5 +1,6 @@
 #include "migratool/core.hpp"
 #include "migratool/gateway.hpp"
+#include "migratool/scale.hpp"
 #include <sqlite3.h>
 #include <algorithm>
 #include <iostream>
@@ -110,6 +111,22 @@ int wmain(int argc,wchar_t** argv){
         auto after_change=run_cases(p, {}, nullptr, {"json-order"});
         check(after_change["reused_cases"].empty(),"un cambio en las raíces invalida todos los recibos omitidos");
         auto unchecked=status(p,false);check(unchecked["freshness"]["checked"]==false&&unchecked["freshness"]["basis"]=="indexed_at_last_sync_with_watcher_invalidations","consulta caché declara base de vigencia");
+        // Production hardening regressions (v3.1.0: CI-001, P2-015, DEEP-001, DEEP-003)
+        check(build_identity().value("version", std::string{}) == "3.1.0", "build_identity version unificada == 3.1.0");
+        // Repeated libclang invocations in the same process must never crash on FreeLibrary/TLS (CI-001)
+        write_text(dst/L"logic.cpp","namespace Native { int Add(int a,int b){return a+b+1;} }\n");
+        auto inv2 = scan(p);
+        check(inv2["complete"]==true, "segunda invocación de libclang en el mismo proceso sin crash");
+        write_text(dst/L"logic.cpp","namespace Native { int Add(int a,int b){return a+b+2;} }\n");
+        auto inv3 = scan(p);
+        check(inv3["complete"]==true, "tercera invocación de libclang en el mismo proceso sin crash");
+        // is_path_within_dir edge cases including trailing '.' segments (DEEP-001)
+        check(is_path_within_dir(src / L"." / L"modelo.cs", src / L".", false, true), "is_path_within_dir tolera segmentos '.' sin UB");
+        check(!is_path_within_dir(src, src, false, true), "is_path_within_dir allow_equal=false rechaza igualdad");
+        check(is_path_within_dir(src, src, true, true), "is_path_within_dir allow_equal=true acepta igualdad");
+        check(!is_path_within_dir(src / L".." / L"destino" / L"logic.cpp", src, false, true), "is_path_within_dir rechaza traversal '..'");
+        // file_toolkit create_file must reject traversal and outside-root writes (DEEP-003)
+        throws([&]{ agent_request(p, "create_file", {{"path", "../escape_out.txt"}, {"content", "bad"}}); }, "create_file rechaza path traversal");
         std::cout<<"PASS: "<<checks<<" comprobaciones. Evidencia: "<<path_text(qa)<<'\n';return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
 }

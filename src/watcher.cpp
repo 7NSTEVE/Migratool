@@ -154,6 +154,7 @@ struct IndexWatcher::Impl {
     }
 
     void close() {
+        if (watches.empty()) return;
         try {
             Database db(project);
             for (const auto& w : watches) db.try_aux_write("UPDATE watchers SET closed=? WHERE id=?", {now(), w->id});
@@ -168,13 +169,15 @@ struct IndexWatcher::Impl {
         while (!stop.stop_requested()) {
             auto acquired = WaitForSingleObject(owner, 200);
             if (acquired != WAIT_OBJECT_0 && acquired != WAIT_ABANDONED) continue;
-            try {
-                open();
-                loop(stop, catch_up);
-            } catch (const std::exception& e) {
-                if (log) log(std::string("Watcher: ") + e.what());
+            if (!stop.stop_requested() && !cancel.requested) {
+                try {
+                    open();
+                    loop(stop, catch_up);
+                } catch (const std::exception& e) {
+                    if (log) log(std::string("Watcher: ") + e.what());
+                }
+                close();
             }
-            close();
             ReleaseMutex(owner);
             if (!stop.stop_requested()) Sleep(200);
         }
@@ -406,6 +409,8 @@ struct IndexWatcher::Impl {
                     }
                 }
 
+                if (stop.stop_requested() || cancel.requested) break;
+
                 if (tick - last_config > 1000) {
                     auto current = Project::load(project.file);
                     last_config = tick;
@@ -420,6 +425,8 @@ struct IndexWatcher::Impl {
                     }
                 }
 
+                if (stop.stop_requested() || cancel.requested) break;
+
                 if (!is_ultra_only && due && tick >= due) {
                     if (!scale_enabled(project, db)) {
                         index_sync(project, false, log, &cancel);
@@ -427,6 +434,7 @@ struct IndexWatcher::Impl {
                     } else if (db.integer("SELECT COUNT(*) FROM inventory_jobs WHERE state IN('queued','running')") == 0) {
                         if (reconcile || db.integer("SELECT EXISTS(SELECT 1 FROM inventory_generations WHERE state='published')") == 0) {
                             auto receipts = db.query("SELECT id,at FROM dirty_paths ORDER BY id LIMIT 1000");
+                            if (stop.stop_requested() || cancel.requested) break;
                             scale_start(project, {{"actor", "watcher"}, {"event_receipts", receipts}});
                             last_reconcile = tick;
                             reconcile = false;
@@ -435,6 +443,7 @@ struct IndexWatcher::Impl {
                             std::map<std::string, Json> file_paths, file_receipts;
                             bool launched = false;
                             for (const auto& e : events) {
+                                if (stop.stop_requested() || cancel.requested) break;
                                 Json root;
                                 for (const auto& r : project.config["roots"]) if (r["id"] == e["root"]) root = r;
                                 auto discard = [&]() { db.exec("DELETE FROM dirty_paths WHERE id=? AND at=?", {e["id"], e["at"]}); };
@@ -467,13 +476,15 @@ struct IndexWatcher::Impl {
                                     launched = true;
                                 }
                             }
+                            if (stop.stop_requested() || cancel.requested) break;
                             for (const auto& [rid, paths] : file_paths) {
+                                if (stop.stop_requested() || cancel.requested) break;
                                 scale_start(project, {{"scope", {{"root", rid}, {"files", paths}}},
                                                       {"actor", "watcher"},
                                                       {"event_receipts", file_receipts[rid]}}, false);
                                 launched = true;
                             }
-                            if (launched) scale_spawn(project);
+                            if (launched && !stop.stop_requested() && !cancel.requested) scale_spawn(project);
                         }
                     }
                     due = (reconcile || db.integer("SELECT EXISTS(SELECT 1 FROM dirty_paths)")) ? tick + 500 : 0;
@@ -491,5 +502,10 @@ struct IndexWatcher::Impl {
 IndexWatcher::IndexWatcher(const Project& p, unsigned interval, Log log, bool catch_up)
     : impl_(std::make_unique<Impl>(p, interval, log, catch_up)) {}
 IndexWatcher::~IndexWatcher() = default;
+void IndexWatcher::request_stop() {
+    if (!impl_) return;
+    impl_->cancel.requested = true;
+    impl_->thread.request_stop();
+}
 
 } // namespace mt

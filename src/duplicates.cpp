@@ -15,11 +15,14 @@ namespace {
 struct Library {
     HMODULE handle{};
     Library() {
-        // AUD-035: Search executable_dir()/libzip.dll first for portable deployments before compile-time MIGRATOOL_ZIP_DLL!
+        // AUD-035 & CI-002: Search executable_dir()/{libzip.dll,zip.dll} first for portable/vcpkg deployments before compile-time MIGRATOOL_ZIP_DLL!
         std::vector<fs::path> candidates;
         try {
             const auto exe_dir = executable_dir();
-            if (!exe_dir.empty()) candidates.push_back((exe_dir / L"libzip.dll").make_preferred());
+            if (!exe_dir.empty()) {
+                candidates.push_back((exe_dir / L"libzip.dll").make_preferred());
+                candidates.push_back((exe_dir / L"zip.dll").make_preferred());
+            }
         } catch (...) {}
         candidates.push_back(fs::path(MIGRATOOL_ZIP_DLL).make_preferred());
         for (const auto& cand : candidates) {
@@ -31,6 +34,9 @@ struct Library {
         }
         if (!handle) {
             handle = LoadLibraryExW(L"libzip.dll", nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        }
+        if (!handle) {
+            handle = LoadLibraryExW(L"zip.dll", nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         }
         if (!handle) throw std::runtime_error("No se pudo cargar libzip (Win32 " + std::to_string(GetLastError()) + ")");
     }

@@ -315,14 +315,42 @@ int wmain(int argc, wchar_t** argv) {
               claim1["functions_evidence"].value("actual_functions_count", int64_t{-1}) == 1,
               "functions_evidence detected mismatch (claimed 99 vs actual 1 AST function)");
 
-        // 5b. Record a passing canonical build and a passing verified_runs entry, then verify accurate claim
+        // 5b. Adversarial AUD-MIG-P1-005: external record with ZERO verified artifacts must NOT earn VERIFIED_BUILD_PASS
         tool_build_canonical(p, db, {
             {"action", "record"},
+            {"build_id", "bld-audit-unverified-ext"},
+            {"requesting_agent", "Claude"},
+            {"lifecycle_state", "CONFIRMED"},
+            {"require_complete_integration", false},
+            {"exit_code", 0}
+        });
+        const Json claim_unverified_ext = tool_code_audit(p, db, {
+            {"action", "verify_claim"},
+            {"actor", "Claude"},
+            {"module_or_path", "src/mod_a.cpp"},
+            {"claim_text", "External build with no verified artifacts"},
+            {"claimed_compiled", true}
+        });
+        check(claim_unverified_ext["compilation_evidence"].value("status", std::string{}) != "VERIFIED_BUILD_PASS",
+              "AUD-MIG-P1-005: DECLARED_EXTERNAL build without verified artifacts does NOT pass compilation_evidence: " +
+              claim_unverified_ext.dump());
+
+        // Now execute a genuine OBSERVED_BUILD with a real artifact on disk and a passing verified_runs entry
+        fs::create_directories(repo_dir / L"build_out");
+        const fs::path built_bin = repo_dir / L"build_out" / L"mod_a_app.exe";
+        write_text(built_bin, "MZ_OBSERVED_BUILD_BINARY");
+        tool_build_canonical(p, db, {
+            {"action", "build_and_record"},
             {"build_id", "bld-audit-test-01"},
+            {"execute", true},
+            {"enforce_audit_gates", false},
+            {"command", Json::array({"cmd.exe", "/c", "echo build-ok"})},
             {"requesting_agent", "Claude"},
             {"lifecycle_state", "INTEGRATED"},
             {"require_complete_integration", false},
-            {"exit_code", 0}
+            {"artifacts", Json::array({
+                {{"name", "mod_a_app.exe"}, {"path", path_text(built_bin)}, {"kind", "executable"}}
+            })}
         });
 
         runs_telemetry_schema(db);
@@ -332,7 +360,7 @@ int wmain(int argc, wchar_t** argv) {
             "exit_code,duration_ms,status,passed_count,failed_count,errors_json,raw_bytes,distilled_bytes,log_path,git_head)"
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             {"run-audit-test-01", now(), "Claude", "", "explicit", "[\"code_audit_tests\"]",
-             "[\"ctest\"]", "", path_text(repo_dir), 0, 120, "PASSED", 12, 0, "[]", 256, 2, "", "HEAD"});
+             "[\"ctest\"]", "", path_text(repo_dir), 0, 120, "PASSED", 12, 0, "[]", 256, 2, "", ""});
 
         const Json claim2 = tool_code_audit(p, db, {
             {"action", "verify_claim"},
@@ -345,7 +373,7 @@ int wmain(int argc, wchar_t** argv) {
             {"claimed_equivalent", false}
         });
         check(claim2.value("verdict", std::string{}) == "VERIFIED",
-              "Accurate claim with verified build and test run returns VERIFIED: " + claim2.dump());
+              "Accurate claim with verified observed build and test run returns VERIFIED: " + claim2.dump());
         check(claim2["compilation_evidence"].value("status", std::string{}) == "VERIFIED_BUILD_PASS",
               "compilation_evidence is VERIFIED_BUILD_PASS");
         check(claim2["tests_evidence"].value("status", std::string{}) == "VERIFIED_TESTS_PASS",
@@ -365,8 +393,9 @@ int wmain(int argc, wchar_t** argv) {
             {"max_confirmed_p0", 0},
             {"require_verified_tests", true}
         });
-        check(gate_res.value("ok", false) == true && gate_res.value("gate_passed", false) == true,
-              "gate_check passes when confirmed_p0 == 0 and verified tests exist: " + gate_res.dump());
+        check(gate_res.value("ok", false) == true && gate_res.value("gate_passed", false) == true &&
+              gate_res.value("cache_fresh", false) == true && gate_res.value("rescan_performed", false) == true,
+              "gate_check performs fresh rescan and passes when confirmed_p0 == 0 and verified tests exist: " + gate_res.dump());
 
         // Triage the strcpy P1 finding as SUPPRESSED and verify preservation across re-scan
         const std::string strcpy_fnd_id = prod_sec_findings["findings"][0].value("finding_id", std::string{});
@@ -378,6 +407,205 @@ int wmain(int argc, wchar_t** argv) {
         });
         check(tri_res.value("ok", false) == true && tri_res.value("triage_status", std::string{}) == "SUPPRESSED",
               "triage action updated finding status to SUPPRESSED");
+
+        // =====================================================================
+        // SCENARIO 7: ADVERSARIAL PRODUCTION REGRESSIONS
+        //   7a: Genuine C++23 libclang AST ("clang_ast") vs non-C++ ("syntactic_tokens") (AUD-MIG-P1-006)
+        //   7b: gate_check catches same-mtime + same-size P0 disk edit without prior scan (AUD-MIG-P1-009)
+        //   7c: verify_claim rejects cross-commit & cross-module evidence in real Git repo (AUD-MIG-P1-005)
+        // =====================================================================
+        // 7a. Real C++23 corpus with concepts, templates, lambdas, overloads, class methods
+        write_text(repo_dir / L"src" / L"cpp23_corpus.cpp",
+                   "template<typename T>\n"
+                   "concept Addable = requires(T a, T b) { a + b; };\n"
+                   "template<Addable T>\n"
+                   "T tpl_combine(T a, T b) {\n"
+                   "    auto lam = [](T v) { return v; };\n"
+                   "    return lam(a) + b;\n"
+                   "}\n"
+                   "struct Widget {\n"
+                   "    int process(int x) {\n"
+                   "        if (x > 0 && x < 10) return x * 2;\n"
+                   "        return x;\n"
+                   "    }\n"
+                   "};\n"
+                   "int overload_fn(int a) { return a + 1; }\n"
+                   "double overload_fn(double a) { return a + 1.5; }\n");
+        write_text(repo_dir / L"src" / L"script_helper.py",
+                   "def py_helper(x):\n"
+                   "    if x > 0:\n"
+                   "        return x + 1\n"
+                   "    return 0\n");
+
+        const Json scan_cpp23 = tool_code_audit(p, db, {{"action", "scan_incremental"}});
+        check(scan_cpp23.value("ok", false) == true, "scan_cpp23 ok == true");
+        const Json cpp23_funcs = tool_code_audit(p, db, {
+            {"action", "functions"},
+            {"file_path", "src/cpp23_corpus.cpp"}
+        });
+        const Json py_funcs = tool_code_audit(p, db, {
+            {"action", "functions"},
+            {"file_path", "src/script_helper.py"}
+        });
+        check(cpp23_funcs["functions"].size() >= 4,
+              "AUD-MIG-P1-006: libclang extracted template, method, and both overloads from C++23 corpus: " + cpp23_funcs.dump());
+        for (const auto& fn : cpp23_funcs["functions"]) {
+            check(fn.value("analysis_source", std::string{}) == "clang_ast",
+                  "AUD-MIG-P1-006: C++23 corpus function genuinely labeled clang_ast: " + fn.dump());
+        }
+        check(!py_funcs["functions"].empty(), "Extracted function from src/script_helper.py");
+        for (const auto& fn : py_funcs["functions"]) {
+            check(fn.value("analysis_source", std::string{}) == "syntactic_tokens",
+                  "AUD-MIG-P1-006: non-C++ function honestly labeled syntactic_tokens (never clang_ast): " + fn.dump());
+        }
+
+        // 7b. Same-mtime + same-size P0 injection caught immediately by gate_check
+        const fs::path ind_path = repo_dir / L"src" / L"independent.cpp";
+        const std::string ind_orig = read_text(ind_path);
+        FILETIME ft_create{}, ft_access{}, ft_write{};
+        {
+            HANDLE h_get = CreateFileW(native_path(ind_path).c_str(), GENERIC_READ,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            check(h_get != INVALID_HANDLE_VALUE, "Opened src/independent.cpp to read original FILETIME");
+            check(GetFileTime(h_get, &ft_create, &ft_access, &ft_write) != FALSE, "GetFileTime succeeded");
+            CloseHandle(h_get);
+        }
+        // Craft a same-byte-length file containing unsafe gets() (P0!)
+        std::string same_size_p0 = "void p0_bad(char* s){ gets(s); }\n";
+        while (same_size_p0.size() < ind_orig.size()) same_size_p0.push_back(' ');
+        if (same_size_p0.size() > ind_orig.size()) {
+            // Pad original first? Just write same_size_p0 if ind_orig is larger (ind_orig is ~78 bytes)
+            same_size_p0 = same_size_p0.substr(0, ind_orig.size());
+        }
+        check(same_size_p0.size() == ind_orig.size() && same_size_p0.find("gets(s)") != std::string::npos,
+              "Constructed exact-same-size P0 payload (" + std::to_string(same_size_p0.size()) + " bytes)");
+        write_text(ind_path, same_size_p0);
+        {
+            HANDLE h_set = CreateFileW(native_path(ind_path).c_str(), FILE_WRITE_ATTRIBUTES,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            check(h_set != INVALID_HANDLE_VALUE, "Opened src/independent.cpp to restore exact FILETIME");
+            check(SetFileTime(h_set, &ft_create, &ft_access, &ft_write) != FALSE, "Restored exact FILETIME");
+            CloseHandle(h_set);
+        }
+        const Json gate_same_mtime = tool_code_audit(p, db, {
+            {"action", "gate_check"},
+            {"max_confirmed_p0", 0}
+        });
+        write_text(ind_path, ind_orig);
+        check(gate_same_mtime.value("cache_fresh", false) == true &&
+              gate_same_mtime.value("gate_passed", true) == false &&
+              gate_same_mtime.value("confirmed_p0", int64_t{0}) >= 1,
+              "AUD-MIG-P1-009: gate_check caught same-mtime & same-size P0 injection via content SHA-256: " + gate_same_mtime.dump());
+
+        // 7c. Real Git repo: verify_claim MUST reject cross-module test runs & stale-commit builds/tests
+        fs::path git_exe;
+        {
+            std::error_code ec;
+            for (const wchar_t* cand : {L"D:\\DevTools\\Tools\\Git\\cmd\\git.exe", L"C:\\Program Files\\Git\\cmd\\git.exe"}) {
+                if (fs::is_regular_file(cand, ec)) { git_exe = cand; break; }
+            }
+            if (git_exe.empty()) {
+                wchar_t buf[32768]{};
+                if (SearchPathW(nullptr, L"git.exe", nullptr, 32768, buf, nullptr)) git_exe = buf;
+            }
+        }
+        if (!git_exe.empty()) {
+            const fs::path git_repo = temp_base / L"git_claim_repo";
+            const fs::path git_logs = temp_base / L"git_claim_logs";
+            fs::create_directories(git_repo / L"src");
+            fs::create_directories(git_repo / L"build_out");
+            fs::create_directories(git_logs);
+            int gstep = 0;
+            auto rgit = [&](const std::vector<std::string>& args) -> std::string {
+                std::vector<std::string> argv = {path_text(git_exe)};
+                argv.insert(argv.end(), args.begin(), args.end());
+                Json res = run_process(argv, git_repo, "", git_logs / wide("g" + std::to_string(++gstep)), 15000);
+                check(res.value("exit_code", -1) == 0, "git command succeeded in 7c");
+                std::string out = read_text(fs::path(wide(res.at("stdout").get<std::string>())));
+                while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) out.pop_back();
+                return out;
+            };
+            write_text(git_repo / L"src" / L"alpha.cpp", "int alpha_fn(int x) { return x + 1; }\n");
+            write_text(git_repo / L"src" / L"beta.cpp", "int beta_fn(int x) { return x + 2; }\n");
+            write_text(git_repo / L".gitignore", ".migratool/\nbuild_out/\n");
+            rgit({"init"});
+            rgit({"config", "user.email", "audit-test@example.com"});
+            rgit({"config", "user.name", "AuditTest"});
+            rgit({"checkout", "-b", "main"});
+            rgit({"add", "."});
+            rgit({"commit", "-m", "commit 1"});
+
+            Project gp = Project::create(
+                git_repo / L"migration.json",
+                "GitClaimIdentityTest",
+                Json::array({{{"id", "src"}, {"role", "source"}, {"path", path_text(git_repo)}}})
+            );
+            rgit({"add", "migration.json"});
+            rgit({"commit", "-m", "add migration.json"});
+            const std::string head_c1 = rgit({"rev-parse", "HEAD"});
+
+            Database gdb(gp);
+            ensure_code_audit_schema(gdb);
+            runs_telemetry_schema(gdb);
+            tool_code_audit(gp, gdb, {{"action", "scan_incremental"}});
+
+            const fs::path gbin = git_repo / L"build_out" / L"git_app.exe";
+            write_text(gbin, "MZ_GIT_APP_C1");
+            tool_build_canonical(gp, gdb, {
+                {"action", "build_and_record"},
+                {"build_id", "bld-git-c1"},
+                {"execute", true},
+                {"enforce_audit_gates", false},
+                {"command", Json::array({"cmd.exe", "/c", "echo built-c1"})},
+                {"requesting_agent", "AgentG"},
+                {"lifecycle_state", "INTEGRATED"},
+                {"require_complete_integration", false},
+                {"artifacts", Json::array({
+                    {{"name", "git_app.exe"}, {"path", path_text(gbin)}, {"kind", "executable"}}
+                })}
+            });
+            // Insert verified_run ONLY for beta_tests at head_c1
+            gdb.exec(
+                "INSERT INTO verified_runs("
+                "id,at_iso,actor,workstream_id,selection_mode,selected_targets_json,command_json,env_profile,cwd,"
+                "exit_code,duration_ms,status,passed_count,failed_count,errors_json,raw_bytes,distilled_bytes,log_path,git_head)"
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                {"run-git-beta-c1", now(), "AgentG", "", "explicit", "[\"beta_tests\"]",
+                 "[\"ctest\",\"-R\",\"beta_tests\"]", "", path_text(git_repo),
+                 0, 80, "PASSED", 4, 0, "[]", 128, 16, "", head_c1});
+
+            // Claim for src/alpha.cpp must fail tests_evidence with NO_MODULE_TEST_EVIDENCE
+            const Json claim_wrong_mod = tool_code_audit(gp, gdb, {
+                {"action", "verify_claim"},
+                {"actor", "AgentG"},
+                {"module_or_path", "src/alpha.cpp"},
+                {"claim_text", "alpha tested"},
+                {"claimed_compiled", true},
+                {"claimed_tests_passed", true}
+            });
+            check(claim_wrong_mod.value("verdict", std::string{}) != "VERIFIED" &&
+                  claim_wrong_mod["tests_evidence"].value("status", std::string{}) == "NO_MODULE_TEST_EVIDENCE",
+                  "AUD-MIG-P1-005: verify_claim rejected unrelated suite run for src/alpha.cpp: " + claim_wrong_mod.dump());
+
+            // Advance Git HEAD to commit 2 -> old commit-1 build & tests must BOTH be rejected as stale/mismatch!
+            write_text(git_repo / L"src" / L"gamma.cpp", "int gamma_fn() { return 3; }\n");
+            rgit({"add", "src/gamma.cpp"});
+            rgit({"commit", "-m", "commit 2 advance HEAD"});
+            const Json claim_old_commit = tool_code_audit(gp, gdb, {
+                {"action", "verify_claim"},
+                {"actor", "AgentG"},
+                {"module_or_path", "src/beta.cpp"},
+                {"claim_text", "beta built and tested on HEAD"},
+                {"claimed_compiled", true},
+                {"claimed_tests_passed", true}
+            });
+            check(claim_old_commit.value("verdict", std::string{}) != "VERIFIED" &&
+                  claim_old_commit["compilation_evidence"].value("status", std::string{}) == "EVIDENCE_COMMIT_MISMATCH" &&
+                  claim_old_commit["tests_evidence"].value("status", std::string{}) == "STALE_COMMIT_TEST_EVIDENCE",
+                  "AUD-MIG-P1-005: verify_claim rejected stale-commit build & test evidence after HEAD advanced: " + claim_old_commit.dump());
+        }
 
         std::cout << "ALL CODE AUDIT TESTS PASSED (" << g_checks << " checks)\n";
         return 0;

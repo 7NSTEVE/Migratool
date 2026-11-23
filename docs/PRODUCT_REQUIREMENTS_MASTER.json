@@ -724,7 +724,9 @@
         "Una complejidad ciclomática alta se clasifica para revisión de responsabilidades y nunca como defecto confirmado por sí sola."
       ],
       "implementation_files": [
+        "include/migratool/clang_bridge.hpp",
         "include/migratool/code_audit.hpp",
+        "src/analyzers.cpp",
         "src/code_audit.cpp"
       ],
       "test_suites": [
@@ -746,7 +748,9 @@
         "Los archivos de implementación ausentes de compile_commands.json se señalan explícitamente como no compilados."
       ],
       "implementation_files": [
+        "include/migratool/clang_bridge.hpp",
         "include/migratool/code_audit.hpp",
+        "src/analyzers.cpp",
         "src/code_audit.cpp"
       ],
       "test_suites": [

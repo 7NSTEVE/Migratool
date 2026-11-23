@@ -47,6 +47,13 @@ std::string trim_copy(std::string s) {
     return s.substr(i);
 }
 
+std::string first_line_trimmed(const std::string& s) {
+    std::istringstream iss(s);
+    std::string line;
+    if (std::getline(iss, line)) return trim_copy(line);
+    return {};
+}
+
 std::string lower_ascii(std::string_view sv) {
     std::string out(sv);
     for (char& c : out) {
@@ -280,31 +287,72 @@ struct LiveWorktreeMetrics {
     int64_t disk_bytes = 0;
 };
 
-int64_t compute_bounded_dir_bytes(const fs::path& dir, size_t max_entries = 2500, size_t* out_file_count = nullptr) {
+struct BoundedSizeResult {
+    uint64_t bytes = 0;
+    bool scan_complete = true;
+    bool truncated = false;
+    size_t visited_entries = 0;
+    size_t scan_errors = 0;
+    size_t file_count = 0;
+};
+
+BoundedSizeResult compute_bounded_dir_bytes(const fs::path& dir, size_t max_entries = 2500) {
+    BoundedSizeResult res;
     std::error_code ec;
-    if (!fs::is_directory(native_path(dir), ec)) return 0;
-    int64_t total = 0;
-    size_t entries = 0;
-    size_t files = 0;
-    for (fs::recursive_directory_iterator it(native_path(dir), fs::directory_options::skip_permission_denied, ec), end;
-         it != end && entries < max_entries; it.increment(ec)) {
+    if (!fs::is_directory(native_path(dir), ec)) {
         if (ec) {
+            res.scan_complete = false;
+            res.scan_errors = 1;
+        }
+        return res;
+    }
+    fs::recursive_directory_iterator it(native_path(dir), fs::directory_options::skip_permission_denied, ec);
+    if (ec) {
+        res.scan_complete = false;
+        ++res.scan_errors;
+        return res;
+    }
+    const fs::recursive_directory_iterator end;
+    while (it != end) {
+        if (res.visited_entries >= max_entries) {
+            res.scan_complete = false;
+            res.truncated = true;
+            break;
+        }
+        ++res.visited_entries;
+        std::error_code entry_ec;
+        const bool is_sym = it->is_symlink(entry_ec);
+        if (entry_ec) {
+            ++res.scan_errors;
+            entry_ec.clear();
+        } else if (is_sym) {
+            if (it->is_directory(entry_ec)) it.disable_recursion_pending();
+        } else {
+            const bool is_file = it->is_regular_file(entry_ec);
+            if (entry_ec) {
+                ++res.scan_errors;
+                entry_ec.clear();
+            } else if (is_file) {
+                ++res.file_count;
+                const auto sz = it->file_size(entry_ec);
+                if (!entry_ec) {
+                    res.bytes += static_cast<uint64_t>(sz);
+                } else {
+                    ++res.scan_errors;
+                }
+            }
+        }
+        ec.clear();
+        it.increment(ec);
+        if (ec) {
+            ++res.scan_errors;
             ec.clear();
-            continue;
-        }
-        ++entries;
-        if (it->is_symlink(ec)) {
-            if (it->is_directory(ec)) it.disable_recursion_pending();
-            continue;
-        }
-        if (it->is_regular_file(ec)) {
-            ++files;
-            const auto sz = it->file_size(ec);
-            if (!ec) total += static_cast<int64_t>(sz);
         }
     }
-    if (out_file_count) *out_file_count = files;
-    return total;
+    if (res.scan_errors > 0) {
+        res.scan_complete = false;
+    }
+    return res;
 }
 
 LiveWorktreeMetrics inspect_live_worktree(const fs::path& wt_dir,
@@ -317,7 +365,7 @@ LiveWorktreeMetrics inspect_live_worktree(const fs::path& wt_dir,
     m.head_commit = known_head;
     std::error_code ec;
     if (!fs::is_directory(native_path(wt_dir), ec)) return m;
-    m.disk_bytes = compute_bounded_dir_bytes(wt_dir, 1500);
+    m.disk_bytes = static_cast<int64_t>(compute_bounded_dir_bytes(wt_dir, 1500).bytes);
 
     const auto st = run_git_isolated(wt_dir, {"status", "--porcelain=v2", "--branch"}, 15000);
     if (st.exit_code == 0) {
@@ -509,9 +557,19 @@ void ensure_multiagent_coordinator_schema(Database& db) {
             exit_code INTEGER NOT NULL DEFAULT 0,
             test_summary_json TEXT NOT NULL DEFAULT '{}',
             manifest_path TEXT NOT NULL DEFAULT '',
+            manifest_sha256 TEXT NOT NULL DEFAULT '',
+            provenance_mode TEXT NOT NULL DEFAULT 'DECLARED_EXTERNAL',
             created_at_utc TEXT NOT NULL DEFAULT ''
         )
     )SQL");
+    for (const char* bm_col : {
+        "manifest_sha256 TEXT NOT NULL DEFAULT ''",
+        "provenance_mode TEXT NOT NULL DEFAULT 'DECLARED_EXTERNAL'"
+    }) {
+        try {
+            db.exec(std::string("ALTER TABLE build_manifests ADD COLUMN ") + bm_col);
+        } catch (...) {}
+    }
 
     db.exec(R"SQL(
         CREATE TABLE IF NOT EXISTS build_artifacts (
@@ -522,9 +580,13 @@ void ensure_multiagent_coordinator_schema(Database& db) {
             sha256 TEXT NOT NULL DEFAULT '',
             size_bytes INTEGER NOT NULL DEFAULT 0,
             mtime_utc TEXT NOT NULL DEFAULT '',
-            kind TEXT NOT NULL DEFAULT 'other'
+            kind TEXT NOT NULL DEFAULT 'other',
+            artifact_verified INTEGER NOT NULL DEFAULT 0
         )
     )SQL");
+    try {
+        db.exec("ALTER TABLE build_artifacts ADD COLUMN artifact_verified INTEGER NOT NULL DEFAULT 0");
+    } catch (...) {}
     db.exec("CREATE INDEX IF NOT EXISTS idx_build_artifacts_sha256 ON build_artifacts(sha256)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_build_artifacts_path ON build_artifacts(artifact_path)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_build_artifacts_build_id ON build_artifacts(build_id)");
@@ -597,12 +659,18 @@ void ensure_multiagent_coordinator_schema(Database& db) {
             disk_bytes INTEGER NOT NULL DEFAULT 0,
             discovered_at_utc TEXT NOT NULL DEFAULT '',
             merge_base_commit TEXT NOT NULL DEFAULT '',
-            is_ancestor_of_main INTEGER NOT NULL DEFAULT 0
+            is_ancestor_of_main INTEGER NOT NULL DEFAULT 0,
+            sample_complete INTEGER NOT NULL DEFAULT 1,
+            visited_entries INTEGER NOT NULL DEFAULT 0,
+            sampled_files_count INTEGER NOT NULL DEFAULT 0
         )
     )SQL");
     for (const char* rep_col : {
         "merge_base_commit TEXT NOT NULL DEFAULT ''",
-        "is_ancestor_of_main INTEGER NOT NULL DEFAULT 0"
+        "is_ancestor_of_main INTEGER NOT NULL DEFAULT 0",
+        "sample_complete INTEGER NOT NULL DEFAULT 1",
+        "visited_entries INTEGER NOT NULL DEFAULT 0",
+        "sampled_files_count INTEGER NOT NULL DEFAULT 0"
     }) {
         try {
             db.exec(std::string("ALTER TABLE discovered_project_replicas ADD COLUMN ") + rep_col);
@@ -915,28 +983,102 @@ Json tool_worktree_inventory(const Project& p, Database& db, const Json& args) {
         const std::string wt_id = !existing.empty()
             ? existing.value("worktree_id", default_worktree_id(wt_path))
             : (!req_id.empty() ? req_id : default_worktree_id(wt_path));
+        if (is_path_within_dir(p.directory(), wt_fs, true, false)) {
+            throw std::runtime_error("WORKTREE_REMOVE_REFUSED_MAIN: cannot remove the main project integration worktree or its ancestor");
+        }
+
         const bool execute = args.value("execute", false);
+        std::string removal_mechanism = "DRY_RUN";
+        std::string quarantine_path_str;
         if (execute) {
-            run_git_isolated(p.directory(), {"worktree", "remove", wt_path}, 10000);
-            std::error_code ec;
-            if (fs::exists(native_path(wt_fs), ec) && !is_path_within_dir(wt_fs, p.directory(), true, false)) {
-                if (!send_file_to_recycle_bin(wt_fs)) {
-                    fs::remove_all(native_path(wt_fs), ec);
-                }
-                run_git_isolated(p.directory(), {"worktree", "prune"}, 5000);
+            const fs::path repo_dir = canonical_win32_path(p.directory());
+            const fs::path effective_repo = repo_dir.empty() ? p.directory() : repo_dir;
+            const auto git_rm = run_git_isolated(effective_repo, {"worktree", "remove", wt_path}, 15000);
+            removal_mechanism = "GIT_WORKTREE_REMOVE";
+
+            std::error_code rm_ec;
+            bool still_exists = fs::exists(native_path(wt_fs), rm_ec);
+            if (rm_ec) {
+                throw std::runtime_error(
+                    "WORKTREE_REMOVE_FAILED: no se pudo verificar si el directorio del worktree fue eliminado: " +
+                    wt_path + " (" + rm_ec.message() + ")");
             }
+
+            std::string fallback_error;
+            if (still_exists) {
+                if (send_file_to_recycle_bin(wt_fs)) {
+                    rm_ec.clear();
+                    still_exists = fs::exists(native_path(wt_fs), rm_ec);
+                    if (!still_exists && !rm_ec) {
+                        removal_mechanism = "WINDOWS_RECYCLE_BIN";
+                    }
+                } else {
+                    fallback_error = "send_file_to_recycle_bin failed";
+                }
+            }
+
+            if (still_exists) {
+                const fs::path q_parent = p.state_dir() / L"quarantine" / L"worktrees";
+                std::error_code q_ec;
+                fs::create_directories(native_path(q_parent), q_ec);
+                const fs::path q_dest = q_parent / wide(wt_id + "-" + unique_id().substr(0, 8));
+                if (!q_ec) {
+                    const BOOL moved = MoveFileExW(
+                        native_path(wt_fs).c_str(),
+                        native_path(q_dest).c_str(),
+                        MOVEFILE_WRITE_THROUGH);
+                    if (moved) {
+                        rm_ec.clear();
+                        still_exists = fs::exists(native_path(wt_fs), rm_ec);
+                        if (!still_exists && !rm_ec) {
+                            removal_mechanism = "RECOVERABLE_QUARANTINE";
+                            quarantine_path_str = canonical_path_str(q_dest);
+                        }
+                    } else {
+                        const DWORD werr = GetLastError();
+                        if (!fallback_error.empty()) fallback_error += "; ";
+                        fallback_error += "MoveFileExW quarantine failed (Win32 " + std::to_string(werr) + ")";
+                    }
+                } else {
+                    if (!fallback_error.empty()) fallback_error += "; ";
+                    fallback_error += "create_directories quarantine failed (" + q_ec.message() + ")";
+                }
+            }
+
+            if (still_exists) {
+                std::string reason_detail = "git worktree remove exit_code=" + std::to_string(git_rm.exit_code);
+                const std::string git_msg = trim_copy(git_rm.output);
+                if (!git_msg.empty()) reason_detail += "; git_output=" + git_msg;
+                if (!fallback_error.empty()) reason_detail += "; fallback=" + fallback_error;
+                throw std::runtime_error(
+                    "WORKTREE_REMOVE_FAILED: el directorio del worktree permanece en disco y no pudo reciclarse ni moverse a cuarentena: " +
+                    wt_path + " (" + reason_detail + ")");
+            }
+
+            const auto prune_res = run_git_isolated(effective_repo, {"worktree", "prune"}, 10000);
+            if (prune_res.exit_code != 0) {
+                throw std::runtime_error(
+                    "WORKTREE_REMOVE_FAILED: git worktree prune falló (exit_code=" +
+                    std::to_string(prune_res.exit_code) + "): " + trim_copy(prune_res.output));
+            }
+
             db.exec("DELETE FROM agent_worktrees_catalog WHERE worktree_id=? OR lower(worktree_path)=lower(?)", {wt_id, wt_path});
             db.exec("DELETE FROM integration_queue WHERE worktree_id=? OR lower(worktree_path)=lower(?)", {wt_id, wt_path});
         }
 
-        return {
+        Json rm_resp = {
             {"schema", "migratool.worktree_inventory/1"},
             {"action", "remove_worktree"},
             {"ok", true},
             {"executed", execute},
             {"worktree_id", wt_id},
-            {"worktree_path", wt_path}
+            {"worktree_path", wt_path},
+            {"removal_mechanism", removal_mechanism}
         };
+        if (!quarantine_path_str.empty()) {
+            rm_resp["quarantine_path"] = quarantine_path_str;
+        }
+        return rm_resp;
     }
 
     if (action == "resume" || action == "handoff") {
@@ -1175,7 +1317,9 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
     ensure_multiagent_coordinator_schema(db);
     const std::string action = lower_ascii(args.value("action", "evaluate"));
     const std::string ts = now();
-    const std::string target_branch = detect_main_branch(p.directory(), args.value("target_branch", std::string{}));
+    const fs::path canon_repo = canonical_win32_path(p.directory());
+    const fs::path repo_dir = canon_repo.empty() ? p.directory() : canon_repo;
+    const std::string target_branch = detect_main_branch(repo_dir, args.value("target_branch", std::string{}));
 
     if (action == "merge_execute") {
         const std::string req_id = trim_copy(args.value("worktree_id", std::string{}));
@@ -1183,7 +1327,7 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
         const std::string req_branch = trim_copy(args.value("branch", std::string{}));
         if (!req_path.empty()) {
             fs::path fp(wide(req_path));
-            if (fp.is_relative()) fp = p.directory() / fp;
+            if (fp.is_relative()) fp = repo_dir / fp;
             req_path = canonical_path_str(fp);
         }
         if (req_id.empty() && req_path.empty() && req_branch.empty()) {
@@ -1212,7 +1356,7 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
             rows = find_wt_rows();
         }
         if (rows.empty()) {
-            throw std::runtime_error("WORKTREE_NOT_FOUND: worktree not found in agent_worktrees_catalog");
+            throw std::runtime_error("WORKTREE_NOT_FOUND: worktree not found in agent_worktrees_catalog or live git worktrees");
         }
 
         const Json wt_row = rows[0];
@@ -1222,11 +1366,51 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
         std::string head_commit = wt_row.value("head_commit", std::string{});
         const std::string state = wt_row.value("lifecycle_state", std::string{"IMPLEMENTED"});
         const std::string owner_agent = wt_row.value("owner_agent", std::string{});
+        const std::string existing_notes = wt_row.value("notes", std::string{});
 
-        if (!wt_path.empty()) {
-            const LiveWorktreeMetrics wt_live = inspect_live_worktree(fs::path(wide(wt_path)), target_branch);
-            if (!wt_live.head_commit.empty()) head_commit = wt_live.head_commit;
-            if (branch.empty() && !wt_live.branch.empty()) branch = wt_live.branch;
+        // (a) Verify source worktree exists on disk, is a live Git worktree, and has zero uncommitted/untracked changes
+        const fs::path wt_fs(wide(wt_path));
+        std::error_code wt_ec;
+        if (wt_path.empty() || !fs::is_directory(native_path(wt_fs), wt_ec)) {
+            throw std::runtime_error("WORKTREE_NOT_FOUND: el directorio del worktree origen no existe en disco: " + wt_path);
+        }
+        const LiveWorktreeMetrics wt_live = inspect_live_worktree(wt_fs, target_branch);
+        if (!wt_live.is_git_worktree) {
+            throw std::runtime_error("WORKTREE_NOT_FOUND: el worktree origen no es un worktree Git válido: " + wt_path);
+        }
+        if (wt_live.uncommitted_count > 0 || wt_live.untracked_count > 0) {
+            throw std::runtime_error(
+                "MERGE_BLOCKED_DIRTY_SOURCE_WORKTREE: el worktree origen tiene cambios sin commit (uncommitted=" +
+                std::to_string(wt_live.uncommitted_count) + ", untracked=" + std::to_string(wt_live.untracked_count) + ")");
+        }
+        if (!wt_live.head_commit.empty()) {
+            head_commit = wt_live.head_commit;
+        } else {
+            const auto wt_rev = run_git_isolated(wt_fs, {"rev-parse", "HEAD"}, 10000);
+            if (wt_rev.exit_code == 0 && !trim_copy(wt_rev.output).empty()) {
+                head_commit = first_line_trimmed(wt_rev.output);
+            }
+        }
+        if (branch.empty() && !wt_live.branch.empty()) branch = wt_live.branch;
+
+        // (b) Verify target repository's actual checked-out branch matches target_branch (reject detached HEAD or wrong branch)
+        const auto sym_res = run_git_isolated(repo_dir, {"symbolic-ref", "--short", "HEAD"}, 10000);
+        const std::string actual_branch = (sym_res.exit_code == 0) ? first_line_trimmed(sym_res.output) : std::string("(detached)");
+        if (sym_res.exit_code != 0 || actual_branch != target_branch) {
+            throw std::runtime_error(
+                "MERGE_BLOCKED_WRONG_TARGET_BRANCH: rama activa '" + actual_branch + "' != target_branch '" + target_branch + "'");
+        }
+
+        // (c) Verify target repository is completely clean (zero uncommitted and zero untracked files)
+        const LiveWorktreeMetrics main_live = inspect_live_worktree(repo_dir, target_branch);
+        if (!main_live.is_git_worktree) {
+            throw std::runtime_error("MERGE_BLOCKED_DIRTY_TARGET_WORKTREE: no se pudo verificar el estado Git del repositorio destino");
+        }
+        if (main_live.uncommitted_count > 0 || main_live.untracked_count > 0) {
+            throw std::runtime_error(
+                "MERGE_BLOCKED_DIRTY_TARGET_WORKTREE: target integration worktree has " +
+                std::to_string(main_live.uncommitted_count) + " uncommitted and " +
+                std::to_string(main_live.untracked_count) + " untracked changes");
         }
 
         const bool allow_implemented = args.value("allow_implemented", false);
@@ -1236,22 +1420,25 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
                 "' (must be CONFIRMED before merge_execute)");
         }
 
-        const std::string candidate_ref = (!branch.empty() && git_commit_exists(p.directory(), branch))
+        const std::string candidate_ref = (!branch.empty() && git_commit_exists(repo_dir, branch))
             ? branch
             : (!head_commit.empty() ? head_commit : branch);
+        std::string source_head = head_commit;
+        if (source_head.empty() && !candidate_ref.empty()) {
+            const auto srev = run_git_isolated(repo_dir, {"rev-parse", "--verify", candidate_ref + "^{commit}"}, 10000);
+            if (srev.exit_code == 0) source_head = first_line_trimmed(srev.output);
+        }
+        if (source_head.empty()) {
+            throw std::runtime_error("MERGE_EXECUTION_FAILED: no se pudo resolver el commit HEAD del worktree origen");
+        }
+
+        // (d) Non-destructive git merge-tree --write-tree conflict pre-check
         const auto mt_res = run_git_isolated(
-            p.directory(), {"merge-tree", "--write-tree", target_branch, candidate_ref}, 10000);
+            repo_dir, {"merge-tree", "--write-tree", target_branch, candidate_ref}, 10000);
         if (mt_res.exit_code != 0 || mt_res.output.find("CONFLICT") != std::string::npos) {
             throw std::runtime_error(
                 "MERGE_BLOCKED_CONFLICT: non-destructive git merge-tree detected conflict merging '" +
                 candidate_ref + "' into '" + target_branch + "': " + mt_res.output);
-        }
-
-        const LiveWorktreeMetrics main_live = inspect_live_worktree(p.directory(), target_branch);
-        if (main_live.uncommitted_count > 0) {
-            throw std::runtime_error(
-                "MERGE_BLOCKED_DIRTY_TARGET_WORKTREE: target integration worktree has " +
-                std::to_string(main_live.uncommitted_count) + " uncommitted changes");
         }
 
         if (args.value("enforce_audit_gates", false)) {
@@ -1262,21 +1449,38 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
         }
 
         const bool execute = args.value("execute", false);
-        std::string new_head = head_commit;
+        std::string new_head = source_head;
         if (execute) {
             const auto merge_res = run_git_isolated(
-                p.directory(), {"merge", "--no-ff", "--no-edit", candidate_ref}, 15000);
+                repo_dir, {"merge", "--no-ff", "--no-edit", candidate_ref}, 15000);
             if (merge_res.exit_code != 0) {
-                run_git_isolated(p.directory(), {"merge", "--abort"}, 5000);
+                run_git_isolated(repo_dir, {"merge", "--abort"}, 5000);
                 throw std::runtime_error("MERGE_EXECUTION_FAILED: " + merge_res.output);
             }
-            const auto rev = run_git_isolated(p.directory(), {"rev-parse", "HEAD"}, 4000);
-            if (rev.exit_code == 0 && !trim_copy(rev.output).empty()) {
-                new_head = trim_copy(rev.output);
+
+            // (e) Verify real Git ancestry after merge before promoting CONFIRMED -> INTEGRATED
+            const auto post_anc = run_git_isolated(
+                repo_dir, {"merge-base", "--is-ancestor", source_head, "HEAD"}, 10000);
+            if (post_anc.exit_code != 0) {
+                throw std::runtime_error(
+                    "MERGE_VERIFICATION_FAILED: post-merge git merge-base --is-ancestor falló para " + source_head);
             }
+
+            const auto rev = run_git_isolated(repo_dir, {"rev-parse", "HEAD"}, 4000);
+            if (rev.exit_code != 0 || trim_copy(rev.output).empty()) {
+                throw std::runtime_error("MERGE_VERIFICATION_FAILED: no se pudo resolver el nuevo commit HEAD tras merge");
+            }
+            new_head = first_line_trimmed(rev.output);
+
+            const std::string verif_note =
+                "verification_mode=VERIFIED_GIT_ANCESTOR verified_source_head=" + source_head +
+                " verified_target_branch=" + target_branch +
+                " verified_target_head=" + new_head;
+            const std::string updated_notes = existing_notes.empty() ? verif_note : (existing_notes + "\n" + verif_note);
+
             db.exec(
-                "UPDATE agent_worktrees_catalog SET lifecycle_state='INTEGRATED', uncommitted_count=0, ahead_count=0, updated_at_utc=? WHERE worktree_id=?",
-                {ts, wt_id});
+                "UPDATE agent_worktrees_catalog SET lifecycle_state='INTEGRATED', head_commit=?, uncommitted_count=0, untracked_count=0, ahead_count=0, notes=?, updated_at_utc=? WHERE worktree_id=?",
+                {source_head, updated_notes, ts, wt_id});
             db.exec(R"SQL(
                 INSERT INTO integration_queue (
                     worktree_id, worktree_path, branch, head_commit, target_branch,
@@ -1284,16 +1488,17 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
                     conflicting_files_json, evaluated_at_utc, integrated_at_utc, integrated_commit, status
                 ) VALUES (?, ?, ?, ?, ?, ?, 'INTEGRATED', 'ALREADY_MERGED', '', '[]', ?, ?, ?, 'INTEGRATED')
                 ON CONFLICT(worktree_id) DO UPDATE SET
+                    head_commit=excluded.head_commit,
                     lifecycle_state='INTEGRATED',
                     conflict_status='ALREADY_MERGED',
                     integrated_at_utc=excluded.integrated_at_utc,
                     integrated_commit=excluded.integrated_commit,
                     status='INTEGRATED',
                     evaluated_at_utc=excluded.evaluated_at_utc
-            )SQL", {wt_id, wt_path, branch, head_commit, target_branch, owner_agent, ts, ts, new_head});
+            )SQL", {wt_id, wt_path, branch, source_head, target_branch, owner_agent, ts, ts, new_head});
         }
 
-        return {
+        Json merge_resp = {
             {"schema", "migratool.integrate_ready/1"},
             {"action", "merge_execute"},
             {"ok", true},
@@ -1305,41 +1510,107 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
             {"integrated_commit", new_head},
             {"lifecycle_state", execute ? std::string("INTEGRATED") : state}
         };
+        if (execute) {
+            merge_resp["verification_mode"] = "VERIFIED_GIT_ANCESTOR";
+            merge_resp["verified_source_head"] = source_head;
+            merge_resp["verified_target_branch"] = target_branch;
+            merge_resp["verified_target_head"] = new_head;
+        }
+        return merge_resp;
     }
 
+    Json mark_verified_meta = Json::object();
     if (action == "mark_integrated") {
-        const std::string req_id = args.value("worktree_id", std::string{});
-        std::string req_path = args.value("worktree_path", std::string{});
+        const std::string req_id = trim_copy(args.value("worktree_id", std::string{}));
+        std::string req_path = trim_copy(args.value("worktree_path", std::string{}));
+        const std::string req_branch = trim_copy(args.value("branch", std::string{}));
         if (!req_path.empty()) {
             fs::path fp(wide(req_path));
-            if (fp.is_relative()) fp = p.directory() / fp;
+            if (fp.is_relative()) fp = repo_dir / fp;
             req_path = canonical_path_str(fp);
         }
-        if (req_id.empty() && req_path.empty()) {
-            throw std::runtime_error("MARK_INTEGRATED_MISSING_TARGET: provide worktree_id or worktree_path");
+        if (req_id.empty() && req_path.empty() && req_branch.empty()) {
+            throw std::runtime_error("MARK_INTEGRATED_MISSING_TARGET: provide worktree_id, worktree_path, or branch");
         }
-        Json rows = !req_id.empty()
-            ? db.query("SELECT * FROM agent_worktrees_catalog WHERE worktree_id=?", {req_id})
-            : db.query("SELECT * FROM agent_worktrees_catalog WHERE lower(worktree_path)=lower(?)", {req_path});
-        if (rows.empty() && !req_path.empty()) {
-            tool_worktree_inventory(p, db, {
-                {"action", "register"},
-                {"worktree_path", req_path},
-                {"lifecycle_state", "INTEGRATED"}
-            });
-            rows = db.query("SELECT * FROM agent_worktrees_catalog WHERE lower(worktree_path)=lower(?)", {req_path});
+
+        auto find_mark_rows = [&]() -> Json {
+            if (!req_id.empty()) {
+                const auto r = db.query("SELECT * FROM agent_worktrees_catalog WHERE worktree_id=?", {req_id});
+                if (!r.empty()) return r;
+            }
+            if (!req_path.empty()) {
+                const auto r = db.query("SELECT * FROM agent_worktrees_catalog WHERE lower(worktree_path)=lower(?)", {req_path});
+                if (!r.empty()) return r;
+            }
+            if (!req_branch.empty()) {
+                const auto r = db.query("SELECT * FROM agent_worktrees_catalog WHERE branch=?", {req_branch});
+                if (!r.empty()) return r;
+            }
+            return Json::array();
+        };
+
+        Json rows = find_mark_rows();
+        if (rows.empty()) {
+            tool_worktree_inventory(p, db, {{"action", "scan"}, {"target_branch", target_branch}});
+            rows = find_mark_rows();
         }
         if (rows.empty()) {
-            throw std::runtime_error("WORKTREE_NOT_FOUND: worktree not found in agent_worktrees_catalog");
+            throw std::runtime_error("WORKTREE_NOT_FOUND: worktree not found in agent_worktrees_catalog or live git worktrees");
         }
+
         const std::string wt_id = rows[0].value("worktree_id", std::string{});
         const std::string wt_path = rows[0].value("worktree_path", std::string{});
-        const std::string branch = rows[0].value("branch", target_branch);
-        const std::string head_commit = args.value("integrated_commit", rows[0].value("head_commit", std::string{}));
         const std::string owner_agent = rows[0].value("owner_agent", std::string{});
+        const std::string existing_notes = rows[0].value("notes", std::string{});
 
-        db.exec("UPDATE agent_worktrees_catalog SET lifecycle_state='INTEGRATED', uncommitted_count=0, ahead_count=0, updated_at_utc=? WHERE worktree_id=?",
-                {ts, wt_id});
+        // Inspect live Git state (fail closed if directory missing, not a Git worktree, or dirty)
+        const fs::path wt_fs(wide(wt_path));
+        std::error_code wt_ec;
+        if (wt_path.empty() || !fs::is_directory(native_path(wt_fs), wt_ec)) {
+            throw std::runtime_error("WORKTREE_NOT_FOUND: el directorio del worktree no existe en disco: " + wt_path);
+        }
+        const LiveWorktreeMetrics wt_live = inspect_live_worktree(wt_fs, target_branch);
+        if (!wt_live.is_git_worktree) {
+            throw std::runtime_error("WORKTREE_NOT_FOUND: la ruta no corresponde a un worktree Git válido: " + wt_path);
+        }
+        if (wt_live.uncommitted_count > 0 || wt_live.untracked_count > 0) {
+            throw std::runtime_error("MARK_INTEGRATED_REFUSED_DIRTY: el worktree tiene cambios sin commit");
+        }
+
+        std::string wt_head = wt_live.head_commit;
+        if (wt_head.empty()) {
+            const auto wt_rev = run_git_isolated(wt_fs, {"rev-parse", "HEAD"}, 10000);
+            if (wt_rev.exit_code == 0) wt_head = first_line_trimmed(wt_rev.output);
+        }
+        if (wt_head.empty()) {
+            throw std::runtime_error("MARK_INTEGRATED_REFUSED_UNMERGED: el commit del worktree no es ancestro de " + target_branch);
+        }
+
+        const auto anc_res = run_git_isolated(repo_dir, {"merge-base", "--is-ancestor", wt_head, target_branch}, 10000);
+        if (anc_res.exit_code != 0) {
+            throw std::runtime_error(
+                "MARK_INTEGRATED_REFUSED_UNMERGED: el commit del worktree no es ancestro de " + target_branch);
+        }
+
+        const auto tgt_rev = run_git_isolated(repo_dir, {"rev-parse", target_branch}, 10000);
+        const std::string target_head = (tgt_rev.exit_code == 0) ? first_line_trimmed(tgt_rev.output) : std::string{};
+        if (tgt_rev.exit_code != 0 || target_head.empty()) {
+            throw std::runtime_error(
+                "MARK_INTEGRATED_REFUSED_UNMERGED: no se pudo resolver el commit HEAD de " + target_branch);
+        }
+
+        const std::string branch = !wt_live.branch.empty()
+            ? wt_live.branch
+            : rows[0].value("branch", target_branch);
+        const std::string verif_note =
+            "verification_mode=VERIFIED_GIT_ANCESTOR verified_source_head=" + wt_head +
+            " verified_target_branch=" + target_branch +
+            " verified_target_head=" + target_head;
+        const std::string updated_notes = existing_notes.empty() ? verif_note : (existing_notes + "\n" + verif_note);
+
+        db.exec(
+            "UPDATE agent_worktrees_catalog SET lifecycle_state='INTEGRATED', head_commit=?, uncommitted_count=0, untracked_count=0, ahead_count=0, notes=?, updated_at_utc=? WHERE worktree_id=?",
+            {wt_head, updated_notes, ts, wt_id});
         db.exec(R"SQL(
             INSERT INTO integration_queue (
                 worktree_id, worktree_path, branch, head_commit, target_branch,
@@ -1347,13 +1618,23 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
                 conflicting_files_json, evaluated_at_utc, integrated_at_utc, integrated_commit, status
             ) VALUES (?, ?, ?, ?, ?, ?, 'INTEGRATED', 'ALREADY_MERGED', '', '[]', ?, ?, ?, 'INTEGRATED')
             ON CONFLICT(worktree_id) DO UPDATE SET
+                head_commit=excluded.head_commit,
                 lifecycle_state='INTEGRATED',
                 conflict_status='ALREADY_MERGED',
                 integrated_at_utc=excluded.integrated_at_utc,
                 integrated_commit=excluded.integrated_commit,
                 status='INTEGRATED',
                 evaluated_at_utc=excluded.evaluated_at_utc
-        )SQL", {wt_id, wt_path, branch, head_commit, target_branch, owner_agent, ts, ts, head_commit});
+        )SQL", {wt_id, wt_path, branch, wt_head, target_branch, owner_agent, ts, ts, target_head});
+
+        mark_verified_meta = {
+            {"worktree_id", wt_id},
+            {"worktree_path", wt_path},
+            {"verification_mode", "VERIFIED_GIT_ANCESTOR"},
+            {"verified_source_head", wt_head},
+            {"verified_target_branch", target_branch},
+            {"verified_target_head", target_head}
+        };
     } else if (action == "enqueue" && (args.contains("worktree_path") || args.contains("worktree_id"))) {
         Json reg_args = args;
         reg_args["action"] = "register";
@@ -1364,7 +1645,7 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
     tool_worktree_inventory(p, db, {{"action", "scan"}, {"target_branch", target_branch}});
 
     const auto worktrees = db.query("SELECT * FROM agent_worktrees_catalog ORDER BY worktree_path ASC");
-    const bool target_ref_valid = git_commit_exists(p.directory(), target_branch);
+    const bool target_ref_valid = git_commit_exists(repo_dir, target_branch);
 
     for (const auto& wt : worktrees) {
         const std::string wt_id = wt.value("worktree_id", std::string{});
@@ -1389,9 +1670,9 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
             status = "INTEGRATED";
         } else {
             const std::string candidate_ref = !head_commit.empty() ? head_commit : branch;
-            if (target_ref_valid && git_commit_exists(p.directory(), candidate_ref)) {
+            if (target_ref_valid && git_commit_exists(repo_dir, candidate_ref)) {
                 const auto mt_res = run_git_isolated(
-                    p.directory(), {"merge-tree", "--write-tree", target_branch, candidate_ref}, 10000);
+                    repo_dir, {"merge-tree", "--write-tree", target_branch, candidate_ref}, 10000);
                 std::istringstream iss(mt_res.output);
                 std::string first_line;
                 if (std::getline(iss, first_line)) {
@@ -1478,7 +1759,7 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
         queue_out.push_back(std::move(item));
     }
 
-    return {
+    Json out = {
         {"schema", "migratool.integrate_ready/1"},
         {"ok", true},
         {"action", action},
@@ -1490,6 +1771,12 @@ Json tool_integrate_ready(const Project& p, Database& db, const Json& args) {
         {"excluded_worktrees", excluded_worktrees},
         {"queue", queue_out}
     };
+    if (!mark_verified_meta.empty()) {
+        for (auto it = mark_verified_meta.begin(); it != mark_verified_meta.end(); ++it) {
+            out[it.key()] = it.value();
+        }
+    }
+    return out;
 }
 
 Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
@@ -1522,11 +1809,12 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
 
         const auto rows = db.query(R"SQL(
             SELECT
-                a.artifact_id, a.build_id, a.artifact_name, a.artifact_path, a.sha256, a.size_bytes, a.mtime_utc, a.kind,
+                a.artifact_id, a.build_id, a.artifact_name, a.artifact_path, a.sha256, a.size_bytes, a.mtime_utc, a.kind, a.artifact_verified,
                 m.project_name, m.worktree_path, m.branch, m.head_commit, m.tree_clean, m.snapshot_id,
                 m.requesting_agent, m.build_type, m.compiler_id, m.lifecycle_state, m.integration_completeness,
                 m.unintegrated_worktrees_json, m.excluded_worktrees_json, m.conservation_tier,
-                m.total_artifact_bytes, m.build_dir, m.exit_code, m.test_summary_json, m.manifest_path, m.created_at_utc
+                m.total_artifact_bytes, m.build_dir, m.exit_code, m.test_summary_json,
+                m.manifest_path, m.manifest_sha256, m.provenance_mode, m.created_at_utc
             FROM build_artifacts a
             JOIN build_manifests m ON a.build_id = m.build_id
             WHERE (? != '' AND lower(a.sha256) = lower(?))
@@ -1538,6 +1826,9 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
         for (const auto& r : rows) {
             Json item = r;
             item["tree_clean"] = (r.value("tree_clean", int64_t{1}) != 0);
+            item["artifact_verified"] = (r.value("artifact_verified", int64_t{0}) != 0);
+            item["provenance_mode"] = r.value("provenance_mode", std::string{"DECLARED_EXTERNAL"});
+            item["manifest_sha256"] = r.value("manifest_sha256", std::string{});
             item["unintegrated_worktrees"] = parse_json_safe(r.value("unintegrated_worktrees_json", std::string{"[]"}), Json::array());
             item["excluded_worktrees"] = parse_json_safe(r.value("excluded_worktrees_json", std::string{"[]"}), Json::array());
             item["test_summary"] = parse_json_safe(r.value("test_summary_json", std::string{"{}"}), Json::object());
@@ -1587,6 +1878,8 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
             out["requesting_agent"] = m0.value("requesting_agent", std::string{});
             out["lifecycle_state"] = m0.value("lifecycle_state", std::string{});
             out["integration_completeness"] = m0.value("integration_completeness", std::string{});
+            out["provenance_mode"] = m0.value("provenance_mode", std::string{"DECLARED_EXTERNAL"});
+            out["manifest_sha256"] = m0.value("manifest_sha256", std::string{});
             out["build"] = m0;
             if (m0.contains("manifest")) out["manifest"] = m0["manifest"];
         }
@@ -1599,11 +1892,17 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
         for (const auto& r : rows) {
             Json b = r;
             b["tree_clean"] = (r.value("tree_clean", int64_t{1}) != 0);
+            b["provenance_mode"] = r.value("provenance_mode", std::string{"DECLARED_EXTERNAL"});
+            b["manifest_sha256"] = r.value("manifest_sha256", std::string{});
             b["unintegrated_worktrees"] = parse_json_safe(r.value("unintegrated_worktrees_json", std::string{"[]"}), Json::array());
             b["excluded_worktrees"] = parse_json_safe(r.value("excluded_worktrees_json", std::string{"[]"}), Json::array());
             b["test_summary"] = parse_json_safe(r.value("test_summary_json", std::string{"{}"}), Json::object());
-            b["artifacts"] = db.query("SELECT * FROM build_artifacts WHERE build_id=? ORDER BY artifact_id ASC",
-                                      {r.value("build_id", std::string{})});
+            Json arts = db.query("SELECT * FROM build_artifacts WHERE build_id=? ORDER BY artifact_id ASC",
+                                 {r.value("build_id", std::string{})});
+            for (auto& a : arts) {
+                a["artifact_verified"] = (a.value("artifact_verified", int64_t{0}) != 0);
+            }
+            b["artifacts"] = std::move(arts);
             builds.push_back(std::move(b));
         }
         return {
@@ -1619,6 +1918,38 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
     const std::string lifecycle_state = upper_ascii(args.value("lifecycle_state", "INTEGRATED"));
     validate_lifecycle_state_or_throw(lifecycle_state);
 
+    const bool is_build_and_record = (action == "build_and_record");
+    const bool execute_build = is_build_and_record && json_bool_or_int(args, "execute", false);
+    std::string provenance_mode = "DECLARED_EXTERNAL";
+    int64_t exit_code = args.value("exit_code", int64_t{0});
+
+    // AUD-MIG-P1-008: Separate DECLARED_EXTERNAL from OBSERVED_BUILD
+    if (lifecycle_state == "DELIVERED" && !execute_build) {
+        throw std::runtime_error(
+            "DELIVERED_REQUIRES_OBSERVED_BUILD: use build_and_record con execute=true, artefactos verificados y audit gates aprobados");
+    }
+    if (!execute_build && exit_code != 0 &&
+        (lifecycle_state == "CONFIRMED" || lifecycle_state == "INTEGRATED" || lifecycle_state == "DELIVERED")) {
+        throw std::runtime_error("BUILD_NONZERO_EXIT_CANNOT_CONFIRM: exit_code=" + std::to_string(exit_code));
+    }
+
+    const std::string build_id = trim_copy(args.value("build_id", "bld-" + unique_id().substr(0, 12)));
+    if (build_id.empty() || build_id.find('/') != std::string::npos || build_id.find('\\') != std::string::npos ||
+        build_id.find("..") != std::string::npos || build_id.find(':') != std::string::npos) {
+        throw std::runtime_error("INVALID_BUILD_ID: identificador de build inválido: " + build_id);
+    }
+
+    // AUD-MIG-P1-004: Strict append-only immutability check before any execution or mutation
+    const fs::path manifest_fs = p.state_dir() / L"builds" / wide(build_id) / L"manifest.json";
+    {
+        std::error_code col_ec;
+        const bool exists_in_db = db.integer("SELECT COUNT(*) FROM build_manifests WHERE build_id=?", {build_id}) > 0;
+        const bool exists_on_disk = fs::exists(native_path(manifest_fs), col_ec);
+        if (exists_in_db || exists_on_disk) {
+            throw std::runtime_error("BUILD_MANIFEST_IMMUTABLE_COLLISION: build_id ya existe y es inmutable: " + build_id);
+        }
+    }
+
     const Json integ = tool_integrate_ready(p, db, {
         {"action", "evaluate"},
         {"target_branch", args.value("target_branch", std::string{})}
@@ -1632,14 +1963,14 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
             " mientras existan worktrees obligatorios sin integrar: " + integ["unintegrated_mandatory_worktrees"].dump());
     }
 
-    if (args.value("enforce_audit_gates", false)) {
+    const bool enforce_audit_gates = json_bool_or_int(args, "enforce_audit_gates", lifecycle_state == "DELIVERED");
+    if (enforce_audit_gates) {
         const Json gate = tool_code_audit(p, db, {{"action", "gate_check"}});
         if (!json_bool_or_int(gate, "gate_passed", false)) {
             throw std::runtime_error("CANONICAL_BUILD_BLOCKED_AUDIT_GATE: code_audit gate_check failed: " + gate.dump());
         }
     }
 
-    const std::string build_id = args.value("build_id", "bld-" + unique_id().substr(0, 12));
     std::string wt_path = args.value("worktree_path", path_text(p.directory()));
     {
         fs::path fp(wide(wt_path));
@@ -1654,23 +1985,22 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
         build_dir = canonical_path_str(bdp);
     }
 
-    int64_t exit_code = args.value("exit_code", int64_t{0});
-    if (action == "build_and_record") {
+    if (is_build_and_record) {
         const int64_t self_pid = static_cast<int64_t>(GetCurrentProcessId());
         db.exec("UPDATE agent_worktrees_catalog SET active_build_pid=?, updated_at_utc=? WHERE lower(worktree_path)=lower(?)",
                 {self_pid, ts, wt_path});
         struct ActiveBuildPidGuard {
-            Database& db;
-            std::string wt_path;
+            Database& db_ref;
+            std::string worktree_path_val;
             ~ActiveBuildPidGuard() {
                 try {
-                    db.exec("UPDATE agent_worktrees_catalog SET active_build_pid=0, updated_at_utc=? WHERE lower(worktree_path)=lower(?)",
-                            {now(), wt_path});
+                    db_ref.exec("UPDATE agent_worktrees_catalog SET active_build_pid=0, updated_at_utc=? WHERE lower(worktree_path)=lower(?)",
+                                {now(), worktree_path_val});
                 } catch (...) {}
             }
         } pid_guard{db, wt_path};
 
-        if (args.value("execute", false)) {
+        if (execute_build) {
             std::vector<std::string> cmd_argv;
             if (args.contains("command")) {
                 if (args["command"].is_array()) {
@@ -1702,13 +2032,17 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
             if (cmd_argv.empty()) {
                 throw std::runtime_error("CANONICAL_BUILD_MISSING_COMMAND: provide command, preset, or build_dir when execute=true");
             }
-            const fs::path log_file = p.state_dir() / L"builds" / wide(build_id) / L"build_exec.log";
+            const fs::path exec_log_dir = p.state_dir() / L"builds" / wide(build_id) / L"exec_logs";
             const Json proc_res = run_process(
-                cmd_argv, fs::path(wide(wt_path)), "", log_file, static_cast<unsigned>(args.value("timeout_ms", 300000)));
+                cmd_argv, fs::path(wide(wt_path)), "", exec_log_dir, static_cast<unsigned>(args.value("timeout_ms", 300000)));
+            const bool proc_timed_out = proc_res.value("timed_out", false);
+            const bool proc_cancelled = proc_res.value("cancelled", false);
+            const bool proc_overflow = proc_res.value("output_limit", false);
             exit_code = proc_res.value("exit_code", int64_t{-1});
-            if (exit_code != 0) {
+            if (exit_code != 0 || proc_timed_out || proc_cancelled || proc_overflow) {
                 throw std::runtime_error("CANONICAL_BUILD_COMMAND_FAILED: exit_code=" + std::to_string(exit_code));
             }
+            provenance_mode = "OBSERVED_BUILD";
         }
     }
 
@@ -1763,22 +2097,26 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
         }
     }
 
+    // AUD-MIG-P1-003: Zero synthetic artifact hashes; require real disk files by default and always for INTEGRATED/DELIVERED
+    const bool require_existing_artifacts = (lifecycle_state == "INTEGRATED" || lifecycle_state == "DELIVERED")
+        ? true
+        : json_bool_or_int(args, "require_existing_artifacts", true);
+
     Json artifacts_out = Json::array();
     int64_t total_artifact_bytes = 0;
+    size_t verified_artifacts_count = 0;
     for (const auto& entry : raw_artifacts) {
         std::string a_raw_path;
         std::string a_name;
-        std::string a_sha256;
+        std::string declared_sha256;
         std::string a_kind;
-        int64_t a_size = 0;
         if (entry.is_string()) {
             a_raw_path = entry.get<std::string>();
         } else if (entry.is_object()) {
             a_raw_path = entry.value("artifact_path", entry.value("path", std::string{}));
             a_name = entry.value("artifact_name", entry.value("name", std::string{}));
-            a_sha256 = lower_ascii(entry.value("sha256", std::string{}));
+            declared_sha256 = lower_ascii(trim_copy(entry.value("sha256", std::string{})));
             a_kind = entry.value("kind", std::string{});
-            a_size = entry.value("size_bytes", int64_t{0});
         }
         if (a_raw_path.empty()) continue;
 
@@ -1793,13 +2131,32 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
             else if (ext == ".lib" || ext == ".a") a_kind = "lib";
             else a_kind = "other";
         }
-        std::error_code ec;
-        if (fs::is_regular_file(native_path(ap), ec)) {
-            a_size = static_cast<int64_t>(fs::file_size(native_path(ap), ec));
-            if (a_sha256.empty()) a_sha256 = lower_ascii(hash_file(ap));
-        } else if (a_sha256.empty()) {
-            a_sha256 = sha256(a_norm_path + ":" + build_id);
+
+        std::string a_sha256;
+        int64_t a_size = 0;
+        bool a_verified = false;
+        std::error_code art_ec;
+        if (fs::is_regular_file(native_path(ap), art_ec) && !art_ec) {
+            std::error_code sz_ec;
+            const auto fsz = fs::file_size(native_path(ap), sz_ec);
+            a_size = sz_ec ? int64_t{0} : static_cast<int64_t>(fsz);
+            const std::string computed_sha = lower_ascii(hash_file(ap));
+            if (!declared_sha256.empty() && declared_sha256 != computed_sha) {
+                throw std::runtime_error(
+                    "BUILD_ARTIFACT_SHA256_MISMATCH: hash declarado no coincide con archivo en disco: " + a_norm_path);
+            }
+            a_sha256 = computed_sha;
+            a_verified = true;
+            ++verified_artifacts_count;
+        } else {
+            if (require_existing_artifacts) {
+                throw std::runtime_error("BUILD_ARTIFACT_MISSING: " + a_norm_path);
+            }
+            a_sha256.clear();
+            a_size = 0;
+            a_verified = false;
         }
+
         total_artifact_bytes += a_size;
         artifacts_out.push_back({
             {"build_id", build_id},
@@ -1808,13 +2165,17 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
             {"sha256", a_sha256},
             {"size_bytes", a_size},
             {"mtime_utc", ts},
-            {"kind", a_kind}
+            {"kind", a_kind},
+            {"artifact_verified", a_verified}
         });
     }
 
-    const fs::path manifest_fs = p.state_dir() / L"builds" / wide(build_id) / L"manifest.json";
-    const std::string manifest_path_str = canonical_path_str(manifest_fs);
+    if (lifecycle_state == "DELIVERED" && verified_artifacts_count == 0) {
+        throw std::runtime_error(
+            "DELIVERED_REQUIRES_VERIFIED_ARTIFACTS: un build DELIVERED requiere al menos un artefacto verificado en disco");
+    }
 
+    const std::string manifest_path_str = canonical_path_str(manifest_fs);
     const Json unintegrated_wts = integ.value("unintegrated_mandatory_worktrees", Json::array());
     const Json excluded_wts = integ.value("excluded_worktrees", Json::array());
 
@@ -1831,11 +2192,13 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
         {"build_type", build_type},
         {"compiler_id", compiler_id},
         {"lifecycle_state", lifecycle_state},
+        {"provenance_mode", provenance_mode},
         {"integration_completeness", integration_completeness},
         {"unintegrated_worktrees", unintegrated_wts},
         {"excluded_worktrees", excluded_wts},
         {"conservation_tier", conservation_tier},
         {"total_artifact_bytes", total_artifact_bytes},
+        {"verified_artifacts_count", verified_artifacts_count},
         {"build_dir", build_dir},
         {"exit_code", exit_code},
         {"test_summary", test_summary},
@@ -1844,69 +2207,71 @@ Json tool_build_canonical(const Project& p, Database& db, const Json& args) {
         {"created_at_utc", ts}
     };
 
-    write_json(manifest_fs, manifest_doc);
-
-    if ((lifecycle_state == "INTEGRATED" || lifecycle_state == "DELIVERED") && args.value("demote_previous_builds", true)) {
-        db.exec("UPDATE build_manifests SET conservation_tier='VERIFIED_SAFE_CLEAN' WHERE build_id != ?", {build_id});
+    const std::string manifest_json_text = manifest_doc.dump(2, ' ', false, Json::error_handler_t::replace) + "\n";
+    const std::string manifest_sha256 = lower_ascii(sha256(manifest_json_text));
+    try {
+        write_text_exclusive(manifest_fs, manifest_json_text);
+    } catch (const std::exception&) {
+        std::error_code ex_ec;
+        if (fs::exists(native_path(manifest_fs), ex_ec)) {
+            throw std::runtime_error("BUILD_MANIFEST_IMMUTABLE_COLLISION: build_id ya existe y es inmutable: " + build_id);
+        }
+        throw;
     }
 
-    db.exec(R"SQL(
-        INSERT INTO build_manifests (
-            build_id, project_name, worktree_path, branch, head_commit, tree_clean,
-            snapshot_id, requesting_agent, build_type, compiler_id, lifecycle_state,
-            integration_completeness, unintegrated_worktrees_json, excluded_worktrees_json,
-            conservation_tier, total_artifact_bytes, build_dir, exit_code, test_summary_json,
-            manifest_path, created_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(build_id) DO UPDATE SET
-            worktree_path=excluded.worktree_path,
-            branch=excluded.branch,
-            head_commit=excluded.head_commit,
-            tree_clean=excluded.tree_clean,
-            snapshot_id=excluded.snapshot_id,
-            requesting_agent=excluded.requesting_agent,
-            build_type=excluded.build_type,
-            compiler_id=excluded.compiler_id,
-            lifecycle_state=excluded.lifecycle_state,
-            integration_completeness=excluded.integration_completeness,
-            unintegrated_worktrees_json=excluded.unintegrated_worktrees_json,
-            excluded_worktrees_json=excluded.excluded_worktrees_json,
-            conservation_tier=excluded.conservation_tier,
-            total_artifact_bytes=excluded.total_artifact_bytes,
-            build_dir=excluded.build_dir,
-            exit_code=excluded.exit_code,
-            test_summary_json=excluded.test_summary_json,
-            manifest_path=excluded.manifest_path,
-            created_at_utc=excluded.created_at_utc
-    )SQL", {
-        build_id, proj_name, wt_path, branch, head_commit, tree_clean ? 1 : 0,
-        snapshot_id, requesting_agent, build_type, compiler_id, lifecycle_state,
-        integration_completeness, unintegrated_wts.dump(), excluded_wts.dump(),
-        conservation_tier, total_artifact_bytes, build_dir, exit_code, test_summary.dump(),
-        manifest_path_str, ts
-    });
+    const bool need_tx = (sqlite3_get_autocommit(db.native_handle()) != 0);
+    if (need_tx) db.begin();
+    try {
+        if ((lifecycle_state == "INTEGRATED" || lifecycle_state == "DELIVERED") && args.value("demote_previous_builds", true)) {
+            db.exec("UPDATE build_manifests SET conservation_tier='VERIFIED_SAFE_CLEAN' WHERE build_id != ?", {build_id});
+        }
 
-    db.exec("DELETE FROM build_artifacts WHERE build_id=?", {build_id});
-    Statement ins_art(db, R"SQL(
-        INSERT INTO build_artifacts (build_id, artifact_name, artifact_path, sha256, size_bytes, mtime_utc, kind)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    )SQL");
-    for (const auto& a : artifacts_out) {
-        ins_art.exec({
-            build_id,
-            a.value("artifact_name", std::string{}),
-            a.value("artifact_path", std::string{}),
-            a.value("sha256", std::string{}),
-            a.value("size_bytes", int64_t{0}),
-            a.value("mtime_utc", ts),
-            a.value("kind", std::string{"other"})
+        db.exec(R"SQL(
+            INSERT INTO build_manifests (
+                build_id, project_name, worktree_path, branch, head_commit, tree_clean,
+                snapshot_id, requesting_agent, build_type, compiler_id, lifecycle_state,
+                integration_completeness, unintegrated_worktrees_json, excluded_worktrees_json,
+                conservation_tier, total_artifact_bytes, build_dir, exit_code, test_summary_json,
+                manifest_path, manifest_sha256, provenance_mode, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        )SQL", {
+            build_id, proj_name, wt_path, branch, head_commit, tree_clean ? 1 : 0,
+            snapshot_id, requesting_agent, build_type, compiler_id, lifecycle_state,
+            integration_completeness, unintegrated_wts.dump(), excluded_wts.dump(),
+            conservation_tier, total_artifact_bytes, build_dir, exit_code, test_summary.dump(),
+            manifest_path_str, manifest_sha256, provenance_mode, ts
         });
+
+        Statement ins_art(db, R"SQL(
+            INSERT INTO build_artifacts (build_id, artifact_name, artifact_path, sha256, size_bytes, mtime_utc, kind, artifact_verified)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        )SQL");
+        for (const auto& a : artifacts_out) {
+            ins_art.exec({
+                build_id,
+                a.value("artifact_name", std::string{}),
+                a.value("artifact_path", std::string{}),
+                a.value("sha256", std::string{}),
+                a.value("size_bytes", int64_t{0}),
+                a.value("mtime_utc", ts),
+                a.value("kind", std::string{"other"}),
+                a.value("artifact_verified", false) ? 1 : 0
+            });
+        }
+        if (need_tx) db.commit();
+    } catch (...) {
+        if (need_tx) {
+            try { db.rollback(); } catch (...) {}
+        }
+        throw;
     }
 
     Json resp = manifest_doc;
     resp["schema"] = "migratool.build_canonical/1";
     resp["action"] = action;
     resp["ok"] = true;
+    resp["manifest_sha256"] = manifest_sha256;
+    resp["provenance_mode"] = provenance_mode;
     return resp;
 }
 
@@ -1938,28 +2303,71 @@ bool is_always_protected_core_dir(const std::string& name_low) {
     return kCore.contains(name_low);
 }
 
-bool directory_has_handwritten_sources(const fs::path& dir, size_t max_entries = 1500) {
+struct SourceScanResult {
+    bool has_sources = false;
+    bool scan_complete = true;
+    size_t visited_entries = 0;
+    size_t scan_errors = 0;
+};
+
+SourceScanResult directory_has_handwritten_sources(const fs::path& dir, size_t max_entries = 1500) {
+    SourceScanResult res;
     std::error_code ec;
-    if (!fs::is_directory(native_path(dir), ec)) return false;
-    size_t visited = 0;
-    for (fs::recursive_directory_iterator it(native_path(dir), fs::directory_options::skip_permission_denied, ec), end;
-         it != end && visited < max_entries; it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        ++visited;
-        if (it->is_directory(ec)) {
+    if (!fs::is_directory(native_path(dir), ec)) {
+        if (ec) {
+            res.scan_complete = false;
+            res.scan_errors = 1;
+        }
+        return res;
+    }
+    fs::recursive_directory_iterator it(native_path(dir), fs::directory_options::skip_permission_denied, ec);
+    if (ec) {
+        res.scan_complete = false;
+        ++res.scan_errors;
+        return res;
+    }
+    const fs::recursive_directory_iterator end;
+    while (it != end) {
+        if (res.visited_entries >= max_entries) {
+            res.scan_complete = false;
+            break;
+        }
+        ++res.visited_entries;
+        std::error_code entry_ec;
+        const bool is_dir = it->is_directory(entry_ec);
+        if (entry_ec) {
+            ++res.scan_errors;
+            entry_ec.clear();
+        } else if (is_dir) {
             const std::string dlow = lower_ascii(path_text(it->path().filename()));
             if (dlow == "cmakefiles" || dlow == "zip-headers" || dlow == "_deps"
                 || dlow == "vcpkg_installed" || dlow == "node_modules" || dlow == ".git") {
                 it.disable_recursion_pending();
             }
-            continue;
+        } else {
+            const bool is_file = it->is_regular_file(entry_ec);
+            if (entry_ec) {
+                ++res.scan_errors;
+                entry_ec.clear();
+            } else if (is_file) {
+                const std::string ext = lower_ascii(path_text(it->path().extension()));
+                if (is_handwritten_source_ext(ext)) {
+                    res.has_sources = true;
+                    return res;
+                }
+            }
         }
-        if (it->is_regular_file(ec)) {
-            const std::string ext = lower_ascii(path_text(it->path().extension()));
-            if (is_handwritten_source_ext(ext)) return true;
+        ec.clear();
+        it.increment(ec);
+        if (ec) {
+            ++res.scan_errors;
+            ec.clear();
         }
     }
-    return false;
+    if (res.scan_errors > 0) {
+        res.scan_complete = false;
+    }
+    return res;
 }
 
 bool pattern_matches_dir(std::string pat_low, const std::string& rel_low, const std::string& name_low) {
@@ -2172,6 +2580,10 @@ Json tool_storage_audit(const Project& p, Database& db, const Json& args) {
     }
 
     const fs::path root_canon = canonical_win32_path(p.directory());
+    const size_t source_scan_limit = static_cast<size_t>(std::clamp<int64_t>(args.value("source_scan_limit", int64_t{1500}), 100, 50000));
+    const size_t size_scan_limit = static_cast<size_t>(std::clamp<int64_t>(args.value("size_scan_limit", int64_t{2000}), 100, 100000));
+    const size_t dup_scan_limit = static_cast<size_t>(std::clamp<int64_t>(args.value("duplicate_scan_limit", int64_t{400}), 50, 50000));
+
     Json items = Json::array();
     std::unordered_map<std::string, Json> item_by_key;
     std::map<std::string, int64_t> bytes_by_tier = {
@@ -2182,6 +2594,7 @@ Json tool_storage_audit(const Project& p, Database& db, const Json& args) {
     };
     std::map<std::string, int64_t> bytes_by_category;
     int64_t reclaimable_bytes = 0;
+    bool quota_evaluation_complete = true;
 
     for (const auto& dir_path : candidate_dirs) {
         const std::string dir_str = canonical_path_str(dir_path);
@@ -2197,9 +2610,11 @@ Json tool_storage_audit(const Project& p, Database& db, const Json& args) {
         }
         const std::string rel_low = lower_ascii(rel_str);
 
-        size_t file_count = 0;
-        const int64_t dir_bytes = compute_bounded_dir_bytes(dir_path, 2000, &file_count);
-        const bool has_sources = directory_has_handwritten_sources(dir_path);
+        const BoundedSizeResult size_scan = compute_bounded_dir_bytes(dir_path, size_scan_limit);
+        const int64_t dir_bytes = static_cast<int64_t>(size_scan.bytes);
+        const size_t file_count = size_scan.file_count;
+        const SourceScanResult src_scan = directory_has_handwritten_sources(dir_path, source_scan_limit);
+        const bool has_sources = src_scan.has_sources;
 
         bool has_dirty_wt = false;
         bool has_active_build_pid = false;
@@ -2295,6 +2710,19 @@ Json tool_storage_audit(const Project& p, Database& db, const Json& args) {
             reason = "Directorio no clasificado; requiere revisión humana o política explícita";
         }
 
+        // AUD-MIG-P1-007: Fail closed when bounded handwritten-source scan is incomplete or hit errors
+        if ((!src_scan.scan_complete || src_scan.scan_errors > 0) && tier == "VERIFIED_SAFE_CLEAN") {
+            tier = "NEEDS_REVIEW";
+            reason = "Escaneo de archivos fuente incompleto o con errores (fail-closed: visited=" +
+                std::to_string(src_scan.visited_entries) + ", errors=" +
+                std::to_string(src_scan.scan_errors) + "); prohibida limpieza automática sin revisión";
+        }
+
+        const bool size_is_estimate = size_scan.truncated || !size_scan.scan_complete;
+        if ((category == "BUILD_OUTPUT" || category == "CACHE") && size_is_estimate) {
+            quota_evaluation_complete = false;
+        }
+
         bytes_by_tier[tier] += dir_bytes;
         count_by_tier[tier] += 1;
         bytes_by_category[category] += dir_bytes;
@@ -2313,6 +2741,14 @@ Json tool_storage_audit(const Project& p, Database& db, const Json& args) {
             {"has_uncommitted_changes", has_dirty_wt},
             {"size_bytes", dir_bytes},
             {"file_count", file_count},
+            {"scan_complete", size_scan.scan_complete && src_scan.scan_complete},
+            {"size_is_estimate", size_is_estimate},
+            {"size_scan_complete", size_scan.scan_complete},
+            {"size_visited_entries", size_scan.visited_entries},
+            {"size_scan_errors", size_scan.scan_errors},
+            {"source_scan_complete", src_scan.scan_complete},
+            {"source_visited_entries", src_scan.visited_entries},
+            {"source_scan_errors", src_scan.scan_errors},
             {"reason", reason}
         };
         item_by_key[dir_key] = item;
@@ -2382,32 +2818,66 @@ Json tool_storage_audit(const Project& p, Database& db, const Json& args) {
     };
     std::map<std::string, DupArtifactGroup> dup_by_sha;
     std::unordered_set<std::string> seen_artifact_paths;
+    bool duplicate_scan_complete = true;
+    size_t skipped_oversize_count = 0;
 
     for (const auto& item : items) {
         if (item.value("category", std::string{}) != "BUILD_OUTPUT") continue;
         const fs::path bdir(wide(item.value("path", std::string{})));
         std::error_code dec;
-        if (!fs::is_directory(native_path(bdir), dec)) continue;
+        if (!fs::is_directory(native_path(bdir), dec)) {
+            if (dec) duplicate_scan_complete = false;
+            continue;
+        }
+        fs::recursive_directory_iterator it(native_path(bdir), fs::directory_options::skip_permission_denied, dec);
+        if (dec) {
+            duplicate_scan_complete = false;
+            continue;
+        }
+        const fs::recursive_directory_iterator end;
         size_t scanned = 0;
-        for (fs::recursive_directory_iterator it(native_path(bdir), fs::directory_options::skip_permission_denied, dec), end;
-             it != end && scanned < 400; it.increment(dec)) {
-            if (dec) { dec.clear(); continue; }
+        while (it != end) {
+            if (scanned >= dup_scan_limit) {
+                duplicate_scan_complete = false;
+                break;
+            }
             ++scanned;
-            if (!it->is_regular_file(dec)) continue;
-            const std::string ext = lower_ascii(path_text(it->path().extension()));
-            if (ext != ".exe" && ext != ".dll" && ext != ".lib" && ext != ".pdb" && ext != ".obj") continue;
-            const auto fsz = it->file_size(dec);
-            if (dec || fsz == 0 || fsz > 64 * 1024 * 1024) continue;
-            const std::string fpath = canonical_path_str(it->path());
-            if (!seen_artifact_paths.insert(lower_ascii(fpath)).second) continue;
-            try {
-                const std::string sha = lower_ascii(hash_file(it->path()));
-                if (!sha.empty()) {
-                    auto& grp = dup_by_sha[sha];
-                    grp.size_bytes = static_cast<int64_t>(fsz);
-                    grp.paths.push_back(fpath);
+            std::error_code entry_ec;
+            const bool is_reg = it->is_regular_file(entry_ec);
+            if (entry_ec) {
+                duplicate_scan_complete = false;
+            } else if (is_reg) {
+                const std::string ext = lower_ascii(path_text(it->path().extension()));
+                if (ext == ".exe" || ext == ".dll" || ext == ".lib" || ext == ".pdb" || ext == ".obj") {
+                    const auto fsz = it->file_size(entry_ec);
+                    if (entry_ec) {
+                        duplicate_scan_complete = false;
+                    } else if (fsz > 64ULL * 1024ULL * 1024ULL) {
+                        ++skipped_oversize_count;
+                        duplicate_scan_complete = false;
+                    } else if (fsz > 0) {
+                        const std::string fpath = canonical_path_str(it->path());
+                        if (seen_artifact_paths.insert(lower_ascii(fpath)).second) {
+                            try {
+                                const std::string sha = lower_ascii(hash_file(it->path()));
+                                if (!sha.empty()) {
+                                    auto& grp = dup_by_sha[sha];
+                                    grp.size_bytes = static_cast<int64_t>(fsz);
+                                    grp.paths.push_back(fpath);
+                                }
+                            } catch (...) {
+                                duplicate_scan_complete = false;
+                            }
+                        }
+                    }
                 }
-            } catch (...) {}
+            }
+            dec.clear();
+            it.increment(dec);
+            if (dec) {
+                duplicate_scan_complete = false;
+                dec.clear();
+            }
         }
     }
 
@@ -2447,6 +2917,9 @@ Json tool_storage_audit(const Project& p, Database& db, const Json& args) {
         {"quota_policy", quota_policy},
         {"quota_exceeded", quota_exceeded},
         {"bytes_over_quota", bytes_over_quota},
+        {"quota_evaluation_complete", quota_evaluation_complete},
+        {"duplicate_scan_complete", duplicate_scan_complete},
+        {"skipped_oversize_count", skipped_oversize_count},
         {"duplicate_artifact_groups", duplicate_artifact_groups},
         {"duplicate_artifact_reclaimable_bytes", duplicate_artifact_reclaimable_bytes},
         {"counts_by_tier", count_by_tier},
@@ -2459,6 +2932,13 @@ Json tool_storage_audit(const Project& p, Database& db, const Json& args) {
 
 namespace {
 
+struct SourceSampleResult {
+    bool sample_complete = true;
+    size_t visited_entries = 0;
+    size_t sampled_files_count = 0;
+    size_t scan_errors = 0;
+};
+
 struct ProjectFingerprint {
     std::string git_root_commit;
     std::string git_head_commit;
@@ -2467,6 +2947,7 @@ struct ProjectFingerprint {
     std::unordered_set<std::string> linked_worktree_keys;
     std::unordered_map<std::string, std::string> rel_to_sha256;
     std::unordered_set<std::string> all_sha256s;
+    SourceSampleResult sample_stats;
 };
 
 bool should_skip_fingerprint_dir(const std::string& dlow) {
@@ -2485,64 +2966,105 @@ bool is_fingerprint_candidate_file(const fs::path& fp) {
     return !kExcludedExts.contains(ext_low);
 }
 
-void collect_dir_source_hashes(const fs::path& root_dir,
-                               std::unordered_map<std::string, std::string>& out_rel_to_sha,
-                               std::unordered_set<std::string>& out_all_sha,
-                               size_t max_files = 250) {
+SourceSampleResult collect_dir_source_hashes(const fs::path& root_dir,
+                                             std::unordered_map<std::string, std::string>& out_rel_to_sha,
+                                             std::unordered_set<std::string>& out_all_sha,
+                                             size_t max_files = 250,
+                                             size_t max_visited = 3000) {
+    SourceSampleResult res;
     std::error_code ec;
     const fs::path canon_root = canonical_win32_path(root_dir);
-    if (canon_root.empty() || !fs::is_directory(native_path(canon_root), ec)) return;
+    if (canon_root.empty() || !fs::is_directory(native_path(canon_root), ec)) {
+        if (ec) {
+            res.sample_complete = false;
+            res.scan_errors = 1;
+        }
+        return res;
+    }
 
-    size_t visited = 0;
-    for (fs::recursive_directory_iterator it(native_path(canon_root), fs::directory_options::skip_permission_denied, ec), end;
-         it != end && out_rel_to_sha.size() < max_files && visited < 3000; it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        ++visited;
-        if (it->is_directory(ec)) {
+    fs::recursive_directory_iterator it(native_path(canon_root), fs::directory_options::skip_permission_denied, ec);
+    if (ec) {
+        res.sample_complete = false;
+        ++res.scan_errors;
+        return res;
+    }
+    const fs::recursive_directory_iterator end;
+    while (it != end) {
+        if (res.visited_entries >= max_visited) {
+            res.sample_complete = false;
+            break;
+        }
+        ++res.visited_entries;
+        std::error_code entry_ec;
+        const bool is_dir = it->is_directory(entry_ec);
+        if (entry_ec) {
+            ++res.scan_errors;
+            entry_ec.clear();
+        } else if (is_dir) {
             const std::string dlow = lower_ascii(path_text(it->path().filename()));
             if (should_skip_fingerprint_dir(dlow)) {
                 it.disable_recursion_pending();
             }
-            continue;
+        } else {
+            const bool is_file = it->is_regular_file(entry_ec);
+            if (entry_ec) {
+                ++res.scan_errors;
+                entry_ec.clear();
+            } else if (is_file && is_fingerprint_candidate_file(it->path())) {
+                const auto fsz = it->file_size(entry_ec);
+                if (entry_ec) {
+                    ++res.scan_errors;
+                } else if (fsz <= 4ULL * 1024ULL * 1024ULL) {
+                    if (out_rel_to_sha.size() >= max_files) {
+                        res.sample_complete = false;
+                        break;
+                    }
+                    const fs::path rel = fs::relative(canonical_win32_path(it->path()), canon_root, entry_ec);
+                    if (!entry_ec && !rel.empty()) {
+                        const std::string rel_key = lower_ascii(path_text(rel));
+                        try {
+                            const std::string h = lower_ascii(hash_file(it->path()));
+                            out_rel_to_sha[rel_key] = h;
+                            out_all_sha.insert(h);
+                        } catch (...) {
+                            ++res.scan_errors;
+                        }
+                    }
+                }
+            }
         }
-        if (!it->is_regular_file(ec)) continue;
-        if (!is_fingerprint_candidate_file(it->path())) continue;
-        const auto fsz = it->file_size(ec);
-        if (ec || fsz > 4 * 1024 * 1024) continue;
-
-        const fs::path rel = fs::relative(canonical_win32_path(it->path()), canon_root, ec);
-        if (ec || rel.empty()) continue;
-        const std::string rel_key = lower_ascii(path_text(rel));
-        try {
-            const std::string h = lower_ascii(hash_file(it->path()));
-            out_rel_to_sha[rel_key] = h;
-            out_all_sha.insert(h);
-        } catch (...) {}
+        ec.clear();
+        it.increment(ec);
+        if (ec) {
+            ++res.scan_errors;
+            ec.clear();
+        }
     }
+    if (res.scan_errors > 0) {
+        res.sample_complete = false;
+    }
+    res.sampled_files_count = out_rel_to_sha.size();
+    return res;
 }
 
-std::string first_line_trimmed(const std::string& s) {
-    std::istringstream iss(s);
-    std::string line;
-    if (std::getline(iss, line)) return trim_copy(line);
-    return {};
-}
-
-ProjectFingerprint compute_project_fingerprint(const fs::path& dir) {
+ProjectFingerprint compute_project_fingerprint(const fs::path& dir, size_t max_sample_files = 250) {
     ProjectFingerprint fp;
-    const auto root_res = run_git_isolated(dir, {"rev-list", "--max-parents=0", "HEAD"}, 5000);
+    const fs::path canon_dir = canonical_win32_path(dir);
+    const fs::path eff_dir = canon_dir.empty() ? dir : canon_dir;
+
+    const auto root_res = run_git_isolated(eff_dir, {"rev-list", "--max-parents=0", "HEAD"}, 5000);
     if (root_res.exit_code == 0) fp.git_root_commit = first_line_trimmed(root_res.output);
 
-    const auto head_res = run_git_isolated(dir, {"rev-parse", "HEAD"}, 4000);
+    const auto head_res = run_git_isolated(eff_dir, {"rev-parse", "HEAD"}, 4000);
     if (head_res.exit_code == 0) fp.git_head_commit = first_line_trimmed(head_res.output);
 
-    const auto br_res = run_git_isolated(dir, {"rev-parse", "--abbrev-ref", "HEAD"}, 4000);
+    const auto br_res = run_git_isolated(eff_dir, {"rev-parse", "--abbrev-ref", "HEAD"}, 4000);
     if (br_res.exit_code == 0) fp.git_branch = first_line_trimmed(br_res.output);
 
-    const auto rem_res = run_git_isolated(dir, {"config", "--get", "remote.origin.url"}, 4000);
+    const auto rem_res = run_git_isolated(eff_dir, {"config", "--get", "remote.origin.url"}, 4000);
     if (rem_res.exit_code == 0) fp.git_remote_url = first_line_trimmed(rem_res.output);
 
-    const auto wt_res = run_git_isolated(dir, {"worktree", "list", "--porcelain"}, 5000);
+    const auto wt_res = run_git_isolated(eff_dir, {"worktree", "list", "--porcelain"}, 5000);
     if (wt_res.exit_code == 0) {
         std::istringstream iss(wt_res.output);
         std::string line;
@@ -2554,7 +3076,7 @@ ProjectFingerprint compute_project_fingerprint(const fs::path& dir) {
         }
     }
 
-    collect_dir_source_hashes(dir, fp.rel_to_sha256, fp.all_sha256s);
+    fp.sample_stats = collect_dir_source_hashes(eff_dir, fp.rel_to_sha256, fp.all_sha256s, max_sample_files);
     return fp;
 }
 
@@ -2574,6 +3096,9 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
             item["replica_path"] = cpath;
             item["path"] = cpath;
             item["is_ancestor_of_main"] = (r.value("is_ancestor_of_main", int64_t{0}) != 0);
+            item["sample_complete"] = (r.value("sample_complete", int64_t{1}) != 0);
+            item["visited_entries"] = r.value("visited_entries", int64_t{0});
+            item["sampled_files_count"] = r.value("sampled_files_count", int64_t{0});
             item["unique_files_sample"] = parse_json_safe(r.value("unique_files_sample_json", std::string{"[]"}), Json::array());
             items.push_back(std::move(item));
         }
@@ -2586,8 +3111,14 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
         };
     }
 
-    const ProjectFingerprint ref = compute_project_fingerprint(p.directory());
-    const std::string main_key = normalize_path_key(p.directory());
+    // CI-003 & AUD-MIG-P2-013: Always canonicalize repo_dir & candidates via canonical_win32_path (resolves Win32 8.3 short paths)
+    const fs::path canon_repo = canonical_win32_path(p.directory());
+    const fs::path repo_dir = canon_repo.empty() ? p.directory() : canon_repo;
+    const int max_depth = std::clamp(args.value("max_depth", 2), 1, 5);
+    const size_t max_sample_files = static_cast<size_t>(std::clamp<int64_t>(args.value("max_sample_files", int64_t{250}), 10, 5000));
+
+    const ProjectFingerprint ref = compute_project_fingerprint(repo_dir, max_sample_files);
+    const std::string main_key = normalize_path_key(repo_dir);
 
     struct CandidateItem {
         fs::path path;
@@ -2613,18 +3144,11 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
         if (cp.empty()) return;
         std::error_code ec;
         const bool exists_dir = fs::exists(native_path(cp), ec) && !ec && fs::is_directory(native_path(cp), ec);
-        std::string disp;
-        fs::path resolved_cp = cp;
-        if (exists_dir) {
-            resolved_cp = canonical_win32_path(cp);
-            if (resolved_cp.empty()) resolved_cp = cp.lexically_normal();
-            disp = canonical_path_str(resolved_cp);
-        } else {
-            resolved_cp = cp.lexically_normal();
-            disp = path_text(resolved_cp);
-            while (disp.size() > 3 && (disp.back() == '/' || disp.back() == '\\')) {
-                disp.pop_back();
-            }
+        fs::path resolved_cp = canonical_win32_path(cp);
+        if (resolved_cp.empty()) resolved_cp = cp.lexically_normal();
+        std::string disp = exists_dir ? canonical_path_str(resolved_cp) : path_text(resolved_cp);
+        while (disp.size() > 3 && (disp.back() == '/' || disp.back() == '\\')) {
+            disp.pop_back();
         }
         if (disp.empty()) return;
         if (persist_root) {
@@ -2636,7 +3160,7 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
         }
     };
 
-    add_cand(p.directory(), "main_project", false);
+    add_cand(repo_dir, "main_project", false);
 
     if (args.contains("candidate_paths") && args["candidate_paths"].is_array()) {
         for (const auto& c : args["candidate_paths"]) {
@@ -2644,7 +3168,7 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
                 const std::string raw_s = trim_copy(c.get<std::string>());
                 if (raw_s.empty()) continue;
                 fs::path fp(wide(raw_s));
-                if (fp.is_relative()) fp = p.directory() / fp;
+                if (fp.is_relative()) fp = repo_dir / fp;
                 add_cand(fp, "candidate_path", true);
             }
         }
@@ -2655,17 +3179,66 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
             const std::string raw_s = trim_copy(sr.get<std::string>());
             if (raw_s.empty()) continue;
             fs::path sr_p(wide(raw_s));
-            if (sr_p.is_relative()) sr_p = p.directory() / sr_p;
-            std::error_code ec;
-            if (!fs::exists(native_path(sr_p), ec) || !fs::is_directory(native_path(sr_p), ec)) {
+            if (sr_p.is_relative()) sr_p = repo_dir / sr_p;
+            std::error_code sr_ec;
+            if (!fs::exists(native_path(sr_p), sr_ec) || !fs::is_directory(native_path(sr_p), sr_ec)) {
                 add_cand(sr_p, "search_root", true);
                 continue;
             }
-            persist_search_root(canonical_path_str(sr_p), "search_root", true);
-            add_cand(sr_p, "search_root", false);
-            for (const auto& child : fs::directory_iterator(native_path(sr_p), ec)) {
-                if (child.is_directory(ec)) {
-                    add_cand(child.path(), "search_root_child", false);
+            const fs::path canon_sr = canonical_win32_path(sr_p);
+            const fs::path eff_sr = canon_sr.empty() ? sr_p : canon_sr;
+            persist_search_root(canonical_path_str(eff_sr), "search_root", true);
+            add_cand(eff_sr, "search_root", false);
+
+            // Breadth-first bounded directory walk up to max_depth (1..5), skipping internal subtrees
+            struct DepthDir {
+                fs::path dir;
+                int depth = 0;
+            };
+            std::vector<DepthDir> queue_dirs;
+            queue_dirs.push_back(DepthDir{eff_sr, 0});
+            std::unordered_set<std::string> walked_keys;
+            walked_keys.insert(normalize_path_key(eff_sr));
+            constexpr size_t kMaxWalkedDirs = 500;
+
+            for (size_t qi = 0; qi < queue_dirs.size() && walked_keys.size() < kMaxWalkedDirs; ++qi) {
+                const fs::path cur_dir = queue_dirs[qi].dir;
+                const int cur_depth = queue_dirs[qi].depth;
+                if (cur_depth >= max_depth) continue;
+
+                // Do not descend into internal subtrees of an already-identified repository below depth 0
+                if (cur_depth > 0) {
+                    std::error_code git_ec;
+                    if (fs::exists(native_path(cur_dir / L".git"), git_ec)) {
+                        continue;
+                    }
+                }
+
+                std::error_code dit_ec;
+                fs::directory_iterator dit(native_path(cur_dir), fs::directory_options::skip_permission_denied, dit_ec);
+                if (dit_ec) continue;
+                const fs::directory_iterator dend;
+                for (; dit != dend && walked_keys.size() < kMaxWalkedDirs; dit.increment(dit_ec)) {
+                    if (dit_ec) {
+                        dit_ec.clear();
+                        continue;
+                    }
+                    std::error_code ch_ec;
+                    if (dit->is_symlink(ch_ec) || ch_ec) continue;
+                    if (!dit->is_directory(ch_ec) || ch_ec) continue;
+
+                    const std::string dlow = lower_ascii(path_text(dit->path().filename()));
+                    if (should_skip_fingerprint_dir(dlow)) continue;
+
+                    const fs::path child_canon = canonical_win32_path(dit->path());
+                    const fs::path eff_child = child_canon.empty() ? dit->path() : child_canon;
+                    const std::string ckey = normalize_path_key(eff_child);
+                    if (ckey.empty() || !walked_keys.insert(ckey).second) continue;
+
+                    add_cand(eff_child, "search_root_child", false);
+                    if (cur_depth + 1 < max_depth) {
+                        queue_dirs.push_back(DepthDir{eff_child, cur_depth + 1});
+                    }
                 }
             }
         }
@@ -2689,6 +3262,9 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
         int64_t unique_or_mod_count = 0;
         Json unique_sample = Json::array();
         int64_t disk_bytes = 0;
+        bool sample_complete = true;
+        int64_t visited_entries = 0;
+        int64_t sampled_files_count = 0;
 
         if (!cand_item.is_online) {
             classification = "OFFLINE_DRIVE";
@@ -2706,9 +3282,12 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
                 unique_or_mod_count = prev[0].value("unique_or_modified_files_count", int64_t{0});
                 unique_sample = parse_json_safe(prev[0].value("unique_files_sample_json", std::string{"[]"}), Json::array());
                 disk_bytes = prev[0].value("disk_bytes", int64_t{0});
+                sample_complete = (prev[0].value("sample_complete", int64_t{1}) != 0);
+                visited_entries = prev[0].value("visited_entries", int64_t{0});
+                sampled_files_count = prev[0].value("sampled_files_count", int64_t{0});
             }
         } else {
-            disk_bytes = compute_bounded_dir_bytes(cand, 1200);
+            disk_bytes = static_cast<int64_t>(compute_bounded_dir_bytes(cand, 1200).bytes);
             std::error_code ec;
             const fs::path dot_git = cand / L".git";
             const bool has_git_file = fs::is_regular_file(native_path(dot_git), ec);
@@ -2723,6 +3302,9 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
                 merge_base_commit = ref.git_head_commit;
                 is_ancestor_of_main = !ref.git_head_commit.empty();
                 shared_hashes = static_cast<int64_t>(ref.rel_to_sha256.size());
+                sample_complete = ref.sample_stats.sample_complete;
+                visited_entries = static_cast<int64_t>(ref.sample_stats.visited_entries);
+                sampled_files_count = static_cast<int64_t>(ref.sample_stats.sampled_files_count);
             } else {
                 if (has_git_file || has_git_dir) {
                     const auto r1 = run_git_isolated(cand, {"rev-list", "--max-parents=0", "HEAD"}, 4000);
@@ -2737,7 +3319,10 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
 
                 std::unordered_map<std::string, std::string> cand_rel_to_sha;
                 std::unordered_set<std::string> cand_all_sha;
-                collect_dir_source_hashes(cand, cand_rel_to_sha, cand_all_sha);
+                const SourceSampleResult cand_sample = collect_dir_source_hashes(cand, cand_rel_to_sha, cand_all_sha, max_sample_files);
+                sample_complete = cand_sample.sample_complete;
+                visited_entries = static_cast<int64_t>(cand_sample.visited_entries);
+                sampled_files_count = static_cast<int64_t>(cand_sample.sampled_files_count);
 
                 int64_t matching_rel_paths = 0;
                 for (const auto& [rel, sha] : cand_rel_to_sha) {
@@ -2777,7 +3362,7 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
 
                 if ((classification == "RELATED_WORKTREE" || classification == "POSSIBLE_CLONE") &&
                     !ref.git_head_commit.empty() && !c_head.empty()) {
-                    const auto mb_res = run_git_isolated(p.directory(), {"merge-base", ref.git_head_commit, c_head}, 4000);
+                    const auto mb_res = run_git_isolated(repo_dir, {"merge-base", ref.git_head_commit, c_head}, 4000);
                     if (mb_res.exit_code == 0) {
                         merge_base_commit = first_line_trimmed(mb_res.output);
                         is_ancestor_of_main = (!merge_base_commit.empty() && lower_ascii(merge_base_commit) == lower_ascii(c_head));
@@ -2790,8 +3375,9 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
             INSERT INTO discovered_project_replicas (
                 replica_id, candidate_path, classification, git_root_commit, git_head_commit,
                 git_branch, git_remote_url, shared_file_hashes_count, unique_or_modified_files_count,
-                unique_files_sample_json, disk_bytes, discovered_at_utc, merge_base_commit, is_ancestor_of_main
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                unique_files_sample_json, disk_bytes, discovered_at_utc, merge_base_commit, is_ancestor_of_main,
+                sample_complete, visited_entries, sampled_files_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(replica_id) DO UPDATE SET
                 candidate_path=excluded.candidate_path,
                 classification=excluded.classification,
@@ -2805,11 +3391,15 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
                 disk_bytes=excluded.disk_bytes,
                 discovered_at_utc=excluded.discovered_at_utc,
                 merge_base_commit=excluded.merge_base_commit,
-                is_ancestor_of_main=excluded.is_ancestor_of_main
+                is_ancestor_of_main=excluded.is_ancestor_of_main,
+                sample_complete=excluded.sample_complete,
+                visited_entries=excluded.visited_entries,
+                sampled_files_count=excluded.sampled_files_count
         )SQL", {
             rep_id, cand_str, classification, c_root, c_head,
             c_branch, c_remote, shared_hashes, unique_or_mod_count,
-            unique_sample.dump(), disk_bytes, ts, merge_base_commit, is_ancestor_of_main ? 1 : 0
+            unique_sample.dump(), disk_bytes, ts, merge_base_commit, is_ancestor_of_main ? 1 : 0,
+            sample_complete ? 1 : 0, visited_entries, sampled_files_count
         });
 
         items.push_back({
@@ -2829,6 +3419,9 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
             {"unique_or_modified_files_count", unique_or_mod_count},
             {"unique_files_sample", unique_sample},
             {"disk_bytes", disk_bytes},
+            {"sample_complete", sample_complete},
+            {"visited_entries", visited_entries},
+            {"sampled_files_count", sampled_files_count},
             {"discovered_at_utc", ts}
         });
     }
@@ -2837,6 +3430,7 @@ Json tool_discover_replicas(const Project& p, Database& db, const Json& args) {
         {"schema", "migratool.discover_replicas/1"},
         {"ok", true},
         {"action", action},
+        {"max_depth", max_depth},
         {"total_discovered", items.size()},
         {"replicas", items}
     };
@@ -2859,6 +3453,170 @@ std::string file_mtime_utc_iso(const fs::path& fp) {
                   static_cast<unsigned>(st.wHour), static_cast<unsigned>(st.wMinute), static_cast<unsigned>(st.wSecond),
                   static_cast<unsigned>(st.wMilliseconds));
     return std::string(buf);
+}
+
+std::string normalize_iso_utc_ms(std::string s) {
+    s = trim_copy(std::move(s));
+    if (s.size() < 19) return s;
+    if (s.size() == 20 && s[19] == 'Z') {
+        return s.substr(0, 19) + ".000Z";
+    }
+    if (s.size() > 20 && s[19] == '.' && s.back() == 'Z') {
+        std::string frac = s.substr(20, s.size() - 21);
+        if (frac.size() < 3) frac.append(3 - frac.size(), '0');
+        else if (frac.size() > 3) frac.resize(3);
+        return s.substr(0, 19) + "." + frac + "Z";
+    }
+    return s;
+}
+
+std::string normalize_suite_token(const std::string& raw) {
+    std::string tok = lower_ascii(trim_copy(raw));
+    if (tok.empty()) return {};
+    for (char& c : tok) {
+        if (c == '\\') c = '/';
+    }
+    const size_t slash = tok.find_last_of('/');
+    std::string base = (slash != std::string::npos) ? tok.substr(slash + 1) : tok;
+    if (base.ends_with(".exe")) base.resize(base.size() - 4);
+    else if (base.ends_with(".cpp")) base.resize(base.size() - 4);
+    return base;
+}
+
+bool token_matches_suite(const std::string& raw_tok, const std::string& suite_low) {
+    if (suite_low.empty()) return false;
+    std::string tok = lower_ascii(trim_copy(raw_tok));
+    if (tok.empty()) return false;
+    for (char& c : tok) {
+        if (c == '\\') c = '/';
+    }
+    const std::string suite_with_tests = suite_low.ends_with("_tests") ? suite_low : (suite_low + "_tests");
+    const std::string suite_base = suite_low.ends_with("_tests") ? suite_low.substr(0, suite_low.size() - 6) : suite_low;
+    if (tok == suite_low || tok == suite_with_tests || (!suite_base.empty() && tok == suite_base)) {
+        return true;
+    }
+    const std::string base = normalize_suite_token(tok);
+    return base == suite_low || base == suite_with_tests || (!suite_base.empty() && base == suite_base);
+}
+
+bool ctest_regex_matches_suite(const std::string& regex_pat, const std::string& suite_low) {
+    if (regex_pat.empty() || suite_low.empty()) return false;
+    const std::string suite_with_tests = suite_low.ends_with("_tests") ? suite_low : (suite_low + "_tests");
+    const std::string suite_base = suite_low.ends_with("_tests") ? suite_low.substr(0, suite_low.size() - 6) : suite_low;
+    size_t start = 0;
+    while (start <= regex_pat.size()) {
+        const size_t bar = regex_pat.find('|', start);
+        std::string part = (bar == std::string::npos) ? regex_pat.substr(start) : regex_pat.substr(start, bar - start);
+        part = lower_ascii(trim_copy(part));
+        if (!part.empty() && part.front() == '(' && part.back() == ')') {
+            part = trim_copy(part.substr(1, part.size() - 2));
+        }
+        while (!part.empty() && part.front() == '^') part.erase(part.begin());
+        while (!part.empty() && part.back() == '$') part.pop_back();
+        if (part == suite_low || part == suite_with_tests || (!suite_base.empty() && part == suite_base)) {
+            return true;
+        }
+        if (bar == std::string::npos) break;
+        start = bar + 1;
+    }
+    return false;
+}
+
+bool verified_run_targets_suite(const Json& vr_row, const std::string& suite_name) {
+    const std::string suite_low = lower_ascii(trim_copy(suite_name));
+    if (suite_low.empty() || !vr_row.is_object()) return false;
+
+    // 1. Structured match against selected_targets_json (JSON array only)
+    const Json targets = Json::parse(vr_row.value("selected_targets_json", std::string{}), nullptr, false);
+    if (targets.is_array()) {
+        for (const auto& t : targets) {
+            if (t.is_string() && token_matches_suite(t.get<std::string>(), suite_low)) {
+                return true;
+            }
+        }
+    }
+
+    // 2. Structured match against command_json (JSON argv array only; never search stdout/stderr/cwd/dump)
+    const Json cmd = Json::parse(vr_row.value("command_json", std::string{}), nullptr, false);
+    if (cmd.is_array() && !cmd.empty() && cmd[0].is_string()) {
+        const std::string exe_base = normalize_suite_token(cmd[0].get<std::string>());
+        if (exe_base == "ctest") {
+            bool has_include_regex = false;
+            std::string include_pat;
+            std::string exclude_pat;
+            for (size_t i = 1; i < cmd.size(); ++i) {
+                if (!cmd[i].is_string()) continue;
+                const std::string arg = trim_copy(cmd[i].get<std::string>());
+                if ((arg == "-R" || arg == "--tests-regex") && i + 1 < cmd.size() && cmd[i + 1].is_string()) {
+                    has_include_regex = true;
+                    include_pat = trim_copy(cmd[++i].get<std::string>());
+                } else if (arg.starts_with("-R") && arg.size() > 2) {
+                    has_include_regex = true;
+                    include_pat = trim_copy(arg.substr(2));
+                } else if (arg.starts_with("--tests-regex=")) {
+                    has_include_regex = true;
+                    include_pat = trim_copy(arg.substr(14));
+                } else if ((arg == "-E" || arg == "--exclude-regex") && i + 1 < cmd.size() && cmd[i + 1].is_string()) {
+                    exclude_pat = trim_copy(cmd[++i].get<std::string>());
+                } else if (arg.starts_with("--exclude-regex=")) {
+                    exclude_pat = trim_copy(arg.substr(16));
+                }
+            }
+            if (!exclude_pat.empty() && ctest_regex_matches_suite(exclude_pat, suite_low)) {
+                return false;
+            }
+            if (!has_include_regex) {
+                return true;
+            }
+            return ctest_regex_matches_suite(include_pat, suite_low);
+        }
+
+        for (const auto& argv_el : cmd) {
+            if (argv_el.is_string() && token_matches_suite(argv_el.get<std::string>(), suite_low)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+struct VerifiedRunOutcome {
+    int64_t exit_code = 1;
+    int64_t passed_cnt = 0;
+    int64_t failed_cnt = 0;
+    bool tests_detected = false;
+    bool passed = false;
+};
+
+VerifiedRunOutcome evaluate_verified_run_outcome(const Json& vr_row) {
+    VerifiedRunOutcome o;
+    if (!vr_row.is_object()) return o;
+    o.exit_code = vr_row.value("exit_code", int64_t{1});
+    o.passed_cnt = vr_row.contains("passed_count")
+        ? vr_row.value("passed_count", int64_t{0})
+        : vr_row.value("passed_cnt", int64_t{0});
+    o.failed_cnt = vr_row.contains("failed_count")
+        ? vr_row.value("failed_count", int64_t{0})
+        : vr_row.value("failed_cnt", int64_t{0});
+    const std::string st = upper_ascii(vr_row.value("status", std::string{}));
+    o.tests_detected = vr_row.contains("tests_detected")
+        ? json_bool_or_int(vr_row, "tests_detected", false)
+        : (st != "NO_TESTS_DETECTED" && (o.passed_cnt > 0 || o.failed_cnt > 0));
+    const bool status_ok = st.empty() || st == "PASSED" || st == "PASS" || st == "OK";
+    o.passed = (o.exit_code == 0) && o.tests_detected && (o.passed_cnt > 0) && (o.failed_cnt == 0) && status_ok;
+    return o;
+}
+
+bool verified_run_covers_suite(const Json& vr_row, const std::string& suite_name, const std::string& repo_head_commit = "") {
+    if (!verified_run_targets_suite(vr_row, suite_name)) return false;
+    const VerifiedRunOutcome out = evaluate_verified_run_outcome(vr_row);
+    if (!out.passed) return false;
+    const std::string vr_git_head = lower_ascii(trim_copy(vr_row.value("git_head", std::string{})));
+    const std::string repo_head_low = lower_ascii(trim_copy(repo_head_commit));
+    if (!repo_head_low.empty() && !vr_git_head.empty() && vr_git_head != repo_head_low) {
+        return false;
+    }
+    return true;
 }
 
 fs::path find_master_prd_json(const Project& p, const Json& args, fs::path* out_repo_root = nullptr) {
@@ -2978,18 +3736,28 @@ void sync_prd_into_sqlite(const Project& p, Database& db, const Json& args) {
 
         const Json impl_files = req.value("implementation_files", Json::array());
         const Json test_suites = req.value("test_suites", Json::array());
-        const std::string primary_suite = (!test_suites.empty() && test_suites[0].is_string())
-            ? test_suites[0].get<std::string>()
-            : std::string{};
-        const std::string primary_suite_low = lower_ascii(primary_suite);
+        std::vector<std::string> req_suites;
+        for (const auto& sv : test_suites) {
+            if (sv.is_string()) {
+                const std::string s = trim_copy(sv.get<std::string>());
+                if (!s.empty()) req_suites.push_back(s);
+            }
+        }
+        const std::string primary_suite = req_suites.empty() ? std::string{} : req_suites[0];
 
+        // AUD-MIG-P1-011: Structured matching via selected_targets_json & command_json (never vr.dump())
         Json matched_run = Json::object();
-        if (!vruns.empty()) {
+        std::string matched_suite;
+        if (!vruns.empty() && !req_suites.empty()) {
             for (const auto& vr : vruns) {
-                if (primary_suite_low.empty() || lower_ascii(vr.dump()).find(primary_suite_low) != std::string::npos) {
-                    matched_run = vr;
-                    break;
+                for (const auto& s : req_suites) {
+                    if (verified_run_targets_suite(vr, s)) {
+                        matched_run = vr;
+                        matched_suite = s;
+                        break;
+                    }
                 }
+                if (!matched_run.empty()) break;
             }
         }
 
@@ -3024,7 +3792,7 @@ void sync_prd_into_sqlite(const Project& p, Database& db, const Json& args) {
             std::string file_mtime_iso;
             if (exists) {
                 const auto fsz = fs::file_size(native_path(resolved), ec);
-                if (!ec && fsz < 8 * 1024 * 1024) {
+                if (!ec && fsz < 8ULL * 1024ULL * 1024ULL) {
                     try { f_sha = hash_file(resolved); } catch (...) {}
                 }
                 file_mtime_iso = file_mtime_utc_iso(resolved);
@@ -3045,30 +3813,33 @@ void sync_prd_into_sqlite(const Project& p, Database& db, const Json& args) {
 
             std::string last_test_status = "NO_TEST_EVIDENCE";
             std::string last_test_run_id;
-            std::string post_change_status = "NO_TEST_EVIDENCE";
+            std::string post_change_status = exists ? "NO_TEST_EVIDENCE" : "FILE_MISSING";
 
             if (!matched_run.empty()) {
                 last_test_run_id = matched_run.value("run_id", matched_run.value("id", std::string{}));
                 const std::string run_ts = matched_run.value(
-                    "created_at", matched_run.value("at_iso", matched_run.value("created_at_utc", std::string{})));
-                const int64_t passed_cnt = matched_run.value("passed_count", int64_t{0});
-                bool run_ok = false;
-                if (matched_run.contains("ok")) {
-                    run_ok = json_bool_or_int(matched_run, "ok", false);
-                } else if (matched_run.contains("status")) {
-                    const std::string st = upper_ascii(matched_run.value("status", std::string{}));
-                    run_ok = (st == "PASSED" || st == "PASS" || st == "OK");
-                } else if (matched_run.contains("exit_code")) {
-                    run_ok = (matched_run.value("exit_code", int64_t{-1}) == 0);
-                }
+                    "finished_at",
+                    matched_run.value("at_iso",
+                        matched_run.value("created_at",
+                            matched_run.value("created_at_utc", std::string{}))));
+                const VerifiedRunOutcome outcome = evaluate_verified_run_outcome(matched_run);
+                const bool covers_at_head = verified_run_covers_suite(matched_run, matched_suite, repo_head_commit);
 
-                if (run_ok && passed_cnt > 0) {
+                if (outcome.passed) {
                     last_test_status = "PASSED";
-                    if (!file_mtime_iso.empty() && !run_ts.empty() && file_mtime_iso > run_ts) {
+                    if (!exists) {
+                        post_change_status = "FILE_MISSING";
+                    } else if (!covers_at_head) {
+                        post_change_status = "UNVERIFIED_COMMIT_MISMATCH";
+                    } else if (!file_mtime_iso.empty() && !run_ts.empty() &&
+                               normalize_iso_utc_ms(file_mtime_iso) > normalize_iso_utc_ms(run_ts)) {
                         post_change_status = "STALE_AFTER_EDIT";
                     } else {
                         post_change_status = "VERIFIED_CURRENT";
                     }
+                } else if (outcome.exit_code == 0 && (!outcome.tests_detected || outcome.passed_cnt <= 0)) {
+                    last_test_status = "NO_TESTS_DETECTED";
+                    post_change_status = exists ? "NO_TEST_EVIDENCE" : "FILE_MISSING";
                 } else {
                     last_test_status = "FAILED";
                     post_change_status = "FAILED";
@@ -3285,10 +4056,26 @@ Json tool_project_health(const Project& p, Database& db, const Json& args) {
 
     const int64_t total_reqs = db.integer("SELECT COUNT(*) FROM product_requirements");
     const int64_t total_links = db.integer("SELECT COUNT(*) FROM requirement_trace_links");
-    const int64_t verified_links = db.integer("SELECT COUNT(*) FROM requirement_trace_links WHERE file_exists = 1");
-    const double coverage_pct = (total_links > 0)
-        ? (100.0 * static_cast<double>(verified_links) / static_cast<double>(total_links))
+    const int64_t file_presence_count = db.integer("SELECT COUNT(*) FROM requirement_trace_links WHERE file_exists = 1");
+    const int64_t test_verified_links_count = db.integer(
+        "SELECT COUNT(*) FROM requirement_trace_links WHERE file_exists = 1 AND post_change_status = 'VERIFIED_CURRENT'");
+    const double file_presence_pct = (total_links > 0)
+        ? (100.0 * static_cast<double>(file_presence_count) / static_cast<double>(total_links))
         : 0.0;
+    const double verified_coverage_pct = (total_links > 0)
+        ? (100.0 * static_cast<double>(test_verified_links_count) / static_cast<double>(total_links))
+        : 0.0;
+    const Json requirements_traceability = {
+        {"total_requirements", total_reqs},
+        {"traced_files_count", total_links},
+        {"total_links", total_links},
+        {"file_presence_count", file_presence_count},
+        {"file_presence_pct", file_presence_pct},
+        {"test_verified_links_count", test_verified_links_count},
+        {"verified_coverage_pct", verified_coverage_pct},
+        {"verified_links_count", test_verified_links_count},
+        {"coverage_pct", verified_coverage_pct}
+    };
 
     const int64_t session_pendings_open_count = db.integer("SELECT COUNT(*) FROM session_pendings WHERE status='OPEN'");
     const Json session_pendings_summary = {
@@ -3334,12 +4121,8 @@ Json tool_project_health(const Project& p, Database& db, const Json& args) {
         {"session_pendings_open_count", session_pendings_open_count},
         {"session_pendings_summary", session_pendings_summary},
         {"code_audit_summary", code_audit_summary},
-        {"requirements_coverage", {
-            {"total_requirements", total_reqs},
-            {"traced_files_count", total_links},
-            {"verified_links_count", verified_links},
-            {"coverage_pct", coverage_pct}
-        }}
+        {"requirements_traceability", requirements_traceability},
+        {"requirements_coverage", requirements_traceability}
     };
 }
 

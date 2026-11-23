@@ -12,29 +12,34 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Setup .NET SDK (Roslyn Adapter)
-        uses: actions/setup-dotnet@v4
+      - name: Setup .NET 10 SDK (Roslyn Adapter)
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
-          dotnet-version: |
-            8.0.x
-            10.0.x
+          dotnet-version: 10.0.x
 
       - name: Setup MSVC Developer Command Prompt
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
-      - name: Install vcpkg dependencies (nlohmann-json, sqlite3[fts5,json1], libzip)
+      - name: Install pinned vcpkg manifest dependencies (nlohmann-json, sqlite3[fts5,json1], libzip)
         shell: pwsh
         run: |
-          vcpkg install nlohmann-json:x64-windows "sqlite3[fts5,json1]:x64-windows" libzip:x64-windows
+          $vcpkgRoot = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:\vcpkg" }
+          $baseline = "db4723bd0a99eab031f1a3dee4336dca43049c87"
+          git -C $vcpkgRoot cat-file -e "$baseline^{commit}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            git -C $vcpkgRoot fetch origin $baseline
+            if ($LASTEXITCODE -ne 0) { git -C $vcpkgRoot fetch --unshallow origin }
+          }
+          vcpkg install --triplet x64-windows --x-manifest-root="${{ github.workspace }}" --x-install-root="${{ github.workspace }}/vcpkg_installed"
 
       - name: Configure CMake (release preset)
         shell: pwsh
         run: |
-          cmake --preset release -DVCPKG_ROOT="$env:VCPKG_INSTALLATION_ROOT"
+          cmake --preset release
 
       - name: Build Migratool CLI, GUI, RoslynAdapter & All Test Targets
         shell: pwsh

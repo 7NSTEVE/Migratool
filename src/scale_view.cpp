@@ -10,6 +10,7 @@
 #include "migratool/workstream.hpp"
 #include "migratool/multiagent_coordinator.hpp"
 #include "migratool/code_audit.hpp"
+#include <atomic>
 #include <commctrl.h>
 #include <condition_variable>
 #include <mutex>
@@ -109,10 +110,13 @@ struct ScaleView::Impl {
     std::vector<std::string> cursors;std::string cursor,next_cursor,target_cursor,next_target_cursor,filter,parent,root,selected_source,pending_reason,dev_state,last_roots_key;bool linked_only=false,target_selected=false;
     struct Folder {std::string root,path,cursor;bool loaded=false;};std::map<HTREEITEM,Folder> folders;uint64_t navigation=0;
     struct Task{uint64_t ticket;std::function<Payload()> run;};
-    std::mutex mutex;std::condition_variable_any ready;std::optional<Task> pending;std::deque<Task> actions;std::jthread worker;uint64_t sequence=0,settled_sequence=0;
-    Impl():worker([this](std::stop_token stop){while(!stop.stop_requested()){Task task{};{std::unique_lock lock(mutex);ready.wait(lock,stop,[&]{return pending.has_value()||!actions.empty();});if(stop.stop_requested())break;if(!actions.empty()){task=std::move(actions.front());actions.pop_front();}else{task=std::move(*pending);pending.reset();}}
-        auto result=std::make_unique<Payload>();try{*result=task.run();}catch(const std::exception& e){result->sequence=task.ticket;result->error=e.what();}if(hwnd&&PostMessageW(hwnd,WM_ROWS,0,reinterpret_cast<LPARAM>(result.get())))result.release();}}){}
-    ~Impl(){worker.request_stop();ready.notify_all();if(worker.joinable())worker.join();MSG message{};while(hwnd&&PeekMessageW(&message,hwnd,WM_ROWS,WM_ROWS,PM_REMOVE))delete reinterpret_cast<Payload*>(message.lParam);DeleteObject(background);DeleteObject(surface);}
+    std::mutex mutex;std::condition_variable_any ready;std::optional<Task> pending;std::deque<Task> actions;std::atomic<bool> stopping{false};std::jthread worker;uint64_t sequence=0,settled_sequence=0;
+    Impl():worker([this](std::stop_token stop){while(!stop.stop_requested()&&!stopping.load()){Task task{};{std::unique_lock lock(mutex);ready.wait(lock,stop,[&]{return stopping.load()||pending.has_value()||!actions.empty();});if(stop.stop_requested()||stopping.load())break;if(!actions.empty()){task=std::move(actions.front());actions.pop_front();}else{task=std::move(*pending);pending.reset();}}
+        if(stop.stop_requested()||stopping.load())break;
+        auto result=std::make_unique<Payload>();try{*result=task.run();}catch(const std::exception& e){result->sequence=task.ticket;result->error=e.what();}if(!stopping.load()&&hwnd&&PostMessageW(hwnd,WM_ROWS,0,reinterpret_cast<LPARAM>(result.get())))result.release();}}){}
+    void request_stop_worker(){stopping.store(true);{std::lock_guard lock(mutex);pending.reset();actions.clear();}worker.request_stop();ready.notify_all();}
+    void stop_worker(){request_stop_worker();if(worker.joinable())worker.join();}
+    ~Impl(){stop_worker();MSG message{};while(hwnd&&PeekMessageW(&message,hwnd,WM_ROWS,WM_ROWS,PM_REMOVE))delete reinterpret_cast<Payload*>(message.lParam);DeleteObject(background);DeleteObject(surface);}
     int px(int n)const{return MulDiv(n,dpi,96);}
     HWND make(const wchar_t* cls,const wchar_t* title,DWORD style,int id){auto h=CreateWindowExW(0,cls,title,WS_CHILD|WS_VISIBLE|style,0,0,10,10,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);SendMessageW(h,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);if(wcscmp(cls,L"STATIC")!=0&&wcscmp(cls,L"BUTTON")!=0)ui::name(h,title);return h;}
     void sync_root_options(){
@@ -249,10 +253,10 @@ struct ScaleView::Impl {
         int pager_y=y+actual_available+gap;int pager_x=left;
         for(auto item:{previous,next,next_target})if(GetWindowLongPtrW(item,GWL_STYLE)&WS_VISIBLE){int button_width=std::min((width-gap*2)/3,ui::type_size(18,dpi)*10);ui::move_if(item,pager_x,pager_y,button_width,control);pager_x+=button_width+gap;}
         if(inspector)ui::move_if(detail,0,height-detail_height,width,detail_height);
-        update_controls();InvalidateRect(hwnd,nullptr,TRUE);
+        update_controls();InvalidateRect(hwnd,nullptr,FALSE);
     }
     HTREEITEM add_folder(HTREEITEM parent_item,const std::wstring& name,const Folder& folder,bool children=true){TVINSERTSTRUCTW insert{};insert.hParent=parent_item;insert.hInsertAfter=TVI_LAST;insert.item.mask=TVIF_TEXT|TVIF_CHILDREN;insert.item.cChildren=children?1:0;insert.item.pszText=const_cast<wchar_t*>(name.c_str());auto item=TreeView_InsertItem(tree,&insert);folders[item]=folder;return item;}
-    void request_tree(HTREEITEM item){if(!project||!folders.contains(item)||folders[item].loaded)return;auto folder=folders[item];folders[item].loaded=true;const auto p=*project;const auto nav=navigation;
+    void request_tree(HTREEITEM item){if(stopping.load()||!project||!folders.contains(item)||folders[item].loaded)return;auto folder=folders[item];folders[item].loaded=true;const auto p=*project;const auto nav=navigation;
         {std::lock_guard lock(mutex);actions.push_back({0,[=](){Payload out;out.tree_parent=item;out.navigation=nav;Database db(p);Json args={{"kind","directories"},{"root",folder.root},{"parent",folder.path},{"limit",200},{"include_total",false}};if(!folder.cursor.empty())args["cursor"]=folder.cursor;out.tree=*scale_query(p,db,args);return out;}});}ready.notify_one();}
     void setup_columns(HWND table,const Json& values,std::vector<std::string>& names){
         if(values.empty()){ListView_SetItemCountEx(table,0,LVSICF_NOSCROLL);return;}
@@ -335,7 +339,7 @@ struct ScaleView::Impl {
         }
         ListView_SetItemCountEx(table,static_cast<int>(values.size()),LVSICF_NOSCROLL);
     }
-    void request(){if(!project)return;reading=true;SetTimer(hwnd,2,150,nullptr);const auto p=*project;const auto view=page;const auto query_cursor=cursor,target_after=target_cursor;const auto query_filter=filter,query_parent=parent,query_root=root,source=selected_source,reason=pending_reason,query_dev_state=dev_state;const int query_depth=depth,query_dev_kind=dev_kind;const bool linked_targets=linked_only,query_non_source=include_non_source;const auto ticket=++sequence;
+    void request(){if(stopping.load()||!project)return;reading=true;SetTimer(hwnd,2,150,nullptr);const auto p=*project;const auto view=page;const auto query_cursor=cursor,target_after=target_cursor;const auto query_filter=filter,query_parent=parent,query_root=root,source=selected_source,reason=pending_reason,query_dev_state=dev_state;const int query_depth=depth,query_dev_kind=dev_kind;const bool linked_targets=linked_only,query_non_source=include_non_source;const auto ticket=++sequence;
         {std::lock_guard lock(mutex);pending=Task{ticket,[=](){Payload result;result.sequence=ticket;Database db(p);Json args={{"limit",200},{"include_total",false}};if(!query_cursor.empty())args["cursor"]=query_cursor;if(!query_filter.empty())args["text"]=query_filter;
             if(view==16)result.left=scale_jobs(p,{{"limit",100}});
             else if(view==17){args["kind"]="census_entries";args["with_coverage"]=true;if(!query_root.empty())args["root"]=query_root;args["parent"]=query_parent;result.left=*scale_query(p,db,args);Json roots=Json::array();for(const auto& r:p.config["roots"])roots.push_back({{"id",r["id"]},{"path",path_text(p.resolve(r["path"]))}});result.tree=roots;
@@ -662,9 +666,13 @@ struct ScaleView::Impl {
                     std::string post_st=str_or(r,"post_change_status");
                     if(post_st.empty()){
                         const auto links=r.value("trace_links",Json::array());
-                        bool all_ok=!links.empty();
-                        for(const auto& lk:links)if(lk.value("file_exists",0)==0){all_ok=false;break;}
-                        post_st=all_ok?"VERIFIED_CURRENT":"PENDING_VALIDATION";
+                        bool all_files_exist=!links.empty();
+                        bool all_verified=!links.empty();
+                        for(const auto& lk:links){
+                            if(lk.value("file_exists",0)==0){all_files_exist=false;all_verified=false;break;}
+                            if(str_or(lk,"post_change_status")!="VERIFIED_CURRENT"){all_verified=false;}
+                        }
+                        post_st=all_verified?"VERIFIED_CURRENT":(all_files_exist?"FILE_PRESENT_UNVERIFIED":"PENDING_VALIDATION");
                     }
                     const std::string rid=str_or(r,"req_id");
                     items.push_back({
@@ -682,7 +690,7 @@ struct ScaleView::Impl {
                     });
                 }
                 if(items.empty()&&query_filter.empty()){
-                    items.push_back({{"id","REQ-MASTER"},{"req_id","REQ-MASTER"},{"title","Especificación maestra del producto inicializada"},{"category","ARCHITECTURE"},{"priority","P0"},{"status","CONFIRMED"},{"invariants_count",int64_t{1}},{"traced_files","docs/PRODUCT_REQUIREMENTS_MASTER.json"},{"test_suite","multiagent_coordinator_tests"},{"post_change_status","VERIFIED_CURRENT"},{"summary","Sincronice docs/PRODUCT_REQUIREMENTS_MASTER.json con tool_project_health."}});
+                    items.push_back({{"id","REQ-MASTER"},{"req_id","REQ-MASTER"},{"title","Especificación maestra del producto pendiente de sincronizar"},{"category","ARCHITECTURE"},{"priority","P0"},{"status","PENDING"},{"invariants_count",int64_t{1}},{"traced_files","docs/PRODUCT_REQUIREMENTS_MASTER.json"},{"test_suite","multiagent_coordinator_tests"},{"post_change_status","PENDING_VALIDATION"},{"summary","Sincronice docs/PRODUCT_REQUIREMENTS_MASTER.json con tool_project_health."}});
                 }
                 result.left={{"items",items}};
                 result.caption="Especificación maestra (PRODUCT_REQUIREMENTS_MASTER) · "+std::to_string(items.size())+" requisito(s)";
@@ -704,7 +712,7 @@ struct ScaleView::Impl {
                         {"triage_status",str_or(f,"triage_status","CONFIRMED")},
                         {"qualified_name",str_or(f,"qualified_name",str_or(f,"function_name","—"))},
                         {"cyclomatic_complexity",f.value("cyclomatic_complexity",int64_t{1})},
-                        {"analysis_source",str_or(f,"analysis_source","syntactic_ast")},
+                        {"analysis_source",str_or(f,"analysis_source","syntactic_tokens")},
                         {"file_path",str_or(f,"file_path",str_or(f,"path"))},
                         {"summary",str_or(f,"message",str_or(f,"summary"))}
                     });
@@ -725,7 +733,7 @@ struct ScaleView::Impl {
                         {"function_name",str_or(fn,"function_name",qname)},
                         {"qualified_name",qname},
                         {"cyclomatic_complexity",cc},
-                        {"analysis_source",str_or(fn,"analysis_source","syntactic_ast")},
+                        {"analysis_source",str_or(fn,"analysis_source","syntactic_tokens")},
                         {"file_path",str_or(fn,"file_path",str_or(fn,"path"))},
                         {"summary","Complejidad ciclomática AST = "+std::to_string(cc)+" ("+std::to_string(fn.value("line_count",int64_t{0}))+" líneas)"}
                     });
@@ -739,7 +747,7 @@ struct ScaleView::Impl {
                         {"triage_status","VERIFIED_CURRENT"},
                         {"qualified_name","Caché AST incremental"},
                         {"cyclomatic_complexity",int64_t{0}},
-                        {"analysis_source","syntactic_ast"},
+                        {"analysis_source","clang_ast"},
                         {"file_path",path_text(p.directory())},
                         {"summary","0 hallazgos pendientes y caché incremental al día."}
                     });
@@ -831,11 +839,11 @@ struct ScaleView::Impl {
     }
     void copy_paths(){int index=ListView_GetNextItem(target_selected?targets:list,-1,LVNI_SELECTED);const auto& data=target_selected?target_rows:rows;if(index<0||static_cast<size_t>(index)>=data.size())return;const auto& item=data[index];std::wstring text;for(const auto* key:{"source_path","absolute_path","output_path"})if(item.contains(key)&&item[key].is_string()){auto path=wide(item[key]);if(!path.empty()&&text.find(path)==std::wstring::npos)text+=path+L"\r\n";}if(item.contains("target_paths"))for(const auto& path:item["target_paths"])text+=wide(path)+L"\r\n";if(text.empty())text=control_text(detail);
         if(OpenClipboard(hwnd)){EmptyClipboard();auto memory=GlobalAlloc(GMEM_MOVEABLE,(text.size()+1)*sizeof(wchar_t));if(memory){auto bytes=GlobalLock(memory);memcpy(bytes,text.c_str(),(text.size()+1)*sizeof(wchar_t));GlobalUnlock(memory);if(!SetClipboardData(CF_UNICODETEXT,memory))GlobalFree(memory);}CloseClipboard();}}
-    void sync_folder(){if(!project)return;std::string target_root=root,target_sub=parent.empty()?".":parent;
+    void sync_folder(){if(stopping.load()||!project)return;std::string target_root=root,target_sub=parent.empty()?".":parent;
         if(page==17){int at=ListView_GetNextItem(list,-1,LVNI_SELECTED);if(at>=0&&static_cast<size_t>(at)<rows.size()&&rows[at].value("kind",std::string())=="directory"){target_root=rows[at].value("root",target_root);target_sub=rows[at].value("path",target_sub);if(target_sub.empty())target_sub=".";}}
         if(target_root.empty())return;
         const auto p=*project;auto scope=Json{{"root",target_root},{"subdirectory",target_sub}};const auto ticket=++sequence;{std::lock_guard lock(mutex);actions.push_back({ticket,[=](){auto job=scale_start(p,{{"scope",scope},{"actor","GUI"}});Payload out;out.sequence=ticket;out.refresh_after=true;out.caption="Recorrido de carpeta iniciado: "+job["job_id"].get<std::string>();out.left=Json::object();return out;}});}ready.notify_one();}
-    void control_job(const std::string& action){if(!project||page!=16)return;int at=ListView_GetNextItem(list,-1,LVNI_SELECTED);if(at<0||static_cast<size_t>(at)>=rows.size())return;auto id=display(rows[at]["id"]);if(id.empty())return;auto p=*project;auto ticket=++sequence;
+    void control_job(const std::string& action){if(stopping.load()||!project||page!=16)return;int at=ListView_GetNextItem(list,-1,LVNI_SELECTED);if(at<0||static_cast<size_t>(at)>=rows.size())return;auto id=display(rows[at]["id"]);if(id.empty())return;auto p=*project;auto ticket=++sequence;
         {std::lock_guard lock(mutex);actions.push_back({ticket,[=](){Payload out;scale_control(p,{{"id",id},{"action",action},{"actor","GUI"}});out.sequence=ticket;out.left=scale_jobs(p,{{"limit",100}});out.caption="Control de trabajo: "+action;return out;}});}ready.notify_one();}
     static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){auto* self=reinterpret_cast<Impl*>(GetWindowLongPtrW(w,GWLP_USERDATA));if(msg==WM_NCCREATE){self=static_cast<Impl*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);self->hwnd=w;SetWindowLongPtrW(w,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(self));}if(!self)return DefWindowProcW(w,msg,wp,lp);
         try{switch(msg){case WM_SIZE:self->layout();return 0;
@@ -967,17 +975,24 @@ void ScaleView::show(const Project& p,int page,const std::string& filter){
     if(changed_view||s.filter!=filter){s.cursor.clear();s.cursors.clear();s.target_cursor.clear();s.next_cursor.clear();s.next_target_cursor.clear();}
     if(changed_view){
         s.parent.clear();if(page!=1&&!s.keep_context)s.root.clear();s.keep_context=false;s.selected_source.clear();s.target_selected=false;++s.navigation;s.folders.clear();
-        if(TreeView_GetCount(s.tree)>0){TreeView_DeleteAllItems(s.tree);}
+        if(TreeView_GetCount(s.tree)>0){
+            if(page!=17)ui::show_if(s.tree,false);
+            SendMessageW(s.tree,WM_SETREDRAW,FALSE,0);
+            TreeView_DeleteAllItems(s.tree);
+            SendMessageW(s.tree,WM_SETREDRAW,TRUE,0);
+        }
         s.replacing_rows=true;
-        if(!s.rows.empty()){if(s.list)SendMessageW(s.list,WM_SETREDRAW,FALSE,0);ListView_SetItemCountEx(s.list,0,0);if(s.list)SendMessageW(s.list,WM_SETREDRAW,TRUE,0);}
-        if(!s.target_rows.empty()){if(s.targets)SendMessageW(s.targets,WM_SETREDRAW,FALSE,0);ListView_SetItemCountEx(s.targets,0,0);if(s.targets)SendMessageW(s.targets,WM_SETREDRAW,TRUE,0);}
+        if(!s.rows.empty()){ListView_SetItemCountEx(s.list,0,LVSICF_NOINVALIDATEALL|LVSICF_NOSCROLL);}
+        if(!s.target_rows.empty()){ListView_SetItemCountEx(s.targets,0,LVSICF_NOINVALIDATEALL|LVSICF_NOSCROLL);}
         s.replacing_rows=false;
         s.rows=Json::array();s.target_rows=Json::array();ui::show_if(s.empty,false);
         SetWindowTextW(s.caption,L"Preparando esta vista…");
     }
+    const bool was_visible=(GetWindowLongPtrW(s.hwnd,GWL_STYLE)&WS_VISIBLE)!=0;
     s.project=p;s.page=page;s.filter=filter;
     if(changed_view)s.sync_root_options();
-    ui::show_if(s.hwnd,true);s.layout();
+    ui::show_if(s.hwnd,true);
+    if(changed_view||!was_visible)s.layout();
     s.request();
 }
 void ScaleView::refresh(){impl_->request();}
@@ -989,4 +1004,6 @@ bool ScaleView::settled()const{return !impl_->reading&&impl_->sequence==impl_->s
 void ScaleView::set_filter_context(const std::string& root_id,const std::string& filter_text){
     auto& s=*impl_;s.keep_context=true;s.root=root_id;s.filter=filter_text;s.cursor.clear();s.cursors.clear();s.sync_root_options();
 }
+void ScaleView::request_stop(){impl_->request_stop_worker();}
+void ScaleView::stop(){impl_->stop_worker();}
 }

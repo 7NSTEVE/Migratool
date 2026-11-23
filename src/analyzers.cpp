@@ -2,12 +2,15 @@
 #include "migratool/gateway.hpp"
 #include "migratool/ast_engine.hpp"
 #include "migratool/analysis_context.hpp"
+#include "migratool/clang_bridge.hpp"
 #include <clang-c/Index.h>
 #include <algorithm>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <unordered_map>
 #include <regex>
 #include <cctype>
 #include <shellapi.h>
@@ -216,9 +219,11 @@ void merge_result(Json& scan, Json& file, const Json& result, const std::string&
     }
 }
 
-// libclang mantiene el parser nativo fuera de proceso de construcción y evita AST JSON de gran tamaño.
+// libclang mantiene el parser nativo en proceso con vida de proceso (CI-001: nunca llamar
+// FreeLibrary sobre libclang.dll en LLVM 20/21 Windows para evitar 0xC0000005 en destructores TLS/ManagedStatic).
 struct Clang {
     HMODULE dll{};
+    fs::path loaded_path;
 #define MT_CLANG_FUNCS(X) \
     X(clang_createIndex) X(clang_disposeIndex) X(clang_parseTranslationUnit2) X(clang_disposeTranslationUnit) \
     X(clang_getTranslationUnitCursor) X(clang_visitChildren) X(clang_getCursorLocation) X(clang_getSpellingLocation) \
@@ -230,7 +235,8 @@ struct Clang {
     X(clang_getCursorExtent) X(clang_getRangeStart) X(clang_getRangeEnd) X(clang_getCursorReferenced) \
     X(clang_CXXMethod_isVirtual) X(clang_CXXMethod_isPureVirtual) X(clang_CXXMethod_isStatic) \
     X(clang_getOverriddenCursors) X(clang_disposeOverriddenCursors) X(clang_equalCursors) X(clang_Cursor_isNull) \
-    X(clang_Cursor_getSpellingNameRange) X(clang_getIncludedFile) X(clang_getInclusions)
+    X(clang_Cursor_getSpellingNameRange) X(clang_getIncludedFile) X(clang_getInclusions) \
+    X(clang_tokenize) X(clang_disposeTokens) X(clang_getTokenSpelling) X(clang_getTokenKind)
 #define FIELD(fn) decltype(&fn) fn##_p{};
     MT_CLANG_FUNCS(FIELD)
 #undef FIELD
@@ -245,22 +251,39 @@ struct Clang {
         candidates.push_back(fs::path(MIGRATOOL_CLANG_DLL).make_preferred());
         for (const auto& cand : candidates) {
             std::error_code ec;
-            if (!cand.empty() && fs::exists(cand, ec)) {
+            if (!cand.empty() && fs::exists(native_path(cand), ec)) {
                 dll = LoadLibraryExW(cand.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-                if (dll) break;
+                if (dll) {
+                    loaded_path = cand;
+                    break;
+                }
             }
         }
         if (!dll) dll = LoadLibraryW(L"libclang.dll");
         if (!dll) throw std::runtime_error("libclang no disponible en su ruta configurada");
+        if (loaded_path.empty()) {
+            std::wstring mod_buf(32768, L'\0');
+            DWORD got = GetModuleFileNameW(dll, mod_buf.data(), static_cast<DWORD>(mod_buf.size()));
+            if (got > 0 && got < mod_buf.size()) {
+                mod_buf.resize(got);
+                loaded_path = fs::path(mod_buf);
+            }
+        }
 #define LOAD(fn) fn##_p = reinterpret_cast<decltype(fn##_p)>(GetProcAddress(dll,#fn)); if (!fn##_p) throw std::runtime_error("libclang sin " #fn);
         MT_CLANG_FUNCS(LOAD)
 #undef LOAD
     }
-    ~Clang() { if(dll) FreeLibrary(dll); }
-    std::string str(CXString s) { auto p=clang_getCString_p(s); std::string out = p?p:""; clang_disposeString_p(s); return out; }
+    // Intentionally leak process-lifetime HMODULE so LLVM's ManagedStatic/atexit/TLS handlers never run after unmap.
+    ~Clang() = default;
+    std::string str(CXString s) const { auto p=clang_getCString_p(s); std::string out = p?p:""; clang_disposeString_p(s); return out; }
 };
 
-std::string qualified_cursor_name(Clang& c, CXCursor cur) {
+const Clang& shared_clang() {
+    static const Clang instance;
+    return instance;
+}
+
+std::string qualified_cursor_name(const Clang& c, CXCursor cur) {
     auto q = c.str(c.clang_getCursorSpelling_p(cur));
     if (q.empty()) return q;
     auto parent = c.clang_getCursorSemanticParent_p(cur);
@@ -282,7 +305,7 @@ struct EnclosingScope {
 };
 
 struct Visit {
-    Clang* c;
+    const Clang* c;
     Json* scan;
     std::map<std::string,Json*>* files;
     std::map<std::string,std::string>* contents;
@@ -1406,8 +1429,16 @@ Json analyze(const Project& p, Json s, Log log, Cancel* cancel) {
         if(log) log("Clang: "+std::to_string(cpp.size())+" archivos C/C++");
         std::string clang_phase="load";
         try {
-            Clang c; auto index=c.clang_createIndex_p(1,0); std::set<std::string> ids, ref_positions;
-            s["clang"]={{"version",c.str(c.clang_getClangVersion_p())},{"library_sha256",hash_file(MIGRATOOL_CLANG_DLL)}};
+            const Clang& c = shared_clang();
+            struct IndexGuard {
+                const Clang* c{};
+                CXIndex idx{};
+                ~IndexGuard() { if (idx && c) c->clang_disposeIndex_p(idx); }
+            } index_guard{&c, c.clang_createIndex_p(1, 0)};
+            std::set<std::string> ids, ref_positions;
+            const std::string lib_hash = (!c.loaded_path.empty() && fs::exists(native_path(c.loaded_path)))
+                ? hash_file(c.loaded_path) : std::string();
+            s["clang"] = {{"version", c.str(c.clang_getClangVersion_p())}, {"library_sha256", lib_hash}};
             struct RootCompileDb {
                 std::map<std::string, Json> entries;
                 std::string path;
@@ -1434,11 +1465,11 @@ Json analyze(const Project& p, Json s, Log log, Cancel* cancel) {
             size_t clang_processed = 0;
             for(auto* f:cpp) {
                 clang_phase="file "+f->value("absolute_path",std::string("<null>"));
-                if(cancel && cancel->requested) { c.clang_disposeIndex_p(index); throw std::runtime_error("Análisis cancelado"); }
+                if(cancel && cancel->requested) { throw std::runtime_error("Análisis cancelado"); }
                 // Recycle CXIndex every 64 translation units to bound libclang internal arena memory and prevent Win32 1450
                 if (clang_processed > 0 && (clang_processed % 64) == 0) {
-                    c.clang_disposeIndex_p(index);
-                    index = c.clang_createIndex_p(1, 0);
+                    c.clang_disposeIndex_p(index_guard.idx);
+                    index_guard.idx = c.clang_createIndex_p(1, 0);
                 }
                 ++clang_processed;
                 auto ext=lower(path_text(fs::path(wide(f->at("path"))).extension()));
@@ -1481,9 +1512,14 @@ Json analyze(const Project& p, Json s, Log log, Cancel* cancel) {
                 (*f)["compile_flags_sha256"]=sha256(Json(args).dump());
                 std::vector<const char*> argv; for(auto& a:args) argv.push_back(a.c_str());
                 CXTranslationUnit tu{};
-                auto rc=c.clang_parseTranslationUnit2_p(index,f->at("absolute_path").get_ref<const std::string&>().c_str(),argv.data(),static_cast<int>(argv.size()),nullptr,0,
+                auto rc=c.clang_parseTranslationUnit2_p(index_guard.idx,f->at("absolute_path").get_ref<const std::string&>().c_str(),argv.data(),static_cast<int>(argv.size()),nullptr,0,
                     CXTranslationUnit_DetailedPreprocessingRecord | CXTranslationUnit_KeepGoing,&tu);
                 if(rc!=CXError_Success || !tu) { (*f)["analysis"]="ERROR"; (*f)["analysis_error"]="Clang parse error "+std::to_string(rc); s["diagnostics"].push_back(diagnostic(f->at("absolute_path"),"Clang parse error "+std::to_string(rc))); continue; }
+                struct TuGuard {
+                    const Clang* c{};
+                    CXTranslationUnit u{};
+                    ~TuGuard() { if (u && c) c->clang_disposeTranslationUnit_p(u); }
+                } tu_guard{&c, tu};
                 bool errors=false;
                 for(unsigned i=0;i<c.clang_getNumDiagnostics_p(tu);++i) {
                     auto d=c.clang_getDiagnostic_p(tu,i);
@@ -1496,7 +1532,7 @@ Json analyze(const Project& p, Json s, Log log, Cancel* cancel) {
                 Visit context{&c,&s,&by_path,&cpp_contents,&ids,&ref_positions,{},cancel};
                 c.clang_visitChildren_p(c.clang_getTranslationUnitCursor_p(tu),visitor,&context);
                 struct InclusionCtx {
-                    Clang* c;
+                    const Clang* c;
                     Json* deps;
                     const std::vector<fs::path>* roots;
                     std::string file_id;
@@ -1534,9 +1570,7 @@ Json analyze(const Project& p, Json s, Log log, Cancel* cancel) {
                     });
                 },&inc_ctx);
                 (*f)["analysis"]=errors?"PARTIAL":"ANALYZED";
-                c.clang_disposeTranslationUnit_p(tu);
             }
-            c.clang_disposeIndex_p(index);
         } catch(const std::exception& e) { for(auto* f:cpp){if((*f)["analysis"]=="PENDING"){(*f)["analysis"]="ERROR";(*f)["analysis_error"]=clang_phase+": "+e.what();}}s["diagnostics"].push_back(diagnostic("Clang",clang_phase+": "+e.what())); }
     }
     std::set<std::string> unique; Json symbols=Json::array();
@@ -1584,5 +1618,176 @@ Json suggestions(const Project& p, const Json& s) {
         }
     }
     return out;
+}
+
+bool extract_cpp_functions_libclang(
+    const fs::path& file_path,
+    const std::vector<std::string>& compile_args,
+    std::vector<ClangAstFunction>& out_functions,
+    std::string& out_clang_version,
+    std::string& out_error) {
+    out_functions.clear();
+    out_error.clear();
+    try {
+        const Clang& c = shared_clang();
+        out_clang_version = c.str(c.clang_getClangVersion_p());
+
+        struct IndexGuard {
+            const Clang* c{};
+            CXIndex idx{};
+            ~IndexGuard() { if (idx && c) c->clang_disposeIndex_p(idx); }
+        } index_guard{&c, c.clang_createIndex_p(1, 0)};
+        if (!index_guard.idx) {
+            out_error = "clang_createIndex devolvió nulo";
+            return false;
+        }
+
+        const fs::path target_canon = canonical_win32_path(file_path);
+        const std::string target_low = lower(path_text(target_canon));
+        const std::string target_utf8 = path_text(target_canon);
+
+        std::vector<const char*> argv;
+        argv.reserve(compile_args.size());
+        for (const auto& a : compile_args) argv.push_back(a.c_str());
+
+        CXTranslationUnit tu{};
+        // Skip function bodies inside included system/STL/SDK headers (preamble) while
+        // parsing 100% of the main file's real C/C++ AST and function bodies for complexity.
+        const unsigned parse_opts =
+            CXTranslationUnit_KeepGoing |
+            CXTranslationUnit_Incomplete |
+            CXTranslationUnit_SkipFunctionBodies |
+            CXTranslationUnit_LimitSkipFunctionBodiesToPreamble;
+        const auto rc = c.clang_parseTranslationUnit2_p(
+            index_guard.idx,
+            target_utf8.c_str(),
+            argv.data(),
+            static_cast<int>(argv.size()),
+            nullptr,
+            0,
+            parse_opts,
+            &tu);
+        if (rc != CXError_Success || !tu) {
+            out_error = "clang_parseTranslationUnit2 falló con código " + std::to_string(static_cast<int>(rc));
+            return false;
+        }
+        struct TuGuard {
+            const Clang* c{};
+            CXTranslationUnit u{};
+            ~TuGuard() { if (u && c) c->clang_disposeTranslationUnit_p(u); }
+        } tu_guard{&c, tu};
+
+        struct AstExtractCtx {
+            const Clang* c{};
+            CXTranslationUnit tu{};
+            std::string target_low;
+            std::vector<ClangAstFunction>* out{};
+            std::set<std::string> seen;
+            std::unordered_map<CXFile, bool> file_is_target;
+        } ctx{&c, tu, target_low, &out_functions, {}, {}};
+
+        auto visit_fn = [](CXCursor cur, CXCursor, CXClientData opaque) -> CXChildVisitResult {
+            auto* ex = static_cast<AstExtractCtx*>(opaque);
+            const Clang& cl = *ex->c;
+            CXFile file{};
+            unsigned line = 0, col = 0, offset = 0;
+            cl.clang_getSpellingLocation_p(cl.clang_getCursorLocation_p(cur), &file, &line, &col, &offset);
+            if (!file) return CXChildVisit_Continue;
+
+            auto [fit, inserted] = ex->file_is_target.try_emplace(file, false);
+            if (inserted) {
+                const std::string fraw = cl.str(cl.clang_getFileName_p(file));
+                if (!fraw.empty()) {
+                    std::string fnorm;
+                    try {
+                        fnorm = lower(path_text(canonical_win32_path(fs::path(wide(fraw)))));
+                    } catch (...) {
+                        fnorm = lower(fraw);
+                    }
+                    fit->second = (fnorm == ex->target_low);
+                }
+            }
+            if (!fit->second) return CXChildVisit_Continue;
+
+            const CXCursorKind kind = cl.clang_getCursorKind_p(cur);
+            const bool is_func = (kind == CXCursor_FunctionDecl ||
+                                  kind == CXCursor_CXXMethod ||
+                                  kind == CXCursor_Constructor ||
+                                  kind == CXCursor_Destructor ||
+                                  kind == CXCursor_ConversionFunction ||
+                                  kind == CXCursor_FunctionTemplate);
+            if (is_func && cl.clang_isCursorDefinition_p(cur)) {
+                CXSourceRange extent = cl.clang_getCursorExtent_p(cur);
+                unsigned start_line = line, end_line = line, tmp_col = 0, tmp_off = 0;
+                CXFile sf{}, ef{};
+                cl.clang_getSpellingLocation_p(cl.clang_getRangeStart_p(extent), &sf, &start_line, &tmp_col, &tmp_off);
+                cl.clang_getSpellingLocation_p(cl.clang_getRangeEnd_p(extent), &ef, &end_line, &tmp_col, &tmp_off);
+                if (end_line < start_line) end_line = start_line;
+
+                std::string qname = qualified_cursor_name(cl, cur);
+                std::string disp = cl.str(cl.clang_getCursorDisplayName_p(cur));
+                if (qname.empty()) qname = disp;
+                const std::string dedup_key = qname + "|" + disp + "|" + std::to_string(start_line);
+                if (ex->seen.insert(dedup_key).second) {
+                    // Compute genuine AST cyclomatic complexity:
+                    // 1 + AST branch statement nodes + logical &&/|| tokens from libclang lexer (ignoring strings/comments).
+                    struct BranchCounter {
+                        const Clang* c{};
+                        int branches = 0;
+                    } bc{&cl, 0};
+                    cl.clang_visitChildren_p(cur, [](CXCursor child, CXCursor, CXClientData data) -> CXChildVisitResult {
+                        auto* b = static_cast<BranchCounter*>(data);
+                        const CXCursorKind ck = b->c->clang_getCursorKind_p(child);
+                        switch (ck) {
+                            case CXCursor_IfStmt:
+                            case CXCursor_ForStmt:
+                            case CXCursor_CXXForRangeStmt:
+                            case CXCursor_WhileStmt:
+                            case CXCursor_DoStmt:
+                            case CXCursor_CaseStmt:
+                            case CXCursor_CXXCatchStmt:
+                            case CXCursor_ConditionalOperator:
+                                ++b->branches;
+                                break;
+                            default:
+                                break;
+                        }
+                        return CXChildVisit_Recurse;
+                    }, &bc);
+
+                    CXToken* tokens = nullptr;
+                    unsigned num_tokens = 0;
+                    cl.clang_tokenize_p(ex->tu, extent, &tokens, &num_tokens);
+                    if (tokens && num_tokens > 0) {
+                        for (unsigned ti = 0; ti < num_tokens; ++ti) {
+                            if (cl.clang_getTokenKind_p(tokens[ti]) == CXToken_Punctuation) {
+                                const std::string tok = cl.str(cl.clang_getTokenSpelling_p(ex->tu, tokens[ti]));
+                                if (tok == "&&" || tok == "||") ++bc.branches;
+                            }
+                        }
+                        cl.clang_disposeTokens_p(ex->tu, tokens, num_tokens);
+                    }
+
+                    ClangAstFunction fn;
+                    fn.qualified_name = qname;
+                    fn.display_name = disp;
+                    fn.kind = cl.str(cl.clang_getCursorKindSpelling_p(kind));
+                    fn.signature = cl.str(cl.clang_getTypeSpelling_p(cl.clang_getCursorType_p(cur)));
+                    fn.start_line = static_cast<int>(start_line);
+                    fn.end_line = static_cast<int>(end_line);
+                    fn.cyclomatic_complexity = 1 + bc.branches;
+                    fn.is_definition = true;
+                    ex->out->push_back(std::move(fn));
+                }
+            }
+            return CXChildVisit_Recurse;
+        };
+
+        c.clang_visitChildren_p(c.clang_getTranslationUnitCursor_p(tu), visit_fn, &ctx);
+        return true;
+    } catch (const std::exception& e) {
+        out_error = e.what();
+        return false;
+    }
 }
 }

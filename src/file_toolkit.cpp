@@ -36,11 +36,14 @@ fs::path resolve_authorized_path(const Project& p, const std::string& raw_path,
     if (raw_path.empty()) throw std::runtime_error("Ruta vacía");
     fs::path input(wide(raw_path));
     if (input.is_absolute()) {
-        fs::path canon = fs::weakly_canonical(input);
         for (const auto& r : p.config["roots"]) {
             if (!req_root.empty() && r["id"] != req_root) continue;
-            fs::path rbase = p.resolve(r["path"]);
-            if (within(canon, rbase)) {
+            fs::path rbase = canonical_win32_path(p.resolve(r["path"]));
+            const bool direct_ok = is_path_within_dir(input, rbase, /*allow_equal=*/false, /*reject_reparse=*/true);
+            fs::path canon = canonical_win32_path(input);
+            const bool canon_ok = !direct_ok && !has_reparse_point_in_chain(input, rbase) &&
+                                  is_path_within_dir(canon, rbase, /*allow_equal=*/false, /*reject_reparse=*/true);
+            if (direct_ok || canon_ok) {
                 if (must_exist && !fs::is_regular_file(native_path(canon)))
                     throw std::runtime_error("Archivo no existe: " + path_text(canon));
                 if (out_root_key) *out_root_key = r["id"].get<std::string>();
@@ -48,21 +51,22 @@ fs::path resolve_authorized_path(const Project& p, const std::string& raw_path,
                 return canon;
             }
         }
-        throw std::runtime_error("PATH_OUTSIDE_WORKSPACE: la ruta está fuera de las raíces autorizadas: " + raw_path);
+        throw std::runtime_error("PATH_OUTSIDE_WORKSPACE: la ruta está fuera de las raíces autorizadas o cruza un reparse point: " + raw_path);
     }
 
-    // Relative path: search matching root
+    // Relative path: search matching root with strict Win32 physical confinement + reparse rejection
     for (const auto& r : p.config["roots"]) {
         if (!req_root.empty() && r["id"] != req_root) continue;
-        fs::path rbase = p.resolve(r["path"]);
-        fs::path candidate = fs::weakly_canonical(rbase / input);
-        if (!within(candidate, rbase)) {
+        fs::path rbase = canonical_win32_path(p.resolve(r["path"]));
+        fs::path candidate = rbase / input;
+        if (!is_path_within_dir(candidate, rbase, /*allow_equal=*/false, /*reject_reparse=*/true)) {
             throw std::runtime_error("PATH_TRAVERSAL_DENIED: " + raw_path);
         }
-        if (!must_exist || fs::is_regular_file(native_path(candidate))) {
+        fs::path canon = canonical_win32_path(candidate);
+        if (!must_exist || fs::is_regular_file(native_path(canon))) {
             if (out_root_key) *out_root_key = r["id"].get<std::string>();
-            if (out_rel) *out_rel = normalize_rel_ft(path_text(candidate.lexically_relative(rbase)));
-            return candidate;
+            if (out_rel) *out_rel = normalize_rel_ft(path_text(canon.lexically_relative(rbase)));
+            return canon;
         }
     }
     throw std::runtime_error("FILE_NOT_FOUND: " + raw_path);

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "migratool",
+  "version": "3.1.0",
+  "description": "Migratool — AI Agent Project OS, Multi-Agent Worktree/Build Coordinator, and Continuous Audit Engine",
+  "builtin-baseline": "db4723bd0a99eab031f1a3dee4336dca43049c87",
+  "dependencies": [
+    "nlohmann-json",
+    {
+      "name": "sqlite3",
+      "features": [
+        "fts5",
+        "json1"
+      ]
+    },
+    "libzip"
+  ]
+}

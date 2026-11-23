@@ -404,16 +404,19 @@ bool is_path_within_dir(const fs::path& candidate, const fs::path& dir, bool all
     auto check_prefix = [&](const fs::path& c, const fs::path& d) -> bool {
         auto ci = c.begin();
         auto di = d.begin();
-        for (; di != d.end(); ++di, ++ci) {
-            if (di->empty() || *di == L".") {
-                if (ci != c.end() && (ci->empty() || *ci == L".")) continue;
-                --ci;
-                continue;
-            }
+        auto skip_trivial = [](const fs::path& p, fs::path::const_iterator& it) {
+            while (it != p.end() && (it->empty() || *it == L".")) ++it;
+        };
+        for (;;) {
+            skip_trivial(d, di);
+            skip_trivial(c, ci);
+            if (di == d.end()) break;
             if (ci == c.end() || !equal_path_segment(*ci, *di)) return false;
+            ++di;
+            ++ci;
         }
-        bool exact = (ci == c.end()) || (std::next(ci) == c.end() && (ci->empty() || *ci == L"."));
-        if (exact) return allow_equal;
+        skip_trivial(c, ci);
+        if (ci == c.end()) return allow_equal;
         return true;
     };
 

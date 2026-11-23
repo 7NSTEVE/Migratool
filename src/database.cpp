@@ -193,6 +193,7 @@ COMMIT;
         }
         if (integer("PRAGMA user_version") < 6) {
             acquire_write_lock();
+            struct UnlockSchema { Database* self; ~UnlockSchema() { self->release_write_lock(); } } unlock_schema{this};
             if (integer("PRAGMA user_version") < 6) {
                 if (version >= 1) {
                     const auto dest = p.state_dir()/wide("schema-v"+std::to_string(version)+"-"+unique_id()+".sqlite");
@@ -207,7 +208,6 @@ COMMIT;
                 }
                 scale_schema(*this);
             }
-            release_write_lock();
         }
         const bool missing_claims = integer("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_claims'") == 0;
         const bool missing_dev = integer("SELECT COUNT(*) FROM meta WHERE key='dev_control_schema' AND value='2'") == 0 ||
@@ -317,25 +317,42 @@ Json Database::query(const std::string& sql, const Json& params) const {
     return rows;
 }
 void Database::each(const std::string& sql,const Json& params,const std::function<bool(const Json&)>& visit) const {
-    auto stmt = prepare(db_, sql, params);
-    struct Finalize { sqlite3_stmt* value; ~Finalize(){sqlite3_finalize(value);} } cleanup{stmt};
-    int rc;
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        Json row = Json::object();
-        for (int i = 0; i < sqlite3_column_count(stmt); ++i) {
-            auto name = sqlite3_column_name(stmt, i);
-            switch (sqlite3_column_type(stmt, i)) {
-                case SQLITE_NULL: row[name] = nullptr; break;
-                case SQLITE_INTEGER: row[name] = sqlite3_column_int64(stmt, i); break;
-                case SQLITE_FLOAT: row[name] = sqlite3_column_double(stmt, i); break;
-                default:
-                    row[name] = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, i)),
-                                            static_cast<size_t>(sqlite3_column_bytes(stmt, i)));
+    const auto start = GetTickCount64();
+    unsigned backoff_ms = 25;
+    for (int attempt = 0;; ++attempt) {
+        bool yielded_any = false;
+        try {
+            auto stmt = prepare(db_, sql, params);
+            struct Finalize { sqlite3_stmt* value; ~Finalize(){sqlite3_finalize(value);} } cleanup{stmt};
+            int rc;
+            while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+                yielded_any = true;
+                Json row = Json::object();
+                for (int i = 0; i < sqlite3_column_count(stmt); ++i) {
+                    auto name = sqlite3_column_name(stmt, i);
+                    switch (sqlite3_column_type(stmt, i)) {
+                        case SQLITE_NULL: row[name] = nullptr; break;
+                        case SQLITE_INTEGER: row[name] = sqlite3_column_int64(stmt, i); break;
+                        case SQLITE_FLOAT: row[name] = sqlite3_column_double(stmt, i); break;
+                        default:
+                            row[name] = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, i)),
+                                                    static_cast<size_t>(sqlite3_column_bytes(stmt, i)));
+                    }
+                }
+                if(!visit(row))return;
             }
+            if (rc != SQLITE_DONE) throw SqlError(rc, db_);
+            return;
+        } catch (const SqlError& e) {
+            if (!yielded_any && is_busy_or_locked(e.code) &&
+                (GetTickCount64() - start) < static_cast<ULONGLONG>(write_timeout_ms) && attempt < 16) {
+                Sleep(backoff_ms);
+                backoff_ms = std::min<unsigned>(backoff_ms * 2, 1000u);
+                continue;
+            }
+            throw;
         }
-        if(!visit(row))return;
     }
-    if (rc != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(db_));
 }
 
 int64_t Database::integer(const std::string& sql, const Json& params) const {

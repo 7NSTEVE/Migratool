@@ -213,9 +213,9 @@ int mcp_server(const std::optional<Project>& initial_project, const std::string&
                     {"capabilities", {{"tools", {{"listChanged", false}}}}},
                     {"serverInfo", {{"name", "migratool"}, {"version", build_identity()["version"]}}},
                     {"instructions",
-                     "Migratool v3.0 — AI Agent Project OS (Continuidad de Sesiones 7 etapas + Libro Mayor Epistémico + Docs Hub + Linaje FRN + Inventario Host D:\\DevTools + Ultra-Escala 6M+ archivos + Organización Transaccional WAL + LSP + Migraciones). "
-                     "Flujo recomendado (3-4 llamadas por tarea): agent_wake (arranque con verificación viva disco/Git, workstreams, alertas knowledge y cola DAG) -> repo_map / read_bundle (hasta 25 archivos con dedup known_sha256 y pitfalls) -> batch_edit (7 etapas PREPARED..COMMITTED con snapshot e idempotency_key) -> run_verified (inyección toolchain env_tools + select_tests + destilador de errores). "
-                     "Perfiles MCP: --profile agent-os (~7.5 KB, -89% tokens esquema/turno) y --profile full (~18.2 KB, -73%). "
+                     "Migratool v3.1.0 — AI Agent Project OS & Multi-Agent Worktree/Build/Audit Coordinator (Worktrees 4 estados IMPLEMENTED..DELIVERED + Integración git merge-tree + Manifiestos Inmutables + Auditoría Técnica Incremental libclang + Continuidad de Sesiones 7 etapas + Libro Mayor Epistémico + Docs Hub + Linaje FRN + Inventario Host D:\\DevTools + Ultra-Escala 6M+ archivos + Organización Transaccional WAL + LSP + Migraciones). "
+                     "Flujo recomendado: agent_wake / project_resume (verificación viva disco/Git, worktrees, pendings y alertas) -> repo_map / read_bundle -> batch_edit (7 etapas PREPARED..COMMITTED con snapshot) -> run_verified -> code_audit(gate_check/verify_claim) -> integrate_ready / build_canonical. "
+                     "Perfiles MCP: --profile agent-os y --profile full. "
                      "env_tools funciona con o sin proyecto activo. Lecturas concurrentes habilitadas (hasta 4 en paralelo sobre SQLite WAL)."}
                 });
                 continue;

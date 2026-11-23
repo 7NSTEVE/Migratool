@@ -490,7 +490,7 @@ struct App {
     HBRUSH background_brush{},surface_brush{};
     int hovered=-1,content_left=252,content_width=900,title_y=24,title_width=600,title_height=40,cards_y=145,cards_height=88,cards_columns=4;
     std::optional<Project> project;Json scan_data,summary;std::vector<std::string> selected_ids;
-    std::jthread worker,poll_worker;std::mutex poll_mutex;std::condition_variable_any poll_cv;std::optional<std::function<void()>> poll_pending;std::unique_ptr<IndexWatcher> watcher;Cancel cancel;bool busy=false,closing=false;int page=0,dpi=96;
+    std::jthread worker,poll_worker;std::mutex poll_mutex;std::condition_variable_any poll_cv;std::optional<std::function<void(std::stop_token)>> poll_pending;std::unique_ptr<IndexWatcher> watcher;Cancel cancel;bool busy=false,closing=false,nav_hidden_once=false;int page=0,dpi=96;
     ComparisonView comparison;
     ScaleView scalable_view;
     bool durable=false;
@@ -645,7 +645,7 @@ struct App {
         });InvalidateRect(window,nullptr,TRUE);
     }
     void finish_open(OpenProjectResult& result,bool discovered){
-        loading=false;set_busy(false);if(closing){if(!polling)DestroyWindow(window);return;}
+        loading=false;set_busy(false);if(closing){if(IsWindow(window))DestroyWindow(window);return;}
         if(!result.error.empty()){log("No se pudo abrir el proyecto: "+result.error);return;}
         project=std::move(result.project);scan_data=std::move(result.scan);summary=std::move(result.summary);durable=result.durable;displayed_revision=result.revision;gui_session=std::move(result.session);last_activity_id=0;
         for(size_t i=0;i<project_paths.size();++i)if(same_path(project->file,project_paths[i])){SendMessageW(project_selector,CB_SETCURSEL,i,0);break;}
@@ -666,25 +666,30 @@ struct App {
         if(!poll_worker.joinable()){
             poll_worker=std::jthread([this](std::stop_token stop){
                 while(!stop.stop_requested()){
-                    std::function<void()> fn;
+                    std::function<void(std::stop_token)> fn;
                     {std::unique_lock lk(poll_mutex);poll_cv.wait(lk,stop,[&]{return poll_pending.has_value();});if(stop.stop_requested())break;fn=std::move(*poll_pending);poll_pending.reset();}
-                    if(fn)fn();
+                    if(fn&&!stop.stop_requested())fn(stop);
                 }
             });
         }
         {
             std::lock_guard lk(poll_mutex);
-            poll_pending=[target,current_project,epoch,previous_revision,after,read_catalog,jobs_visible]{
+            poll_pending=[target,current_project,epoch,previous_revision,after,read_catalog,jobs_visible](std::stop_token stop){
+                if(stop.stop_requested())return;
                 auto result=std::make_unique<ProjectPoll>();result->epoch=epoch;
                 try{
                     result->registry=registered_projects();
+                    if(stop.stop_requested())return;
                     result->registry_signature=result->registry.dump();
                     result->projects_signature=result->registry.value("projects",Json::array()).dump();
                     if(current_project){
                         result->activity=project_activity_delta(current_project->file,after);
+                        if(stop.stop_requested())return;
                         if(read_catalog){
                             auto current=Project::load(current_project->file);
+                            if(stop.stop_requested())return;
                             Database db(current);
+                            if(stop.stop_requested())return;
                             result->revision=db.revision();
                             const bool config_changed=current.revision!=current_project->revision;
                             result->update_catalog=config_changed||result->revision!=previous_revision;
@@ -695,7 +700,7 @@ struct App {
                                 }
                             }
                             result->export_jobs=db.query("SELECT id,state,phase,files,error,scope FROM inventory_jobs WHERE generation=0 AND json_extract(scope,'$.kind')='export_inventory' ORDER BY created DESC LIMIT 10");
-                            if(result->update_catalog){
+                            if(result->update_catalog&&!stop.stop_requested()){
                                 result->durable=scale_enabled(current,db);
                                 if(!result->durable){result->scan=index_snapshot(current,false);result->summary=mt::status(current,false);}
                             }
@@ -703,14 +708,14 @@ struct App {
                         }
                     }
                 }catch(const std::exception& e){result->error=e.what();}
-                if(PostMessageW(target,WM_PROJECT_POLL,0,reinterpret_cast<LPARAM>(result.get())))result.release();
+                if(!stop.stop_requested()&&PostMessageW(target,WM_PROJECT_POLL,0,reinterpret_cast<LPARAM>(result.get())))result.release();
             };
         }
         poll_cv.notify_one();
     }
     void finish_poll(ProjectPoll& update){
         polling=false;
-        if(closing){if(!busy)DestroyWindow(window);return;}
+        if(closing)return;
         if(update.epoch!=project_epoch||loading){if(!loading&&!closing)poll_live();return;}
         if(!update.error.empty())log("No se pudo actualizar la vista. Se reintentará: "+update.error);
         if(!update.registry.is_object())return;
@@ -748,10 +753,17 @@ struct App {
         if(page==16||page==17)displayed_jobs_signature=update.jobs_signature;
         jobs_were_active=update.active_jobs;
         if(project&&update.update_catalog&&!busy&&update.error.empty()){
+            const bool proj_cfg_updated=update.updated_project.has_value();
+            const bool was_durable=durable;
             if(update.updated_project)project=std::move(update.updated_project);
             displayed_revision=update.revision;durable=update.durable;
             if(!durable){scan_data=std::move(update.scan);summary=std::move(update.summary);}
-            refresh_view();
+            const bool scaled_now=(durable||page>=16)&&page!=13&&page!=14&&page!=20;
+            if(scaled_now&&was_durable&&!proj_cfg_updated){
+                if(page!=29)scalable_view.refresh();
+            }else{
+                refresh_view();
+            }
         }else if(refresh_jobs&&(page==16||page==17)&&!busy)scalable_view.refresh();
         if(project&&update.export_jobs.is_array()){
             for(const auto& ej:update.export_jobs){
@@ -791,17 +803,17 @@ struct App {
         if(refreshing)return;ViewGuard guard(refreshing);
         update_cards();
         update_navigation();
-        if(!project&&page==0){ShowWindow(scalable_view.window(),SW_HIDE);ShowWindow(comparison.window(),SW_HIDE);ShowWindow(list,SW_HIDE);SetWindowTextW(subtitle,loading?L"Preparando el catálogo en segundo plano…":L"Empiece creando un proyecto o abra uno que ya estén usando sus agentes.");return;}
-        if(page==20){ShowWindow(scalable_view.window(),SW_HIDE);ShowWindow(comparison.window(),SW_HIDE);ShowWindow(list,SW_SHOW);SetWindowTextW(subtitle,L"Elija qué carpetas contienen el código original y dónde se guarda el resultado.");columns({{L"Uso",140},{L"Carpeta",250},{L"Ruta completa",780}});if(project){for(const auto& root:project->config["roots"]){auto path=project->resolve(root["path"]);row({root["role"]=="source"?"Origen":"Destino",path_text(path.filename()),path_text(path)});}row({"Inventario",project->config.value("inventory_mode","universal")=="source_only"?"Solo código fuente":"Todos los archivos","El censo conserva qué se encontró y qué quedó pendiente."});}return;}
+        if(!project&&page==0){ui::show_if(scalable_view.window(),false);ui::show_if(comparison.window(),false);ui::show_if(list,false);SetWindowTextW(subtitle,loading?L"Preparando el catálogo en segundo plano…":L"Empiece creando un proyecto o abra uno que ya estén usando sus agentes.");return;}
+        if(page==20){ui::show_if(scalable_view.window(),false);ui::show_if(comparison.window(),false);ui::show_if(list,true);SetWindowTextW(subtitle,L"Elija qué carpetas contienen el código original y dónde se guarda el resultado.");columns({{L"Uso",140},{L"Carpeta",250},{L"Ruta completa",780}});if(project){for(const auto& root:project->config["roots"]){auto path=project->resolve(root["path"]);row({root["role"]=="source"?"Origen":"Destino",path_text(path.filename()),path_text(path)});}row({"Inventario",project->config.value("inventory_mode","universal")=="source_only"?"Solo código fuente":"Todos los archivos","El censo conserva qué se encontró y qué quedó pendiente."});}return;}
         const bool scaled=project&&(durable||page>=16)&&page!=13&&page!=14&&page!=20;
-        ShowWindow(scalable_view.window(),scaled?SW_SHOW:SW_HIDE);
-        if(scaled){ShowWindow(list,SW_HIDE);ShowWindow(comparison.window(),SW_HIDE);SetWindowTextW(subtitle,page_subtitle(page));scalable_view.show(*project,page,utf8(text(filter)));return;}
+        ui::show_if(scalable_view.window(),scaled);
+        if(scaled){ui::show_if(list,false);ui::show_if(comparison.window(),false);SetWindowTextW(subtitle,page_subtitle(page));scalable_view.show(*project,page,utf8(text(filter)));return;}
         const wchar_t* hints[]={L"Estado de evidencia · los conteos no equivalen a paridad funcional",L"Rutas exactas y avance ponderado por unidades declaradas",L"Declaraciones extraídas por analizadores; filtre por nombre o ruta",L"Declaraciones del agente y evidencia de los casos configurados",L"Entradas, salidas, errores y efectos observables",L"Informes importados; los valores desconocidos permanecen sin verificar",L"Historial inmutable · seleccione un archivo antes de entrar para filtrarlo",L"Todos los archivos conocidos, incluidos recursos, documentos y generados",L"Archivos nuevos, huérfanos y eliminados; el índice conserva su identidad",L"Estado Git independiente del inventario y pertenencia a la compilación",L"SQLite FTS5 · busca documentación, rutas, símbolos, notas y relaciones",L"Dependencias inventariadas; resolución por nombre único cuando es posible",L"Procesos MCP observados y volumen medido de consultas compactas"};
         SetWindowTextW(subtitle,page==13?L"Operaciones CLI, MCP y GUI · mensajes y estados actualizados automáticamente":
             page==14?L"Proyectos usados por agentes · doble clic para abrir el catálogo compartido":
             page==15?L"Copias de código con el mismo tamaño y SHA-256 · doble clic para ver la ruta completa":page<13?hints[page]:page_subtitle(page));
-        ShowWindow(list,page==1?SW_HIDE:SW_SHOW);
-        ShowWindow(comparison.window(),page==1?SW_SHOW:SW_HIDE);
+        ui::show_if(list,page!=1);
+        ui::show_if(comparison.window(),page==1);
         if(page==14){
             columns({{L"Proyecto",300},{L"Sesiones activas",130},{L"Última operación / agente",300},{L"Ruta completa del proyecto",650},{L"Última apertura UTC",210}});
             if(registry.value("projects",Json::array()).empty())row({"No hay proyectos recientes","","Cree uno nuevo o abra un proyecto existente.","",""});
@@ -926,7 +938,7 @@ struct App {
         compact=sidebar_hidden||ui::text_percent>=150||width<px(1100)||((ui::text_percent>125)&&width<px(1600));
         const int sidebar=compact?0:std::max(px(224),type_px(18)*13),left=sidebar+margin,right=margin,content=std::max(px(240),width-left-right);
         content_left=left;content_width=content;title_y=condensed?px(8):px(20);title_height=type_px(28)+px(6);
-        for(auto item:nav)ui::show_if(item,false);
+        if(!nav_hidden_once){for(auto item:nav)ui::show_if(item,false);nav_hidden_once=true;}
         const int nav_top=px(112),nav_height=std::max(px(44),label_height+px(14)),nav_gap=px(6);
         for(size_t i=0;i<section_nav.size();++i){ui::show_if(section_nav[i],!compact);if(!compact)ui::move_if(section_nav[i],px(16),nav_top+static_cast<int>(i)*(nav_height+nav_gap),sidebar-px(32),nav_height);}
         int y=title_y+title_height+gap;
@@ -1056,7 +1068,7 @@ struct App {
         if(id==ID_SECTION_VIEW){const auto index=SendMessageW(section_selector,CB_GETCURSEL,0,0);if(index>=0&&static_cast<size_t>(index)<section_pages.size()){page=section_pages[index];if(GetWindowTextLengthW(filter)>0)SetWindowTextW(filter,L"");refresh_view();layout();}return;}
         if(id==ID_PROJECT_MENU){auto menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,ID_NEW,L"Crear proyecto…");AppendMenuW(menu,MF_STRING,ID_OPEN,L"Abrir proyecto…");AppendMenuW(menu,MF_STRING,1014,L"Proyectos recientes");if(project){AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,2004,L"Carpetas y configuración");AppendMenuW(menu,MF_STRING,ID_REPORT,L"Generar informe…");}RECT bounds{};GetWindowRect(project_menu,&bounds);auto command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTALIGN,bounds.right,bounds.bottom,0,window,nullptr);DestroyMenu(menu);if(command)action(command);return;}
         if(id==ID_NEXT_STEP){page=8;if(GetWindowTextLengthW(filter)>0)SetWindowTextW(filter,L"");refresh_view();layout();return;}
-        if(id>=1000&&id<1000+static_cast<int>(std::size(pages))){SendMessageW(window,WM_SETREDRAW,FALSE,0);if(scalable_view.window())SendMessageW(scalable_view.window(),WM_SETREDRAW,FALSE,0);if(id==1006)history_entity=selected();page=id-1000;if(loading)requested_page=page;if(GetWindowTextLengthW(filter)>0)SetWindowTextW(filter,L"");refresh_view();layout();if(scalable_view.window())SendMessageW(scalable_view.window(),WM_SETREDRAW,TRUE,0);SendMessageW(window,WM_SETREDRAW,TRUE,0);InvalidateRect(window,nullptr,FALSE);if(scalable_view.window()&&IsWindowVisible(scalable_view.window()))InvalidateRect(scalable_view.window(),nullptr,FALSE);return;}
+        if(id>=1000&&id<1000+static_cast<int>(std::size(pages))){SendMessageW(window,WM_SETREDRAW,FALSE,0);if(scalable_view.window())SendMessageW(scalable_view.window(),WM_SETREDRAW,FALSE,0);if(id==1006)history_entity=selected();page=id-1000;if(loading)requested_page=page;if(GetWindowTextLengthW(filter)>0)SetWindowTextW(filter,L"");layout();refresh_view();if(scalable_view.window())SendMessageW(scalable_view.window(),WM_SETREDRAW,TRUE,0);SendMessageW(window,WM_SETREDRAW,TRUE,0);InvalidateRect(window,nullptr,FALSE);if(scalable_view.window()&&IsWindowVisible(scalable_view.window()))InvalidateRect(scalable_view.window(),nullptr,FALSE);return;}
         if(busy){if(id==ID_CANCEL){cancel.requested=true;log("Cancelación solicitada; esperando cierre de procesos propios.");}return;}
         if(id==ID_PROJECT){const auto index=SendMessageW(project_selector,CB_GETCURSEL,0,0);if(index>=0&&static_cast<size_t>(index)<project_paths.size()&&(!project||!same_path(project_paths[index],project->file))){load(project_paths[index]);layout();}return;}
         if(id==ID_OPEN){auto path=open_file(window,L"Abrir proyecto Migratool (.json)");if(path)load(*path);return;}
@@ -1687,7 +1699,7 @@ LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
           case WM_COMMAND:if(LOWORD(wp)==ID_FILTER&&HIWORD(wp)==EN_CHANGE){SetTimer(w,3,160,nullptr);return 0;}if((LOWORD(wp)==ID_PROJECT||LOWORD(wp)==ID_SECTION_VIEW||LOWORD(wp)==ID_SECTION_COMPACT)&&HIWORD(wp)!=CBN_SELCHANGE&&HIWORD(wp)!=1)return 0;a->action(LOWORD(wp));return 0;
           case WM_LOG:{std::unique_ptr<std::string> s(reinterpret_cast<std::string*>(lp));a->log(*s);return 0;}
           case WM_DONE:{std::unique_ptr<std::string> s(reinterpret_cast<std::string*>(lp));if(a->worker.joinable())a->worker.join();a->set_busy(false);
-            if(a->closing){if(wp)a->log("Operación cancelada al cerrar: "+*s);if(!a->polling)DestroyWindow(w);return 0;}
+            if(a->closing){if(wp)a->log("Operación cancelada al cerrar: "+*s);if(IsWindow(w))DestroyWindow(w);return 0;}
             if(wp){a->log("Error: "+*s);MessageBoxW(w,wide(*s).c_str(),L"Migratool — operación no completada",MB_OK|MB_ICONERROR);}else a->log("Operación terminada; consulte estados y comprobantes.");
             if(a->project){a->displayed_revision=-1;a->watcher=std::make_unique<IndexWatcher>(*a->project,900000);if((a->durable||a->page>=16)&&a->page!=13&&a->page!=14&&a->page!=20)a->scalable_view.refresh();}a->layout();a->poll_live();return 0;}
           case WM_TIMER:if(wp==1){if(!a->capture_active)a->poll_live();}else if(wp==3){KillTimer(w,3);a->refresh_view();}else if(wp==4){KillTimer(w,4);a->prefs_dirty=false;const auto path=a->preferences_path();const int tp=ui::text_percent;const bool sh=a->sidebar_hidden;const int tm=ui::g_theme_mode;const bool ic=ui::g_increased_contrast;if(a->prefs_worker.joinable())a->prefs_worker.join();a->prefs_worker=std::jthread([path,tp,sh,tm,ic]{try{fs::create_directories(native_path(path.parent_path()));write_json(path,{{"text_percent",tp},{"sidebar_hidden",sh},{"theme_mode",tm},{"increased_contrast",ic}});}catch(...){}});}else if(wp==5&&a->capture_active){
@@ -1717,8 +1729,28 @@ LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
               }else a->capture_settled_since=0;
           }return 0;
           case WM_NOTIFY:{auto n=reinterpret_cast<NMHDR*>(lp);if(n->hwndFrom==a->list&&n->code==NM_CUSTOMDRAW)return ui::handle_listview_customdraw(lp,palette);if(n->hwndFrom==a->list&&n->code==NM_DBLCLK){auto id=a->selected();if(a->page==14&&!id.empty()){a->load(fs::path(wide(id)));a->layout();return 0;}if(!id.empty()){Form f;f.parent=w;f.title=L"Identificador exacto · copiar para CLI o configuración";f.labels={L"Unidad seleccionada"};f.values={wide(id)};f.height=300;show_form(f);}return 0;}break;}
-          case WM_CLOSE:if(a->busy||a->polling){a->closing=true;a->cancel.requested=true;a->log("Cerrando la ventana. Guardando el estado de la operación…");return 0;}DestroyWindow(w);return 0;
-          case WM_DESTROY:KillTimer(w,1);KillTimer(w,3);KillTimer(w,4);KillTimer(w,5);a->cancel.requested=true;a->poll_worker.request_stop();a->poll_cv.notify_all();if(a->worker.joinable())a->worker.join();if(a->prefs_worker.joinable())a->prefs_worker.join();if(a->prefs_dirty){a->prefs_dirty=false;a->flush_preferences_sync();}if(a->poll_worker.joinable())a->poll_worker.join();a->watcher.reset();if(a->gui_session){a->gui_session->finish(0);a->gui_session.reset();}PostQuitMessage(0);return 0;
+          case WM_CLOSE:
+            a->closing=true;a->cancel.requested=true;
+            KillTimer(w,1);KillTimer(w,3);KillTimer(w,4);KillTimer(w,5);
+            a->poll_worker.request_stop();a->poll_cv.notify_all();
+            a->scalable_view.request_stop();
+            if(a->watcher)a->watcher->request_stop();
+            if(a->busy){a->log("Cerrando la ventana. Guardando el estado de la operación…");return 0;}
+            DestroyWindow(w);return 0;
+          case WM_DESTROY:
+            KillTimer(w,1);KillTimer(w,3);KillTimer(w,4);KillTimer(w,5);
+            a->closing=true;a->cancel.requested=true;
+            a->poll_worker.request_stop();a->poll_cv.notify_all();
+            a->scalable_view.request_stop();
+            if(a->watcher)a->watcher->request_stop();
+            if(a->worker.joinable())a->worker.join();
+            if(a->prefs_worker.joinable())a->prefs_worker.join();
+            if(a->prefs_dirty){a->prefs_dirty=false;a->flush_preferences_sync();}
+            if(a->poll_worker.joinable())a->poll_worker.join();
+            a->scalable_view.stop();
+            a->watcher.reset();
+            if(a->gui_session){a->gui_session->finish(0);a->gui_session.reset();}
+            PostQuitMessage(0);return 0;
         }
     }catch(const std::exception& e){if(msg==WM_TIMER){SetWindowTextW(a->statusbar,wide("No se pudo actualizar el índice; se reintentará: "+std::string(e.what())).c_str());return 0;}a->log("Error: "+std::string(e.what()));MessageBoxW(w,wide(e.what()).c_str(),L"Migratool",MB_OK|MB_ICONERROR);return 0;}
     return DefWindowProcW(w,msg,wp,lp);
